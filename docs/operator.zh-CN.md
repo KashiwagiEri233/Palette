@@ -207,7 +207,15 @@ uv run pytest                      # 单元、QMP、客户机工具与集成测�
 uv run pytest tests/e2e            # 未配置真实 QEMU 与镜像时跳过
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
+uv run python scripts/check_docs.py
 ```
 
 集成测试套件会启动一个真实子进程，经真实管道讲 QMP，因此在不需要 hypervisor 的情况下覆盖了
-分帧、资源回收和生命周期行为。
+分帧、资源回收和生命周期行为。文档检查会强制「中英成对」以及所有相对链接可解析。
+
+CI（`.github/workflows/ci.yml`）在 Ubuntu 与 Windows、Python 3.12 与 3.13 上跑上面全部内容，
+另加一个真实 stdio MCP 会话和一次 `palette doctor` 冒烟检查。矩阵里必须有 Windows，因为 job
+object 进程保护、`CREATE_NO_WINDOW` 与 reparse point 检查只在那里执行。
+
+**它跑不了实机验收**，那需要真实 QEMU 与客户机镜像，对应测试会跳过。绿色徽章的含义是「代码与
+文档自洽」，**不是**「虚拟机可用」——后者要在真实宿主上跑 P0 探针。

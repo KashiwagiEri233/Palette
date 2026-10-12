@@ -2,6 +2,8 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml/badge.svg)](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml)
+
 Palette gives a visual agent an **observable, operable, resettable virtual desktop** — a
 QEMU guest it can see and click on — instead of the host desktop.
 

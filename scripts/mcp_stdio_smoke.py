@@ -28,12 +28,24 @@ def build_frame(payload: dict[str, Any]) -> bytes:
 
 class Session:
     def __init__(self, command: list[str], cwd: Path) -> None:
+        # A deliberately thin environment, so the session is exercised the way a client would
+        # start it rather than inheriting this shell's state. HOME/USERPROFILE and LANG are in
+        # the list for portability: the interpreter wants the first two on POSIX and the third
+        # decides how it encodes its own output on either platform.
+        keep = {
+            "SYSTEMROOT",
+            "WINDIR",
+            "SYSTEMDRIVE",
+            "PATH",
+            "TEMP",
+            "TMP",
+            "HOME",
+            "USERPROFILE",
+            "LANG",
+            "LC_ALL",
+        }
         env = {
-            **{
-                k: v
-                for k, v in os.environ.items()
-                if k in {"SYSTEMROOT", "PATH", "TEMP", "TMP", "WINDIR"}
-            },
+            **{key: value for key, value in os.environ.items() if key in keep},
             "PYTHONIOENCODING": "utf-8",
         }
         self.process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell

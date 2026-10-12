@@ -32,7 +32,7 @@
 | `src/palette/capture/` | 显示缓冲区采集与 PNG/PPM 回退 |
 | `src/palette/input/` | 坐标换算、键码表、有界动作事务 |
 | `src/palette/guest_tools/` | 保留的增强通道：协议、disabled 后端、bridge |
-| `scripts/` | 运维工具：`p0_probe.py` 与 `mcp_stdio_smoke.py` |
+| `scripts/` | 运维工具（`p0_probe.py`、`mcp_stdio_smoke.py`）与 `check_docs.py` |
 | `guest/` | 离线夹具页面与客户机服务契约 |
 | `profiles/` | 不含秘密的可信配置模板 |
 

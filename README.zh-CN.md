@@ -2,6 +2,8 @@
 
 [English](README.md) | **简体中文**
 
+[![CI](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml/badge.svg)](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml)
+
 Palette 为视觉 Agent 提供一个**可观察、可操作、可重置的虚拟桌面**——一台它能看到、能点击的
 QEMU 客户机，而不是宿主机桌面。
 

@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push makes an in-flight run of the same ref pointless; stop paying for it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here writes to the repository, so nothing here asks for permission to.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint, types and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --locked
+      - name: ruff check
+        run: uv run ruff check .
+      - name: ruff format
+        run: uv run ruff format --check .
+      - name: mypy
+        run: uv run mypy
+      # The documentation is a first-class artefact here — bilingual, cross-linked, and
+      # quoted by the code — so its invariants are checked rather than trusted.
+      - name: documentation invariants
+        run: uv run python scripts/check_docs.py
+
+  test:
+    # Two operating systems because the code has real platform branches: the Windows job
+    # object guard, CREATE_NO_WINDOW, reparse-point checks and the console code page only
+    # execute on Windows, and the process plumbing differs underneath.
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: uv sync --locked
+      # The suite needs no hypervisor: the lifecycle tests start a real child process that
+      # speaks real QMP over real pipes (tests/support/fake_qemu.py). The physical-acceptance
+      # tests in tests/e2e require a real QEMU and a guest image, so they skip here — a
+      # skipped test is not evidence, and this workflow does not claim otherwise.
+      - name: Tests
+        run: uv run pytest -ra --durations=10
+      # The stdio transport and the JSON-RPC session are the one seam the pytest suite does
+      # not cover, because it needs a process boundary and our own stdout.
+      - name: MCP session over stdio
+        run: uv run python scripts/mcp_stdio_smoke.py
+      # A runner has no QEMU. `doctor` must say so and exit with its documented "not ready"
+      # code — a crash would be indistinguishable from a verdict if nobody checked.
+      - name: doctor reports a verdict instead of crashing
+        shell: bash
+        run: |
+          code=0
+          uv run palette doctor --json > doctor.json || code=$?
+          echo "doctor exit code: $code"
+          uv run python - <<'PY'
+          import json, pathlib
+          report = json.loads(pathlib.Path("doctor.json").read_text(encoding="utf-8"))
+          if "ok" not in report or not isinstance(report.get("checks"), list):
+              raise SystemExit("doctor produced no usable verdict")
+          print("doctor verdict:", "ready" if report["ok"] else "NOT READY")
+          PY
+          if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
+            echo "::error::doctor exited $code; expected 0 (ready) or 3 (a reported failure)"
+            exit 1
+          fi

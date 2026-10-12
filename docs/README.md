@@ -34,7 +34,7 @@ change to one is incomplete until the other is updated too.
 | `src/palette/capture/` | framebuffer capture and the PNG/PPM fallback |
 | `src/palette/input/` | coordinates, keymaps, and the bounded action transaction |
 | `src/palette/guest_tools/` | the retained enhancement channel: protocol, disabled backend, bridge |
-| `scripts/` | operator tools: `p0_probe.py` and `mcp_stdio_smoke.py` |
+| `scripts/` | operator tools (`p0_probe.py`, `mcp_stdio_smoke.py`) and `check_docs.py` |
 | `guest/` | the offline fixture page and the guest-service contract |
 | `profiles/` | trusted configuration templates, with no secrets in them |
 
