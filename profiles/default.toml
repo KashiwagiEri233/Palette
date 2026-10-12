@@ -1,12 +1,17 @@
-# Offline Debian desktop for visual agents: the default, and the baseline that must keep
-# working on its own no matter what the enhancement channel does.
+# Debian desktop for visual agents.
 #
-# No secrets belong in this file. The base image digest is pinned once the template has
-# been built (see docs/guest-template.md), which is what turns "the image on this machine"
-# into "the image this profile is allowed to run".
+# This profile is the permissive one: a NIC is attached, the in-guest enhancement channel is
+# on, and a caller may supply its own base image, CD-ROMs and QEMU arguments. Every one of
+# those is a switch — profiles/strict-example.toml is the same machine with all of them
+# closed — and the consequences of the open posture are written down in
+# docs/threat-model.md rather than implied.
+#
+# No secrets belong in this file. The base image digest is pinned once the template has been
+# built (see docs/guest-template.md), which is what turns "the image at this path" into "the
+# image this profile is allowed to run".
 
 profile_id = "default"
-description = "Debian 13 + XFCE, 1280x800, offline, visual-only."
+description = "Debian 13 + XFCE, 1280x800, sandboxed NIC, caller-supplied host material allowed."
 
 # A frame older than this is refused, so an agent cannot click on a stale picture of a
 # desktop that has since changed. Measured on the host's monotonic clock.
@@ -72,14 +77,22 @@ size_check_interval_seconds = 5.0
 keep_frames = false
 
 [network]
-# The MVP default: no network device at all. "Restricted user networking" is not the same
-# thing as an egress policy and is not offered here.
-mode = "offline"
-restrict = true
+# A virtual NIC is attached. `restricted-lab` is QEMU user-mode networking with restrict=on:
+# the guest cannot route past the sandbox, which is what makes it a lab rather than a
+# network. Use `nat` when the guest genuinely needs outbound access — it then has the same
+# reach the host has, and there is no egress policy — or `offline` for no NIC at all.
+#
+# `internet-allowlist` is refused at start: an allowlist needs a gateway or proxy to enforce
+# it, and user-mode NAT is not one.
+mode = "restricted-lab"
+# mac = "52:54:00:12:34:56"
+# Reach a service inside the guest from the host. Note this punches through the sandbox that
+# restrict=on otherwise provides; the forwards are recorded when the VM starts.
+# hostfwd = ["tcp::2222-:22"]
 
 [text]
-# Strict keyboard mode. US-layout printable ASCII only; control characters must be sent
-# as explicit key actions.
+# Strict keyboard mode. US-layout printable ASCII only; control characters must be sent as
+# explicit key actions.
 mode = "keyboard"
 max_chars = 256
 char_interval_ms = 12
@@ -97,24 +110,51 @@ double_click_gap_ms = 90
 click_hold_ms = 40
 
 [lifecycle]
-# Agents observe and operate; they do not start, stop or reset VMs unless an operator
-# decides otherwise for a specific profile.
-allow_agent_start = false
+# Callers may start a VM, and may hand the service host material. Read the threat model
+# before leaving these on:
+#
+#   allow_agent_qemu_args  appends raw QEMU arguments. This is host code execution by
+#                          another name: -chardev, -device and -blockdev can read and write
+#                          host files, and -mon/-vnc add a second way to drive the guest.
+#   allow_agent_images     lets a caller choose the disk QEMU boots from, bypassing the
+#                          pinned base and its digest.
+#   allow_agent_iso        attaches a CD-ROM or extra disk from any host path.
+#
+# Turning any of them off restores that particular boundary; strict-example.toml turns all
+# of them off. The destructive lifecycle operations stay closed either way.
+allow_agent_start = true
 allow_agent_stop = false
 allow_agent_reset = false
 allow_agent_force_stop = false
+allow_agent_images = true
+allow_agent_iso = true
+allow_agent_qemu_args = true
 operator_only_tools = true
 
 [guest_tools]
-# The retained enhancement channel, off. Turning it on is a deliberate, separately
-# authorised act - see hybrid-example.toml.
-enabled = false
+# The in-guest enhancement channel. Enabling it costs nothing on its own: it delivers
+# nothing until a guest-side service answers the handshake, and vm_status reports transport
+# and service online as separate facts. A call against a guest with no service fails as
+# unavailable rather than quietly becoming simulated keystrokes.
+enabled = true
 protocol_version = "1.0"
-capabilities = []
-input_methods = []
+capabilities = ["guest.input_text", "guest.launch_app"]
+# native_text writes through the guest platform's own API. clipboard_paste sets the
+# *guest's* clipboard, never the host's. No automatic downgrade between them.
+input_methods = ["native_text"]
 max_text_chars = 4096
 request_timeout_seconds = 20.0
 target_session = "interactive"
+
+# An app_id resolves to a fixed executable with a bounded set of options. Palette never
+# accepts a free-form command line, a path or an argv array, and never uses a shell.
+[guest_tools.allowed_apps.text-editor]
+executable = "/usr/bin/mousepad"
+allowed_options = ["file"]
+
+[guest_tools.allowed_apps.file-manager]
+executable = "/usr/bin/thunar"
+allowed_options = ["directory"]
 
 [retention]
 # Stopped instances are kept so their results can be retrieved; the base image is never

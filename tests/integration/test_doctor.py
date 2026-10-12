@@ -205,7 +205,11 @@ class TestCommandLine:
         assert exit_code == 0
         report = json.loads(capsys.readouterr().out)
         assert report["ok"] is True
-        assert report["profile"]["mode"] == "visual_only"
+        # The profile in this temp repo says nothing about the enhancement channel, so it
+        # gets the default posture — which includes the channel.
+        assert report["profile"]["mode"] == "hybrid"
+        assert report["profile"]["guest_tools_enabled"] is True
+        assert report["profile"]["network"] == "restricted-lab"
 
 
 class TestConfigCommand:

@@ -37,6 +37,8 @@ oversight, and none of it is hidden behind a friendlier message at runtime.
 
 ## Correctness boundaries
 
+* **Nothing the service does survives an open `allow_agent_qemu_args`.** That is not a bug to
+  be fixed later; it is what the switch means. See `threat-model.md`.
 * **Pixel comparison cannot detect semantic change.** Two identical-looking screenshots can
   hide a moved button. Payment, deletion and submission still need the caller's own
   confirmation policy.
@@ -60,8 +62,16 @@ oversight, and none of it is hidden behind a friendlier message at runtime.
   that does and does not buy.
 * **No scheduling platform.** One client controls one VM; `vm_id` exists so that several can
   be addressed, not so that they can be orchestrated.
-* **Guest enhancement tools are disabled by default** and unimplemented. The contract, the
-  policy gates and the mock exist; the transport does not.
+* **Guest enhancement tools are enabled by default and still unimplemented.** The contract,
+  the policy gates, the bridge and the mock exist; the guest-side service and its transport do
+  not. Enabling the channel costs nothing and delivers nothing until such a service answers
+  the handshake, so `vm_status` reports transport and service separately and every call
+  against a service-less guest fails as unavailable.
+* **An enforced egress allowlist is not implemented.** `offline`, `restricted-lab` and `nat`
+  work; `internet-allowlist` is refused at start rather than approximated with user-mode NAT,
+  which is not an allowlist.
+* **No IPv6, DNS-rebinding or redirect handling.** The `nat` mode gives the guest the host's
+  outbound reach as-is, including whatever the host can resolve and reach.
 
 ## What is implemented and tested
 

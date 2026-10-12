@@ -117,9 +117,23 @@ not verify.
 
 ### Lifecycle tools
 
-`vm_start`, `vm_stop` and `vm_reset` are registered so operators can drive them through an
-MCP client, but they are refused for agents unless the profile explicitly grants that
-authority. Registering a tool is not permission.
+`vm_start`, `vm_stop` and `vm_reset` let a caller drive the lifecycle. The shipped profile
+grants **start** only; stopping, force-stopping and resetting stay with the operator, and each
+is a separate switch.
+
+`vm_start` also accepts host material, each behind its own switch:
+
+| Argument | Effect |
+| --- | --- |
+| `image`, `image_format` | boot this base image instead of the profile's pinned one |
+| `iso` | attach one or more CD-ROMs from host paths (repeatable) |
+| `extra_disks` | attach extra disks from host paths |
+| `qemu_args` | append raw QEMU arguments to the command line |
+
+Read `threat-model.md` before using the last one. `qemu_args` is not a tuning knob: it lets a
+caller point QEMU at host files and add a second way to drive the guest, and once it is in play
+nothing else in this document is a guarantee. Each refusal names the switch that would have
+allowed it, so a `POLICY_DENIED` tells you exactly which one to turn on — or to leave alone.
 
 ## Text: what works and what does not
 
@@ -133,7 +147,10 @@ key event means. So:
 * Anything outside US printable ASCII is refused with `UNSUPPORTED_TEXT` — and **nothing is
   typed at all**. The whole string is validated before the first key event.
 * Chinese, emoji and other Unicode need the guest enhancement channel
-  (`vm_guest_input_text`), which is a separate, explicitly enabled capability.
+  (`vm_guest_input_text`), which is a separate capability and needs a service running inside
+  the guest. It is enabled in the shipped profile but delivers nothing on its own: check
+  `vm_status` before relying on it, and expect `GUEST_TOOL_UNAVAILABLE` rather than a
+  surprise when the guest has no service to answer.
 
 ## Frames go stale
 

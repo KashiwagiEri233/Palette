@@ -1,12 +1,18 @@
 """Authorization, path confinement and capability gating.
 
-Two invariants are enforced here, and nowhere else:
+Two rules are enforced here, and nowhere else:
 
-1. **Agent input never becomes a host path or a QEMU argument.** Every filesystem
-   location Palette touches is composed from trusted configuration and a
-   service-generated identifier, then checked to be inside the managed runtime root.
-2. **Power comes from trusted configuration, not from the agent's own claims.** An
-   agent cannot grant itself the reset permission by sending ``confirmed=true``.
+1. **Managed files stay inside the managed runtime root.** Every Palette-owned location is
+   composed from trusted configuration plus a service-generated identifier, then checked
+   before it is read, written or deleted.
+2. **Power comes from trusted configuration, not from the caller's own claims.** A caller
+   cannot grant itself the reset permission by sending ``confirmed=true``.
+
+Caller-supplied *host* material — a base image path, a CD-ROM, raw QEMU arguments — is a
+separate axis with its own switches in ``lifecycle``. Rule 1 still holds for everything
+Palette creates; what changes when those switches are on is that the caller, rather than the
+profile, decides what QEMU is pointed at. That is a deliberate removal of a boundary, not a
+gap, and ``docs/threat-model.md`` records it as one.
 """
 
 from __future__ import annotations
@@ -33,9 +39,16 @@ _CAPABILITY_LABELS: dict[str, str] = {
     "lifecycle.start": "vm_start",
     "lifecycle.stop": "vm_stop",
     "lifecycle.reset": "vm_reset",
+    "host.image": "caller-supplied base image",
+    "host.iso": "caller-supplied CD-ROM or extra disk",
+    "host.qemu_args": "caller-supplied QEMU arguments",
     "guest.input_text": "vm_guest_input_text",
     "guest.launch_app": "vm_guest_launch_app",
 }
+
+#: The kinds of host-side material a caller can hand the service. Each has its own switch
+#: and its own consequence, so they are granted and refused individually.
+MaterialKind = Literal["image", "iso", "qemu_args"]
 
 #: The complete set of capabilities this build knows. A name outside it is not a
 #: permissions question but an unregistered feature, which is what keeps the guest channel
@@ -205,14 +218,20 @@ class Policy:
             )
 
     def capabilities(self) -> list[str]:
-        """The capability list reported by ``vm_status``."""
-        # Observation and control are per-tool policy decisions, not profile switches:
-        # they are available whenever the profile is served. Lifecycle stays operator-only.
+        """The capability list reported by ``vm_status``.
+
+        Every entry here is a grant the profile actually makes, including the host-material
+        ones. Reporting them is the point: a client can see that this profile lets a caller
+        name a base image or append QEMU arguments, rather than discovering it by trying.
+        """
         available = ["observe", "control"]
         for operation, flag in (
             ("lifecycle.start", self.profile.lifecycle.allow_agent_start),
             ("lifecycle.stop", self.profile.lifecycle.allow_agent_stop),
             ("lifecycle.reset", self.profile.lifecycle.allow_agent_reset),
+            ("host.image", self.profile.lifecycle.allow_agent_images),
+            ("host.iso", self.profile.lifecycle.allow_agent_iso),
+            ("host.qemu_args", self.profile.lifecycle.allow_agent_qemu_args),
         ):
             if flag:
                 available.append(operation)
@@ -259,13 +278,41 @@ class Policy:
             )
         return base
 
-    def require_network_offline(self) -> None:
-        if self.profile.network.mode != "offline":
+    def require_network_supported(self) -> None:
+        """Refuse a network mode this build cannot actually implement.
+
+        ``internet-allowlist`` is the only mode that would express an egress *policy*, and
+        enforcing it needs a gateway, proxy or firewall that does not exist here. Saying so
+        is the point: user-mode NAT lets a guest out and is not an allowlist.
+        """
+        mode = self.profile.network.mode
+        if mode == "internet-allowlist":
             raise PaletteError(
-                ErrorCode.POLICY_DENIED,
-                "this build only allows the offline network mode",
-                details={"mode": self.profile.network.mode},
+                ErrorCode.NOT_IMPLEMENTED,
+                "the internet-allowlist network mode needs a controlled egress gateway, which "
+                "this build does not provide; user-mode NAT is not an allowlist",
+                details={"mode": mode, "supported": ["offline", "restricted-lab", "nat"]},
             )
+
+    def require_host_material(self, kind: MaterialKind, *, actor: str) -> None:
+        """Gate caller-supplied host material: an image path, a CD-ROM, or raw QEMU args.
+
+        Operators may always supply these — they are the ones who wrote the profile. A
+        caller acting as an agent needs the matching switch, because each kind hands over
+        something the profile would otherwise have pinned.
+        """
+        switch = {
+            "image": self.profile.lifecycle.allow_agent_images,
+            "iso": self.profile.lifecycle.allow_agent_iso,
+            "qemu_args": self.profile.lifecycle.allow_agent_qemu_args,
+        }[kind]
+        if actor == "operator" or switch:
+            return
+        raise PaletteError(
+            ErrorCode.POLICY_DENIED,
+            f"this profile does not allow callers to supply {kind}",
+            details={"kind": kind, "switch": f"allow_agent_{kind}"},
+        )
 
 
 def sanitise_for_log(values: Iterable[str], *, keep: int = 8) -> list[str]:

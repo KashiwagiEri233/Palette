@@ -25,6 +25,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from ..config import HostConfig, Profile
 from ..errors import ErrorCode, PaletteError
@@ -222,6 +223,55 @@ def require_accelerator(profile: Profile, probe: QemuProbe) -> str:
     return requested
 
 
+@dataclass(frozen=True, slots=True)
+class ExtraVolume:
+    """A host file a caller asked to attach, beyond the instance's own overlay.
+
+    ``cdrom`` media is attached through ``virtio-scsi-pci`` with a ``scsi-cd`` device, which
+    is the recipe QEMU's own manual shows for a bootable optical drive. We add the SCSI
+    controller ourselves rather than relying on whatever ``-nodefaults`` left behind, so an
+    ISO works regardless of the machine's default devices. ``disk`` media uses the same
+    ``virtio-blk-pci`` shape as the instance disk.
+    """
+
+    path: str
+    media: Literal["disk", "cdrom"] = "disk"
+    format: str = "raw"
+    read_only: bool = True
+    boot_index: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchOverrides:
+    """Host material a caller supplied for one start, over and above the profile.
+
+    The service validates and authorises each field before it gets here; this object exists
+    so that the manager, the launcher and the manifest all describe the same set of
+    overrides, and so that a reset can rebuild the instance the caller asked for rather than
+    silently reverting to the profile.
+    """
+
+    image: Path | None = None
+    image_format: str | None = None
+    volumes: tuple[ExtraVolume, ...] = ()
+    qemu_args: tuple[str, ...] = ()
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.image or self.volumes or self.qemu_args)
+
+    def describe(self) -> list[str]:
+        """A shape summary for the audit trail: counts and kinds, never paths."""
+        parts: list[str] = []
+        if self.image:
+            parts.append("image")
+        if self.volumes:
+            parts.append(f"{len(self.volumes)} volume(s)")
+        if self.qemu_args:
+            parts.append(f"{len(self.qemu_args)} qemu arg(s)")
+        return parts
+
+
 @dataclass(slots=True)
 class LaunchPlan:
     """A fully resolved, inspectable command. Tests assert on this rather than on a shell."""
@@ -242,6 +292,71 @@ class LaunchPlan:
         }
 
 
+#: Tokens that create a second way to drive, watch or talk to the guest. Palette adds its own
+#: QMP channel deliberately; anything else coming from a profile or a caller breaks the
+#: single-writer assumption, which the service cannot detect afterwards. Only extra and
+#: caller-supplied arguments are scanned, so Palette's own `-chardev stdio,id=qmp` is not a
+#: false positive here.
+_EXTRA_CHANNEL_TOKENS = ("-mon", "-monitor", "monitor=", "-chardev", "vnc", "spice", "telnet")
+
+
+def _flag_extra_channels(args: Sequence[str], notes: list[str]) -> None:
+    lowered = " ".join(args).lower()
+    matched = sorted({token for token in _EXTRA_CHANNEL_TOKENS if token in lowered})
+    if not matched:
+        return
+    notes.append(
+        f"extra arguments add a monitor or display channel ({', '.join(matched)}); the "
+        "single-writer guarantee no longer holds for this instance"
+    )
+    logger.warning(
+        "QEMU arguments introduce an additional control or display channel (%s); Palette "
+        "cannot enforce single-writer behaviour once one exists",
+        ", ".join(matched),
+    )
+
+
+def _extra_volume_args(volumes: Sequence[ExtraVolume], notes: list[str]) -> list[str]:
+    """Attach caller-supplied disks and CD-ROMs behind explicit blockdev nodes."""
+    if not volumes:
+        return []
+    argv: list[str] = []
+    if any(volume.media == "cdrom" for volume in volumes):
+        # Added unconditionally when an optical drive is requested: the controller must not
+        # depend on which default devices the machine happens to keep.
+        argv += ["-device", "virtio-scsi-pci,id=scsi0"]
+    for index, volume in enumerate(volumes):
+        node = f"extra{index}"
+        argv += [
+            "-blockdev",
+            json.dumps(
+                {
+                    "driver": "file",
+                    "filename": volume.path,
+                    "node-name": f"{node}-file",
+                    "read-only": volume.read_only,
+                },
+                separators=(",", ":"),
+            ),
+            "-blockdev",
+            json.dumps(
+                {
+                    "driver": volume.format,
+                    "file": f"{node}-file",
+                    "node-name": node,
+                    "read-only": volume.read_only,
+                },
+                separators=(",", ":"),
+            ),
+        ]
+        if volume.media == "cdrom":
+            argv += ["-device", f"scsi-cd,drive={node},bus=scsi0.0"]
+        else:
+            argv += ["-device", f"virtio-blk-pci,drive={node}"]
+        notes.append(f"attached a caller-supplied {volume.media}")
+    return argv
+
+
 def build_launch_plan(
     *,
     profile: Profile,
@@ -253,16 +368,21 @@ def build_launch_plan(
     hardware_vars_path: Path | None = None,
     accelerator: str | None = None,
     start_paused: bool = True,
+    extra_volumes: Sequence[ExtraVolume] = (),
+    caller_args: Sequence[str] = (),
 ) -> LaunchPlan:
-    """Compose QEMU's arguments from the profile.
+    """Compose QEMU's arguments from the profile plus anything the caller supplied.
 
-    ``-display none`` plus ``-nic none`` is not decoration: the first removes every
-    window, VNC and SPICE entry point (each of which would be a second, unauthenticated
-    input channel), and the second keeps the guest offline by construction.
+    ``-display none`` is not decoration: it removes every window, VNC and SPICE entry point,
+    each of which would be a second, unauthenticated input channel. The network comes from
+    the profile's mode, and ``caller_args`` are appended last so a caller can override or add
+    to everything above — including, deliberately, the guarantees this function otherwise
+    provides. See ``_flag_extra_channels``.
     """
     qemu = profile.qemu
     devices = profile.devices
     resources = profile.resources
+    network = profile.network
     notes: list[str] = []
 
     argv: list[str] = [binary, *qemu.argv_prefix]
@@ -274,9 +394,18 @@ def build_launch_plan(
     if qemu.cpu:
         argv += ["-cpu", qemu.cpu]
     argv += ["-nodefaults", "-display", "none"]
-    argv += ["-nic", "none"] if profile.network.mode == "offline" else ["-nic", "user,restrict=on"]
-    if profile.network.mode != "offline":
-        notes.append("profile uses restricted user networking; guest egress must be audited")
+    argv += ["-nic", network.qemu_nic_argument()]
+    if network.mode == "offline":
+        notes.append("no network device attached")
+    elif network.mode == "restricted-lab":
+        notes.append("user-mode networking with restrict=on: the guest cannot route past it")
+    elif network.mode == "nat":
+        notes.append(
+            "user-mode NAT: the guest has the same outbound reach as the host, and there is "
+            "no egress policy"
+        )
+    if network.hostfwd:
+        notes.append(f"{len(network.hostfwd)} host port forward(s) configured")
 
     if qemu.firmware.code:
         argv += [
@@ -302,12 +431,16 @@ def build_launch_plan(
     ]
 
     argv += _block_args(overlay_path=overlay_path, profile=profile, notes=notes)
+    argv += _extra_volume_args(extra_volumes, notes)
 
     # QMP over the child's own stdin/stdout, never a socket. ``signal=off`` keeps QEMU
     # from installing host signal handlers around our channel.
     argv += ["-chardev", "stdio,id=qmp,signal=off", "-mon", "chardev=qmp,mode=control"]
-    if qemu.extra_args:
-        argv += list(qemu.extra_args)
+    argv += list(qemu.extra_args)
+    argv += list(caller_args)
+    if caller_args:
+        notes.append(f"{len(caller_args)} caller-supplied QEMU argument(s) appended")
+    _flag_extra_channels([*qemu.extra_args, *caller_args], notes)
     if start_paused:
         argv += ["-S"]
         notes.append("started paused; the manager resumes it once QMP is negotiated")

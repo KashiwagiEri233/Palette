@@ -93,6 +93,42 @@ def resolve_qemu_img(profile: Profile) -> str | None:
     return shutil.which("qemu-img") or shutil.which("qemu-img.exe")
 
 
+def validate_caller_path(path: Path | str, *, what: str = "file") -> Path:
+    """Validate a caller-supplied host path: an image, a CD-ROM, an extra disk.
+
+    These are the only paths Palette ever touches that are deliberately *outside* the
+    managed runtime root, so this is a shape check rather than confinement: absolute,
+    existing, and a regular file. A link is resolved, so the manifest and the audit trail
+    record the file that was actually opened rather than the name that pointed at it.
+    """
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        raise PaletteError(
+            ErrorCode.PATH_DENIED,
+            f"a caller-supplied {what} path must be absolute",
+            details={"value": str(path)},
+        )
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise PaletteError(
+            ErrorCode.IMAGE_MISSING,
+            f"the caller-supplied {what} does not exist",
+            details={"value": str(path)},
+        ) from exc
+    if not resolved.is_file():
+        raise PaletteError(
+            ErrorCode.IMAGE_MISSING,
+            f"the caller-supplied {what} is not a regular file",
+            details={"value": str(path)},
+        )
+    return resolved
+
+
+def _validate_caller_image(path: Path) -> Path:
+    return validate_caller_path(path, what="image")
+
+
 class ImageManager:
     """Owns everything under ``<runtime>/vms/<vm_id>/``."""
 
@@ -211,9 +247,35 @@ class ImageManager:
         shutil.copyfile(source, paths.hardware_vars)
 
     # -- overlays --------------------------------------------------------------------
-    async def create_overlay(self, paths: InstancePaths) -> Path:
-        """Create the writable layer for one instance and verify its backing chain."""
-        base = self.require_base_image()
+    async def create_overlay(
+        self,
+        paths: InstancePaths,
+        *,
+        base: Path | None = None,
+        base_format: str | None = None,
+    ) -> Path:
+        """Create the writable layer for one instance and verify its backing chain.
+
+        ``base`` overrides the profile's pinned image. The caller-supplied file becomes the
+        read-only backing store, so it is validated for existence and shape but not against
+        the profile's digest — the digest pins *the profile's* image, and a caller who names
+        a different file has chosen to step outside that. The writable layer is still ours,
+        still per-instance, and reset still throws it away.
+        """
+        overlay_format = self.profile.images.format
+        backing_format: str
+        if base is None:
+            backing = self.require_base_image()
+            backing_format = self.profile.images.format
+        else:
+            backing = _validate_caller_image(base)
+            backing_format = (base_format or self.profile.images.format).lower()
+            if backing_format not in {"qcow2", "raw"}:
+                raise PaletteError(
+                    ErrorCode.IMAGE_INVALID,
+                    f"unsupported backing format {backing_format!r} for a caller-supplied image",
+                    details={"supported": ["qcow2", "raw"]},
+                )
         if self.qemu_img is None:
             raise PaletteError(
                 ErrorCode.QEMU_NOT_FOUND,
@@ -228,11 +290,11 @@ class ImageManager:
             *self.qemu_img_argv,
             "create",
             "-f",
-            self.profile.images.format,
+            overlay_format,
             "-F",
-            self.profile.images.format,
+            backing_format,
             "-b",
-            str(base),
+            str(backing),
             str(overlay),
         ]
         code, _stdout, stderr = await run_tool(argv, timeout=120.0)
@@ -242,7 +304,7 @@ class ImageManager:
                 "qemu-img could not create the instance overlay",
                 details={"exit_code": code, "stderr_tail": stderr.strip()[-400:]},
             )
-        self._verify_backing_chain(overlay, base)
+        self._verify_backing_chain(overlay, backing)
         return overlay
 
     def _verify_backing_chain(self, overlay: Path, base: Path) -> None:

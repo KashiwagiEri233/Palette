@@ -471,9 +471,24 @@ class TestRelease:
 
 
 class TestAuthorization:
-    async def test_the_shipped_profile_does_not_let_an_agent_start_a_vm(
-        self, service: PaletteService
+    async def test_an_agent_may_start_but_not_reset(self, service: PaletteService) -> None:
+        """Starting is open to callers in this profile; the destructive operations are not.
+        The two are separate grants precisely so a profile can have one without the other."""
+        started = await service.start("desktop", actor="agent")
+        assert started.ok is True
+        await service.manager.stop("desktop", force=True)
+        with pytest.raises(PaletteError) as info:
+            await service.reset("desktop", actor="agent")
+        assert info.value.code is ErrorCode.POLICY_DENIED
+
+    async def test_a_profile_can_close_starting_again(
+        self, service: PaletteService, base_image
     ) -> None:
+        from palette.config import LifecyclePolicy
+        from support.profiles import make_profile
+
+        closed = make_profile(base_image, lifecycle=LifecyclePolicy(allow_agent_start=False))
+        service.config.profiles["default"] = closed
         with pytest.raises(PaletteError) as info:
             await service.start("desktop", actor="agent")
         assert info.value.code is ErrorCode.POLICY_DENIED

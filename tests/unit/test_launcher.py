@@ -13,6 +13,7 @@ from palette.config import FirmwareConfig, HostConfig, NetworkConfig, QemuConfig
 from palette.errors import ErrorCode, PaletteError
 from palette.vm.launcher import (
     ENV_WHITELIST,
+    ExtraVolume,
     build_child_env,
     build_launch_plan,
     probe_binary,
@@ -145,15 +146,148 @@ class TestArgumentVector:
         assert drives[1].endswith(f"file={vars_path}")
         assert "readonly" not in drives[1]
 
-    def test_a_networked_profile_notes_that_egress_must_be_audited(
+    def test_the_network_mode_decides_the_nic_argument(self, profile, tmp_path: Path) -> None:
+        def nic(mode: str) -> str:
+            configured = profile.model_copy(update={"network": NetworkConfig(mode=mode)})  # type: ignore[arg-type]
+            plan = plan_for(configured, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
+            return plan.argv[plan.argv.index("-nic") + 1]
+
+        assert nic("offline") == "none"
+        assert nic("restricted-lab") == "user,restrict=on"
+        # `nat` is user-mode networking without the sandbox: the guest gets the host's reach.
+        assert nic("nat") == "user"
+
+    def test_port_forwards_and_a_fixed_mac_are_passed_through(
         self, profile, tmp_path: Path
     ) -> None:
         configured = profile.model_copy(
-            update={"network": NetworkConfig(mode="restricted-lab", restrict=True)}
+            update={
+                "network": NetworkConfig(
+                    mode="nat", mac="52:54:00:12:34:56", hostfwd=["tcp::2222-:22"]
+                )
+            }
         )
         plan = plan_for(configured, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
-        assert plan.argv[plan.argv.index("-nic") + 1] == "user,restrict=on"
-        assert any("audited" in note for note in plan.notes)
+        nic = plan.argv[plan.argv.index("-nic") + 1]
+        assert "mac=52:54:00:12:34:56" in nic
+        assert "hostfwd=tcp::2222-:22" in nic
+        # A forward deliberately punches through the isolation the other modes provide, so it
+        # is called out rather than passing unnoticed.
+        assert any("port forward" in note for note in plan.notes)
+
+    def test_an_offline_profile_says_there_is_no_nic(self, profile, tmp_path: Path) -> None:
+        configured = profile.model_copy(update={"network": NetworkConfig(mode="offline")})
+        plan = plan_for(configured, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
+        assert any("no network device" in note for note in plan.notes)
+
+    def test_nat_is_described_as_having_no_egress_policy(self, profile, tmp_path: Path) -> None:
+        configured = profile.model_copy(update={"network": NetworkConfig(mode="nat")})
+        plan = plan_for(configured, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
+        assert any("no egress policy" in note for note in plan.notes)
+
+
+class TestExtraVolumes:
+    """Caller-supplied disks and CD-ROMs."""
+
+    def test_no_volumes_means_no_extra_arguments(self, profile, tmp_path: Path) -> None:
+        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
+        assert plan.argv.count("-blockdev") == 2  # only the instance disk's file + format
+
+    def test_an_iso_gets_a_scsi_controller_and_an_optical_device(
+        self, profile, tmp_path: Path
+    ) -> None:
+        plan = plan_for(
+            profile,
+            overlay=tmp_path / "o.qcow2",
+            workdir=tmp_path,
+            extra_volumes=(ExtraVolume(path="D:/templates/installer.iso", media="cdrom"),),
+        )
+        assert "virtio-scsi-pci,id=scsi0" in plan.argv
+        device = next(argument for argument in plan.argv if argument.startswith("scsi-cd"))
+        assert device == "scsi-cd,drive=extra0,bus=scsi0.0"
+        blocks = [plan.argv[i + 1] for i, a in enumerate(plan.argv) if a == "-blockdev"]
+        assert len(blocks) == 4
+        nodes = [json.loads(block) for block in blocks]
+        assert nodes[2]["filename"] == "D:/templates/installer.iso"
+        assert nodes[2]["read-only"] is True
+        assert nodes[3]["driver"] == "raw"
+
+    def test_an_extra_disk_uses_virtio_blk_like_the_instance_disk(
+        self, profile, tmp_path: Path
+    ) -> None:
+        plan = plan_for(
+            profile,
+            overlay=tmp_path / "o.qcow2",
+            workdir=tmp_path,
+            extra_volumes=(
+                ExtraVolume(path="E:/data/scratch.qcow2", media="disk", format="qcow2"),
+            ),
+        )
+        assert "virtio-blk-pci,drive=extra0" in plan.argv
+        assert "virtio-scsi-pci,id=scsi0" not in plan.argv
+        assert any("caller-supplied disk" in note for note in plan.notes)
+
+    def test_several_volumes_get_distinct_nodes(self, profile, tmp_path: Path) -> None:
+        plan = plan_for(
+            profile,
+            overlay=tmp_path / "o.qcow2",
+            workdir=tmp_path,
+            extra_volumes=(
+                ExtraVolume(path="A.iso", media="cdrom"),
+                ExtraVolume(path="B.iso", media="cdrom"),
+            ),
+        )
+        assert plan.argv.count("virtio-scsi-pci,id=scsi0") == 1  # one controller, not two
+        assert "scsi-cd,drive=extra0,bus=scsi0.0" in plan.argv
+        assert "scsi-cd,drive=extra1,bus=scsi0.0" in plan.argv
+
+
+class TestCallerArguments:
+    def test_caller_arguments_are_appended_after_the_profiles(
+        self, profile, tmp_path: Path
+    ) -> None:
+        configured = profile.model_copy(
+            update={"qemu": profile.qemu.model_copy(update={"extra_args": ["-rtc", "base=utc"]})}
+        )
+        plan = plan_for(
+            configured,
+            overlay=tmp_path / "o.qcow2",
+            workdir=tmp_path,
+            caller_args=["-m", "8192"],
+        )
+        assert plan.argv.index("-rtc") < plan.argv.index("-m", plan.argv.index("-rtc"))
+        assert any("caller-supplied QEMU argument" in note for note in plan.notes)
+
+
+class TestExtraChannels:
+    """A second control or display channel breaks the single-writer assumption. It is
+    allowed — a caller who may pass arguments may pass any of them — but never silently."""
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [["-mon", "vc"], ["-vnc", ":0"], ["-chardev", "socket,id=x,port=4444"]],
+    )
+    def test_a_second_channel_is_flagged(
+        self, profile, tmp_path: Path, arguments: list[str]
+    ) -> None:
+        plan = plan_for(
+            profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path, caller_args=arguments
+        )
+        assert any("single-writer guarantee no longer holds" in note for note in plan.notes)
+
+    def test_palettes_own_qmp_channel_is_not_flagged(self, profile, tmp_path: Path) -> None:
+        """The service adds one QMP channel deliberately; only extras are a surprise."""
+        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
+        assert not any("no longer holds" in note for note in plan.notes)
+
+    def test_the_warning_is_logged(self, profile, tmp_path: Path, caplog) -> None:
+        with caplog.at_level("WARNING"):
+            plan_for(
+                profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path, caller_args=["-vnc", ":0"]
+            )
+        assert any(
+            "additional control or display channel" in record.message for record in caplog.records
+        )
 
 
 class TestEnvironment:
@@ -250,11 +384,6 @@ class TestHelperExecution:
 
 
 class TestProfileGuardrails:
-    def test_a_profile_cannot_smuggle_a_monitor_through_extra_args(self) -> None:
-        with pytest.raises(ValidationError) as info:
-            QemuConfig(extra_args=["-mon vc,mode=control"])
-        assert "monitor or display" in str(info.value)
-
     def test_an_accelerator_fallback_cannot_be_enabled(self) -> None:
         with pytest.raises(ValidationError) as info:
             QemuConfig(allow_accelerator_fallback=True)

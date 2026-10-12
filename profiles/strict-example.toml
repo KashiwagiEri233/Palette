@@ -1,0 +1,59 @@
+# The same machine as profiles/default.toml, with every switch closed.
+#
+# Kept as an example because the default profile is now the permissive one, and an operator
+# who wants the opposite posture should not have to reconstruct it from a diff. Start from
+# this file, or copy the `[network]`, `[lifecycle]` and `[guest_tools]` blocks into your own
+# profile.
+#
+# What "closed" means here:
+#   - no NIC at all, so there is nothing for the guest to route through;
+#   - no caller-supplied image, CD-ROM or QEMU argument: the disk QEMU boots from is the one
+#     this file names, and the argument vector is the one Palette builds;
+#   - no in-guest enhancement service, so the only way to reach the desktop is what the
+#     framebuffer shows;
+#   - no agent-driven lifecycle: an operator starts, stops and resets.
+
+profile_id = "strict-example"
+description = "Debian 13 + XFCE, offline, no caller-supplied host material, visual only."
+
+frame_ttl_seconds = 30.0
+
+[qemu]
+binary = "qemu-system-x86_64"
+version_pin = "11.1"
+accelerator = "whpx"
+machine = "q35"
+
+[images]
+base = "G:/Workspace/Palette/images/debian-13-xfce-desktop.qcow2"
+format = "qcow2"
+size_gib = 24
+
+[network]
+# No virtual NIC. Nothing about the guest is reachable and the guest can reach nothing.
+mode = "offline"
+
+[lifecycle]
+allow_agent_start = false
+allow_agent_stop = false
+allow_agent_reset = false
+allow_agent_force_stop = false
+# Each of these closes a door that default.toml leaves open.
+allow_agent_images = false
+allow_agent_iso = false
+allow_agent_qemu_args = false
+operator_only_tools = true
+
+[guest_tools]
+enabled = false
+protocol_version = "1.0"
+capabilities = []
+input_methods = []
+max_text_chars = 4096
+request_timeout_seconds = 20.0
+target_session = "interactive"
+
+[retention]
+keep_overlays = true
+max_overlays = 4
+persist_screenshots = false

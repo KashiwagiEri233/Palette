@@ -65,11 +65,34 @@ uv run python scripts/mcp_stdio_smoke.py
 allow_agent_resett = true    # 拒绝加载：你是想写 allow_agent_reset 吗？
 ```
 
-有两项控制不可放宽，加载器会拒绝任何尝试：
+只有一项控制不可放宽，加载器会拒绝任何尝试：
 
 * `allow_accelerator_fallback` —— 静默回退到 TCG 会改变威胁模型所依赖的隔离前提。缺少硬件加速
   是一个要诊断出来的失败。
-* 通过额外 QEMU 参数添加 monitor 或显示通道 —— 第二条无鉴权的输入路径会破坏单写入者假设。
+
+其余全部是开关，而随仓库提供的 `default.toml` 在其中三项上取了宽松一侧：网卡、客户机增强通道，
+以及调用方自行提供镜像、CD-ROM 与 QEMU 参数的权利。`strict-example.toml` 是同一台机器、把这些
+开关全部关闭。留着宽松那组之前请先读 `threat-model.zh-CN.md`：最后一项取消了宿主边界，而且任何
+参数过滤都换不回来。
+
+## 网络模式
+
+```toml
+[network]
+mode = "restricted-lab"          # 或者 "offline"、"nat"
+# mac = "52:54:00:12:34:56"
+# hostfwd = ["tcp::2222-:22"]
+```
+
+| 模式 | 网卡 | 客户机的可达范围 |
+| --- | --- | --- |
+| `offline` | 无 | 什么都到不了，也什么都到不了它 |
+| `restricted-lab` | user-mode，`restrict=on` | 无法路由出沙箱 |
+| `nat` | user-mode | 与宿主同等的出站能力，**没有出站策略** |
+| `internet-allowlist` | —— | 启动时被拒绝：白名单需要一个本构建并不具备的网关 |
+
+`hostfwd` 会从宿主机向客户机打一个洞，并在 VM 启动时被记录，因为它抵消了 `restrict=on` 提供的
+一部分隔离。
 
 ## 生命周期
 
@@ -80,6 +103,20 @@ uv run palette vm stop   --vm-id desktop
 uv run palette vm reset  --vm-id desktop
 uv run palette vm list
 ```
+
+启动时也可以带上宿主机材料，也就是下面这些 CLI 参数的用途：
+
+```bash
+uv run palette vm start --vm-id scratch \
+    --image D:/images/debian-testing.qcow2 \
+    --iso  D:/templates/firmware.iso \
+    --disk E:/data/scratch.qcow2 \
+    --qemu-arg=-smp --qemu-arg=4
+```
+
+`--image` 替换本实例的只读后端存储；可写层仍然创建在 `.runtime/` 下，仍然是重置所丢弃的东西。
+`--qemu-arg` 追加在最后，其威力正如其名——请先读 `threat-model.zh-CN.md`。运维总是可以使用这些
+参数；以 Agent 身份发起的调用则需要对应的 `allow_agent_*` 开关。
 
 * **start** 从只读基础镜像创建一份新的 overlay，隐藏启动 QEMU，完成 QMP 握手，恢复被暂停的
   客户机，并轮询等待第一个有效显示缓冲区。

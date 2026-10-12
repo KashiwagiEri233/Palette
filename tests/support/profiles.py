@@ -74,11 +74,13 @@ def make_profile(
         "resources": resources,
         "timeouts": timeouts,
         "capture": capture,
-        "guest_tools": GuestToolsConfig(),
+        # The test profile keeps the enhancement channel off so the baseline is what is
+        # under test; the hybrid tests opt in explicitly.
+        "guest_tools": GuestToolsConfig(enabled=False),
     }
     data.update(overrides)
     data.setdefault("display", DisplayConfig(width=width, height=height))
-    data.setdefault("network", NetworkConfig(mode="offline", restrict=True))
+    data.setdefault("network", NetworkConfig(mode="offline"))
     data.setdefault("text", TextConfig(char_interval_ms=1, max_chars=256))
     data.setdefault("retention", RetentionConfig(keep_overlays=True, max_overlays=4))
     return Profile(**data)  # type: ignore[arg-type]

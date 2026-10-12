@@ -61,7 +61,13 @@ class QemuConfig(_Strict):
     firmware: FirmwareConfig = Field(default_factory=FirmwareConfig)
     extra_args: list[str] = Field(
         default_factory=list,
-        description="Reviewed static arguments only; never agent-supplied",
+        description=(
+            "Static QEMU arguments from the operator. Not filtered: an operator writing a "
+            "profile is trusted, and once callers may pass their own arguments (see "
+            "LifecyclePolicy.allow_agent_qemu_args) an argument filter here would be "
+            "decorative. Adding a monitor, VNC or SPICE channel breaks the single-writer "
+            "assumption, so build_launch_plan warns when it sees one."
+        ),
     )
 
     @model_validator(mode="after")
@@ -71,16 +77,6 @@ class QemuConfig(_Strict):
                 "allow_accelerator_fallback must be false: missing acceleration is a diagnosed "
                 "failure, not a silent degradation"
             )
-        return self
-
-    @model_validator(mode="after")
-    def _no_injection(self) -> QemuConfig:
-        for arg in self.extra_args:
-            lowered = arg.lower()
-            if any(token in lowered for token in ("chardev", "-mon", "monitor", "telnet", "vnc")):
-                raise ValueError(
-                    f"profile must not add monitor or display channels to QEMU args: {arg!r}"
-                )
         return self
 
 
@@ -137,14 +133,45 @@ class CaptureConfig(_Strict):
 
 
 class NetworkConfig(_Strict):
-    mode: Literal["offline", "restricted-lab"] = "offline"
-    restrict: bool = True
+    """How the guest reaches a network.
 
-    @model_validator(mode="after")
-    def _offline_has_no_nic(self) -> NetworkConfig:
-        if self.mode != "offline" and self.restrict is False:
-            raise ValueError("a networked profile must keep user-networking restrictions enabled")
-        return self
+    ``offline`` attaches no NIC at all. ``restricted-lab`` and ``nat`` both attach one
+    through QEMU user-mode networking: the first adds ``restrict=on``, which stops the
+    guest routing past the slirp sandbox, the second does not and therefore gives the guest
+    the same outbound reach the host has.
+
+    ``internet-allowlist`` is declared because it is the only mode that would actually
+    express an egress *policy*, and it is refused at start: this build has no gateway,
+    proxy or firewall to enforce an allowlist, and user-mode NAT is not one.
+    """
+
+    mode: Literal["offline", "restricted-lab", "nat", "internet-allowlist"] = "restricted-lab"
+    #: Pins the guest MAC, for a lab network where the address matters.
+    mac: str | None = None
+    #: Additional QEMU ``-nic`` settings, passed through verbatim for the chosen mode.
+    extra_options: str | None = None
+    #: Port forwards for `restricted-lab`/`nat`, e.g. ["tcp::8080-:80"]. Recorded in the
+    #: audit trail at start, because an explicit forward punches through the user-mode
+    #: sandbox that the other settings otherwise provide.
+    hostfwd: list[str] = Field(default_factory=list)
+
+    @property
+    def attaches_nic(self) -> bool:
+        return self.mode != "offline"
+
+    def qemu_nic_argument(self) -> str:
+        """The ``-nic`` value for this mode."""
+        if self.mode == "offline":
+            return "none"
+        parts = ["user"]
+        if self.mode == "restricted-lab":
+            parts.append("restrict=on")
+        if self.mac:
+            parts.append(f"mac={self.mac}")
+        parts.extend(f"hostfwd={forward}" for forward in self.hostfwd)
+        if self.extra_options:
+            parts.append(self.extra_options)
+        return ",".join(parts)
 
 
 class TextConfig(_Strict):
@@ -168,22 +195,51 @@ class TimeoutConfig(_Strict):
 
 
 class LifecyclePolicy(_Strict):
-    """Who may drive the VM lifecycle. Agents get observation and control only by default."""
+    """Who may drive the VM lifecycle, and who may hand the service host-side material.
 
-    allow_agent_start: bool = False
+    The ``allow_agent_*`` flags below default to what an operator who wants full control
+    asks for. Every one of them is a switch: turn them off in a profile to get the stricter
+    posture back, and note that ``allow_agent_images`` and ``allow_agent_qemu_args`` are the
+    two that matter most — together they remove the host boundary entirely.
+    """
+
+    allow_agent_start: bool = True
     allow_agent_stop: bool = False
     allow_agent_reset: bool = False
     allow_agent_force_stop: bool = False
     operator_only_tools: bool = True
 
+    #: Let a request name the base image, bypassing the profile's pinned path and digest.
+    #: The named file becomes the read-only backing store, so it must be one the caller is
+    #: willing to expose; the service still copies nothing into it.
+    allow_agent_images: bool = True
+    #: Let a request append raw QEMU arguments. This is host code execution by another
+    #: name: `-chardev`, `-device`, `-blockdev` and friends can read and write host files,
+    #: and `-mon`/`-vnc` add a second, unauthenticated way to drive the guest.
+    allow_agent_qemu_args: bool = True
+    #: Let a request attach a CD-ROM or extra disk from an arbitrary host path.
+    allow_agent_iso: bool = True
+
 
 class GuestToolsConfig(_Strict):
-    """The retained enhancement channel: defined here, disabled by default."""
+    """The in-guest enhancement channel.
 
-    enabled: bool = False
+    Enabled by default, with both registered capabilities granted, because the point of the
+    channel is to be usable. It still delivers nothing until a guest-side service answers
+    the handshake: `vm_status` reports the two online states separately, and a call against
+    a guest with no service fails as unavailable rather than falling back to keystrokes.
+    """
+
+    enabled: bool = True
     protocol_version: str = "1.0"
-    capabilities: list[str] = Field(default_factory=list)
-    input_methods: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(
+        default_factory=lambda: ["guest.input_text", "guest.launch_app"],
+        description="Registered capabilities to request; the guest must also offer them",
+    )
+    input_methods: list[str] = Field(
+        default_factory=lambda: ["native_text"],
+        description="Preferred text backends, in order of preference",
+    )
     allowed_apps: dict[str, dict[str, Any]] = Field(default_factory=dict)
     max_text_chars: int = Field(default=4096, ge=1)
     request_timeout_seconds: float = Field(default=20.0, gt=0)

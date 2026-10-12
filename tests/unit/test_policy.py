@@ -25,7 +25,7 @@ def make_policy(guard: PathGuard, **overrides) -> Policy:
         "profile_id": "test",
         "qemu": QemuConfig(),
         "images": ImagesConfig(base=str(Path(os.getcwd()) / "missing.qcow2")),
-        "network": NetworkConfig(mode="offline", restrict=True),
+        "network": NetworkConfig(mode="offline"),
     }
     data.update(overrides)
     return Policy(Profile(**data), guard)  # type: ignore[arg-type]
@@ -122,12 +122,21 @@ class TestPathGuard:
 
 
 class TestLifecyclePermissions:
-    def test_agents_are_refused_by_default(self, guard: PathGuard) -> None:
+    def test_the_destructive_operations_stay_closed_to_agents(self, guard: PathGuard) -> None:
         policy = make_policy(guard)
-        for operation in ("start", "stop", "force_stop", "reset"):
+        for operation in ("stop", "force_stop", "reset"):
             with pytest.raises(PaletteError) as info:
                 policy.require_lifecycle(operation, actor="agent")  # type: ignore[arg-type]
             assert info.value.code is ErrorCode.POLICY_DENIED
+
+    def test_starting_is_open_to_agents_by_default(self, guard: PathGuard) -> None:
+        make_policy(guard).require_lifecycle("start", actor="agent")
+
+    def test_a_profile_can_close_starting(self, guard: PathGuard) -> None:
+        policy = make_policy(guard, lifecycle=LifecyclePolicy(allow_agent_start=False))
+        with pytest.raises(PaletteError) as info:
+            policy.require_lifecycle("start", actor="agent")
+        assert info.value.code is ErrorCode.POLICY_DENIED
 
     def test_operators_are_allowed(self, guard: PathGuard) -> None:
         policy = make_policy(guard)
@@ -137,7 +146,7 @@ class TestLifecyclePermissions:
     def test_a_granted_operation_is_allowed_for_agents(self, guard: PathGuard) -> None:
         policy = make_policy(
             guard,
-            lifecycle=LifecyclePolicy(allow_agent_stop=True),
+            lifecycle=LifecyclePolicy(allow_agent_stop=True, allow_agent_start=False),
         )
         policy.require_lifecycle("stop", actor="agent")
         with pytest.raises(PaletteError):
@@ -145,14 +154,59 @@ class TestLifecyclePermissions:
 
     def test_capabilities_reflect_the_grants(self, guard: PathGuard) -> None:
         policy = make_policy(guard)
-        assert policy.capabilities() == ["observe", "control"]
-        granted = make_policy(guard, lifecycle=LifecyclePolicy(allow_agent_reset=True))
-        assert "lifecycle.reset" in granted.capabilities()
+        # Every grant the profile makes is reported, including the host-material ones: a
+        # client should be able to see that this profile lets a caller name an image or
+        # append arguments, rather than finding out by trying.
+        assert set(policy.capabilities()) >= {
+            "observe",
+            "control",
+            "lifecycle.start",
+            "host.image",
+            "host.iso",
+            "host.qemu_args",
+        }
+        assert "lifecycle.reset" not in policy.capabilities()
+        strict = make_policy(guard, lifecycle=LifecyclePolicy(allow_agent_images=False))
+        assert "host.image" not in strict.capabilities()
+
+
+class TestHostMaterial:
+    """Who may hand the service a path or a QEMU argument."""
+
+    def test_operators_may_always_supply_host_material(self, guard: PathGuard) -> None:
+        policy = make_policy(
+            guard,
+            lifecycle=LifecyclePolicy(
+                allow_agent_images=False, allow_agent_iso=False, allow_agent_qemu_args=False
+            ),
+        )
+        for kind in ("image", "iso", "qemu_args"):
+            policy.require_host_material(kind, actor="operator")  # type: ignore[arg-type]
+
+    def test_the_switches_are_independent(self, guard: PathGuard) -> None:
+        policy = make_policy(
+            guard,
+            lifecycle=LifecyclePolicy(
+                allow_agent_images=True, allow_agent_iso=False, allow_agent_qemu_args=True
+            ),
+        )
+        policy.require_host_material("image", actor="agent")
+        policy.require_host_material("qemu_args", actor="agent")
+        with pytest.raises(PaletteError) as info:
+            policy.require_host_material("iso", actor="agent")
+        assert info.value.code is ErrorCode.POLICY_DENIED
+        assert info.value.details["switch"] == "allow_agent_iso"
+
+    def test_a_closed_switch_refuses_the_agent(self, guard: PathGuard) -> None:
+        policy = make_policy(guard, lifecycle=LifecyclePolicy(allow_agent_qemu_args=False))
+        with pytest.raises(PaletteError) as info:
+            policy.require_host_material("qemu_args", actor="agent")
+        assert info.value.code is ErrorCode.POLICY_DENIED
 
 
 class TestCapabilityGating:
     def test_guest_tools_are_unavailable_when_disabled(self, guard: PathGuard) -> None:
-        policy = make_policy(guard)
+        policy = make_policy(guard, guest_tools=GuestToolsConfig(enabled=False))
         with pytest.raises(PaletteError) as info:
             policy.require_capability("guest.input_text")
         assert info.value.code is ErrorCode.GUEST_TOOL_UNAVAILABLE
@@ -213,8 +267,17 @@ class TestAssetsAndNetwork:
             policy.require_base_image()
         assert info.value.code is ErrorCode.IMAGE_INVALID
 
-    def test_only_the_offline_mode_is_accepted_by_this_build(self, guard: PathGuard) -> None:
-        policy = make_policy(guard, network=NetworkConfig(mode="restricted-lab", restrict=True))
+    @pytest.mark.parametrize("mode", ["offline", "restricted-lab", "nat"])
+    def test_the_implemented_network_modes_are_accepted(self, guard: PathGuard, mode: str) -> None:
+        make_policy(guard, network=NetworkConfig(mode=mode)).require_network_supported()  # type: ignore[arg-type]
+
+    def test_an_egress_allowlist_is_refused_because_nothing_enforces_it(
+        self, guard: PathGuard
+    ) -> None:
+        """User-mode NAT lets a guest out; it is not an allowlist, and this build has no
+        gateway to make it one."""
+        policy = make_policy(guard, network=NetworkConfig(mode="internet-allowlist"))
         with pytest.raises(PaletteError) as info:
-            policy.require_network_offline()
-        assert info.value.code is ErrorCode.POLICY_DENIED
+            policy.require_network_supported()
+        assert info.value.code is ErrorCode.NOT_IMPLEMENTED
+        assert "not an allowlist" in info.value.message

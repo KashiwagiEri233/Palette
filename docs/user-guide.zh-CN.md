@@ -111,8 +111,21 @@ vm_observe ──▶ 决策 ──▶ vm_act(frame_id) ──▶ 新截图 ─�
 
 ### 生命周期工具
 
-`vm_start`、`vm_stop` 和 `vm_reset` 被注册，是为了让运维可以通过 MCP 客户端驱动它们，但对 Agent
-一律拒绝，除非 profile 显式授予该权限。注册了工具不等于给了许可。
+`vm_start`、`vm_stop` 与 `vm_reset` 让调用方驱动生命周期。随仓库提供的 profile 只开放**启动**；
+停止、强制停止与重置仍归运维，且各自是一个独立开关。
+
+`vm_start` 也接受宿主机材料，每一项各有一个开关：
+
+| 参数 | 作用 |
+| --- | --- |
+| `image`、`image_format` | 改用它指定的基础镜像启动，而非 profile 钉住的那一个 |
+| `iso` | 从宿主路径挂载一个或多个 CD-ROM（可重复） |
+| `extra_disks` | 从宿主路径挂载额外磁盘 |
+| `qemu_args` | 向命令行追加原始 QEMU 参数 |
+
+用最后一项之前请先读 `threat-model.zh-CN.md`。`qemu_args` 不是一个调参旋钮：它让调用方把 QEMU
+指向宿主机文件、并加出第二条驱动客户机的通道；一旦它生效，本文档里其他东西都不再是保证。每一次
+拒绝都会指明本该放行的那个开关，所以一个 `POLICY_DENIED` 会告诉你该打开哪一个——或者该别去动它。
 
 ## 文本：什么能用，什么不能用
 
@@ -124,8 +137,10 @@ Unicode；一个按键事件是什么意思，由客户机的布局和输入法�
   `{"type": "key", "keys": ["ENTER"]}`。
 * US 可打印 ASCII 之外的任何字符都会以 `UNSUPPORTED_TEXT` 被拒绝——**并且一个字符都不会打出去**。
   整个字符串会在第一个按键事件之前完成校验。
-* 中文、emoji 以及其他 Unicode 需要客户机增强通道（`vm_guest_input_text`），那是一项单独的、
-  需要显式启用的能力。
+* 中文、emoji 以及其他 Unicode 需要客户机增强通道（`vm_guest_input_text`）。那是一项单独的
+  能力，且需要客户机内真的跑着一个服务。它在随仓库提供的 profile 里是启用的，但自身不产生任何
+  效果：依赖它之前先看 `vm_status`；当客户机里没有服务应答时，应当预期 `GUEST_TOOL_UNAVAILABLE`
+  而不是意外。
 
 ## Frame 会过期
 

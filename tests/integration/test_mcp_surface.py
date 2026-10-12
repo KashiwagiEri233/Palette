@@ -263,16 +263,80 @@ class TestActionTool:
 
 
 class TestLifecycleTools:
-    async def test_an_agent_cannot_start_a_vm_through_the_tool(self, server) -> None:
-        """The tool is registered, but its existence is not permission: the trusted profile
-        refuses, and the refusal is a structured error rather than a silent success."""
+    async def test_an_agent_can_start_a_vm_through_the_tool(self, server) -> None:
         result = await call(server, "vm_start", vm_id="desktop")
+        assert result.is_error is False
+        assert result.structured_content["ok"] is True
+        assert result.structured_content["state"] == "RUNNING"
+
+    async def test_the_start_tool_exposes_the_host_material_parameters(self, server) -> None:
+        tools = {tool.name: tool for tool in server._tool_manager.list_tools()}
+        properties = tools["vm_start"].parameters["properties"]
+        for name in ("image", "image_format", "iso", "extra_disks", "qemu_args"):
+            assert name in properties
+
+    async def test_a_caller_supplied_image_backs_the_instance(
+        self, server, base_image, tmp_path
+    ) -> None:
+        result = await call(server, "vm_start", vm_id="desktop", image=str(base_image))
+        assert result.is_error is False
+        assert result.structured_content["note"] is not None
+        assert "image" in result.structured_content["note"]
+
+    async def test_a_missing_caller_image_is_refused_before_anything_starts(
+        self, server, tmp_path
+    ) -> None:
+        result = await call(
+            server, "vm_start", vm_id="desktop", image=str(tmp_path / "absent.qcow2")
+        )
         assert result.is_error is True
-        assert result.structured_content["ok"] is False
+        assert result.structured_content["error"]["code"] == "IMAGE_MISSING"
+
+    async def test_a_relative_caller_image_is_refused(self, server) -> None:
+        result = await call(server, "vm_start", vm_id="desktop", image="relative/base.qcow2")
+        assert result.is_error is True
+        assert result.structured_content["error"]["code"] == "PATH_DENIED"
+
+    async def test_qemu_arguments_reach_the_plan_when_the_profile_allows_them(
+        self, server, service
+    ) -> None:
+        result = await call(server, "vm_start", vm_id="desktop", qemu_args=["-m", "8192"])
+        assert result.is_error is False
+        instance = service.manager.get("desktop")
+        assert "-m" in instance.plan.argv
+        assert instance.plan.notes  # the override is recorded on the plan
+
+    async def test_an_oversized_argument_vector_is_refused(self, server) -> None:
+        result = await call(server, "vm_start", vm_id="desktop", qemu_args=["-m"] * 100)
+        assert result.is_error is True
+        assert result.structured_content["error"]["code"] == "INVALID_ARGUMENT"
+
+    async def test_a_closed_switch_refuses_host_material(self, server, service, base_image) -> None:
+        from palette.config import LifecyclePolicy
+        from support.profiles import make_profile
+
+        service.config.profiles["default"] = make_profile(
+            base_image, lifecycle=LifecyclePolicy(allow_agent_images=False)
+        )
+        result = await call(server, "vm_start", vm_id="desktop", image=str(base_image))
+        assert result.is_error is True
         assert result.structured_content["error"]["code"] == "POLICY_DENIED"
+        assert result.structured_content["error"]["details"]["kind"] == "image"
 
     async def test_an_agent_cannot_reset_a_vm_through_the_tool(self, server, running_vm) -> None:
         result = await call(server, "vm_reset", vm_id="desktop")
+        assert result.is_error is True
+        assert result.structured_content["error"]["code"] == "POLICY_DENIED"
+
+    async def test_an_agent_cannot_force_stop_a_vm(self, server, running_vm) -> None:
+        result = await call(server, "vm_stop", vm_id="desktop", force=True)
+        assert result.is_error is True
+        assert result.structured_content["error"]["code"] == "POLICY_DENIED"
+
+    async def test_a_graceful_stop_is_still_closed_to_agents(self, server, running_vm) -> None:
+        """Stopping is not in the permissive set either: the caller may start a VM, not end
+        one it did not create."""
+        result = await call(server, "vm_stop", vm_id="desktop")
         assert result.is_error is True
         assert result.structured_content["error"]["code"] == "POLICY_DENIED"
 

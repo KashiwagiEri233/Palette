@@ -111,6 +111,33 @@ def _build_parser() -> argparse.ArgumentParser:
     start = vm_sub.add_parser("start", help="create an instance and boot it")
     start.add_argument("--vm-id", default=DEFAULT_VM_ID)
     start.add_argument("--profile", default=None)
+    start.add_argument(
+        "--image",
+        default=None,
+        help="base image to back this instance instead of the profile's pinned one",
+    )
+    start.add_argument("--image-format", default=None, choices=["qcow2", "raw"])
+    start.add_argument(
+        "--iso",
+        action="append",
+        default=None,
+        help="attach a CD-ROM; repeatable",
+    )
+    start.add_argument(
+        "--disk",
+        action="append",
+        default=None,
+        help="attach an extra disk; repeatable",
+    )
+    start.add_argument(
+        "--qemu-arg",
+        action="append",
+        default=None,
+        help=(
+            "append a raw QEMU argument; repeatable. You are handing QEMU to the caller: "
+            "arguments can read and write host files and add a second control channel"
+        ),
+    )
     start.set_defaults(handler=_cmd_vm_start)
 
     stop = vm_sub.add_parser("stop", help="shut the guest down and stop QEMU")
@@ -220,7 +247,18 @@ def _cmd_config_show(args: argparse.Namespace) -> int:
 
 def _cmd_vm_start(args: argparse.Namespace) -> int:
     service = _service(args)
-    result = asyncio.run(_run_start(service, args.vm_id, args.profile))
+    result = asyncio.run(
+        _run_start(
+            service,
+            args.vm_id,
+            args.profile,
+            image=args.image,
+            image_format=args.image_format,
+            iso=args.iso,
+            extra_disks=args.disk,
+            qemu_args=args.qemu_arg,
+        )
+    )
     print(json.dumps(result.model_dump(mode="json"), indent=2, default=str))
     return EXIT_OK if result.ok else EXIT_RUNTIME
 
@@ -281,11 +319,28 @@ def _cmd_vm_list(args: argparse.Namespace) -> int:
 
 
 async def _run_start(
-    service: PaletteService, vm_id: str, profile_id: str | None
+    service: PaletteService,
+    vm_id: str,
+    profile_id: str | None,
+    *,
+    image: str | None = None,
+    image_format: str | None = None,
+    iso: list[str] | None = None,
+    extra_disks: list[str] | None = None,
+    qemu_args: list[str] | None = None,
 ) -> LifecycleResult:
     await service.startup()
     try:
-        return await service.start(vm_id, profile_id=profile_id, actor="operator")
+        return await service.start(
+            vm_id,
+            profile_id=profile_id,
+            actor="operator",
+            image=image,
+            image_format=image_format,
+            iso=iso,
+            extra_disks=extra_disks,
+            qemu_args=qemu_args,
+        )
     finally:
         await service.shutdown()
 

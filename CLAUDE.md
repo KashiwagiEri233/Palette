@@ -21,8 +21,11 @@ scheduler and audit, but nothing visual may come to depend on it, and a failed e
 must never be silently downgraded into keystrokes or a retry. This build ships the enhancement
 contract, a disabled backend, a mock and a bridge — not a guest-side service.
 
-Defaults that constrain feature work: offline with no NIC, guest tools disabled, no arbitrary
-image paths or QEMU arguments, no TCG fallback, no persistent screenshots.
+Defaults that constrain feature work: a sandboxed NIC (`restricted-lab`), the guest enhancement
+channel enabled, a caller permitted to supply its own base image, CD-ROMs and raw QEMU
+arguments — and, still closed, an enforced egress allowlist, TCG fallback, persistent
+screenshots, and the destructive lifecycle operations. `profiles/strict-example.toml` closes
+every switch and is the same machine otherwise.
 
 Two documentation conventions are enforced by hand, not by tooling:
 
@@ -136,8 +139,21 @@ failure path can clean up through the same manifest-verified route. Every manage
 through `PathGuard`, which checks lexically *and* refuses to follow a junction or reparse point.
 
 **Profiles are frozen and `extra="forbid"`.** A misspelled safety switch must fail loudly.
-Two controls deliberately cannot be relaxed and the loader rejects profiles that try:
-`allow_accelerator_fallback` and extra QEMU args adding a monitor or display channel.
+One control deliberately cannot be relaxed: `allow_accelerator_fallback`. Everything else —
+including arguments that add a monitor or display channel — is a switch, and the loader takes
+an operator's arguments at face value.
+
+**Caller-supplied host material is its own axis.** `allow_agent_images`, `allow_agent_iso` and
+`allow_agent_qemu_args` are authorised, validated and audited one at a time via
+`Policy.require_host_material`; a refusal names the switch. Paths go through
+`vm.images.validate_caller_path` (absolute, exists, a regular file — **not** `PathGuard`, since
+these are deliberately outside the runtime root) and arguments through
+`service._validate_qemu_args`, which bounds count and length but deliberately does not filter
+content. A caller-supplied image becomes the read-only backing store for an overlay that is
+still ours, still per-instance, and still discarded by reset; the manifest records it. Read
+`docs/threat-model.md` before touching any of this: with `allow_agent_qemu_args` on, every
+other invariant in this section is advisory, and the service says so rather than pretending a
+blocklist would help.
 
 **Guest tools are registered only if a profile enables them** — and every call still re-checks
 the profile grant and the live capability handshake. Reported capabilities are the intersection

@@ -65,17 +65,34 @@ class TestLoading:
     def test_a_minimal_profile_loads_with_production_defaults(
         self, repo: Path, base_image: Path
     ) -> None:
-        write_profile(repo, "default", profile_body(base_image))
+        # Deliberately no [network], [lifecycle] or [guest_tools] tables: this asserts what
+        # a profile that says nothing at all gets.
+        write_profile(
+            repo,
+            "default",
+            'profile_id = "default"\n'
+            "[qemu]\n"
+            'accelerator = "whpx"\n'
+            "[images]\n"
+            f"base = '{base_image.as_posix()}'\n",
+        )
         config = load(repo)
         profile = config.profile(None)
         assert profile.profile_id == "default"
-        # The safety-relevant defaults are the point: a profile that says nothing about
-        # them still gets the safe answer.
-        assert profile.network.mode == "offline"
-        assert profile.qemu.allow_accelerator_fallback is False
-        assert profile.guest_tools.enabled is False
+        # A profile that says nothing still gets a complete, deliberate posture rather than
+        # an empty one. These are the current defaults; each is a switch.
+        assert profile.network.mode == "restricted-lab"  # a NIC, sandboxed
+        assert profile.network.attaches_nic is True
+        assert profile.qemu.allow_accelerator_fallback is False  # still refuses to degrade
+        assert profile.guest_tools.enabled is True
+        assert profile.guest_tools.capabilities == ["guest.input_text", "guest.launch_app"]
+        assert profile.lifecycle.allow_agent_start is True
+        assert profile.lifecycle.allow_agent_images is True
+        assert profile.lifecycle.allow_agent_qemu_args is True
+        # Destructive lifecycle operations stay closed even so.
         assert profile.lifecycle.allow_agent_reset is False
-        assert profile.mode == "visual_only"
+        assert profile.lifecycle.allow_agent_force_stop is False
+        assert profile.mode == "hybrid"
 
     def test_several_profiles_are_loaded_and_addressable(
         self, repo: Path, base_image: Path
@@ -145,14 +162,17 @@ class TestRefusedRelaxations:
         "extra",
         ["-mon vc,mode=control", "-chardev socket,id=x,port=4444", "-vnc :0", "-display vnc=:0"],
     )
-    def test_a_profile_may_not_add_a_second_control_channel(
+    def test_operator_arguments_are_taken_at_face_value(
         self, repo: Path, base_image: Path, extra: str
     ) -> None:
+        """An operator writing a profile is trusted, and once callers may pass their own
+        arguments an argument filter here would be decorative. A second control channel is
+        therefore accepted — and flagged when the plan is built, which is what makes the
+        broken single-writer guarantee visible instead of silent."""
         body = profile_body(base_image, qemu=f'extra_args = ["{extra}"]\n')
         write_profile(repo, "default", body)
-        with pytest.raises(PaletteError) as info:
-            load(repo)
-        assert "monitor or display" in info.value.message
+        profile = load(repo).profile(None)
+        assert profile.qemu.extra_args == [extra]
 
     def test_an_unknown_key_is_a_typo_not_a_silent_no_op(
         self, repo: Path, base_image: Path
@@ -168,7 +188,7 @@ class TestRefusedRelaxations:
     def test_guest_tools_enabled_without_capabilities_is_refused(
         self, repo: Path, base_image: Path
     ) -> None:
-        body = profile_body(base_image, guest_tools="enabled = true\n")
+        body = profile_body(base_image, guest_tools="enabled = true\ncapabilities = []")
         write_profile(repo, "default", body)
         with pytest.raises(PaletteError):
             load(repo)
@@ -191,29 +211,49 @@ class TestRefusedRelaxations:
             load(repo)
 
 
-class TestHybridProfile:
-    def test_the_shipped_hybrid_example_loads_and_stays_operator_only(self) -> None:
-        """The example file is documentation as much as configuration, so it has to be
-        valid: a broken example is worse than no example."""
-        config = load_config(Path(__file__).resolve().parents[2])
-        profile = config.profile("hybrid-example")
+class TestShippedProfiles:
+    """The profiles in the repository are documentation as much as configuration, so a
+    broken one is worse than none. Both must load, and both must be what they claim."""
+
+    def test_the_default_profile_is_permissive_and_says_so(self) -> None:
+        profile = load_config(Path(__file__).resolve().parents[2]).profile("default")
         assert profile.mode == "hybrid"
         assert profile.guest_tools.enabled is True
-        assert set(profile.guest_tools.capabilities) == {"guest.input_text", "guest.launch_app"}
+        assert profile.guest_tools.input_methods == ["native_text"]
         assert profile.guest_tools.allowed_apps["text-editor"]["executable"] == "/usr/bin/mousepad"
-        # Enabling the guest channel must not hand the agent the lifecycle.
-        assert profile.lifecycle.allow_agent_start is False
+        assert profile.network.attaches_nic is True
+        assert profile.network.mode == "restricted-lab"
+        assert profile.lifecycle.allow_agent_start is True
+        assert profile.lifecycle.allow_agent_images is True
+        assert profile.lifecycle.allow_agent_iso is True
+        assert profile.lifecycle.allow_agent_qemu_args is True
+        # Even the permissive profile keeps the destructive operations shut.
         assert profile.lifecycle.allow_agent_reset is False
-        assert profile.network.mode == "offline"
-
-    def test_the_shipped_default_profile_is_visual_only_and_offline(self) -> None:
-        config = load_config(Path(__file__).resolve().parents[2])
-        profile = config.profile("default")
-        assert profile.mode == "visual_only"
-        assert profile.guest_tools.enabled is False
-        assert profile.network.mode == "offline"
+        assert profile.lifecycle.allow_agent_force_stop is False
         assert profile.capture.keep_frames is False
         assert profile.display.keymap == "us"
+
+    def test_the_strict_example_closes_every_switch(self) -> None:
+        profile = load_config(Path(__file__).resolve().parents[2]).profile("strict-example")
+        assert profile.mode == "visual_only"
+        assert profile.network.mode == "offline"
+        assert profile.network.attaches_nic is False
+        assert profile.guest_tools.enabled is False
+        assert profile.lifecycle.allow_agent_start is False
+        assert profile.lifecycle.allow_agent_images is False
+        assert profile.lifecycle.allow_agent_iso is False
+        assert profile.lifecycle.allow_agent_qemu_args is False
+
+    def test_the_two_shipped_profiles_differ_only_in_posture(self) -> None:
+        """The strict example is the default machine with the doors shut, not a different
+        machine: the same devices, the same resolution, the same timeouts."""
+        config = load_config(Path(__file__).resolve().parents[2])
+        permissive, strict = config.profile("default"), config.profile("strict-example")
+        assert permissive.devices == strict.devices
+        assert permissive.display == strict.display
+        assert permissive.qemu.accelerator == strict.qemu.accelerator
+        assert permissive.qemu.machine == strict.qemu.machine
+        assert permissive.capture.max_long_edge == strict.capture.max_long_edge
 
 
 class TestConfigRootDiscovery:

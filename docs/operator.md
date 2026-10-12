@@ -69,12 +69,35 @@ fails loudly rather than silently leaving a default in place:
 allow_agent_resett = true    # refuses to load: did you mean allow_agent_reset?
 ```
 
-Two controls cannot be relaxed, and the loader refuses a profile that tries:
+One control cannot be relaxed, and the loader refuses a profile that tries:
 
 * `allow_accelerator_fallback` — a silent fall back to TCG would change the isolation
   story the threat model depends on. Missing acceleration is a diagnosed failure.
-* extra QEMU arguments that add a monitor or display channel — a second, unauthenticated
-  input path would break the single-writer assumption.
+
+Everything else is a switch, and the shipped `default.toml` takes the permissive side of
+three of them: a NIC, the guest enhancement channel, and a caller's right to supply its own
+image, CD-ROMs and QEMU arguments. `strict-example.toml` is the same machine with all of them
+closed. Read `threat-model.md` before leaving the permissive set on: the last one removes the
+host boundary, and no amount of argument filtering would put it back.
+
+## Network modes
+
+```toml
+[network]
+mode = "restricted-lab"          # or "offline", or "nat"
+# mac = "52:54:00:12:34:56"
+# hostfwd = ["tcp::2222-:22"]
+```
+
+| Mode | NIC | Guest's reach |
+| --- | --- | --- |
+| `offline` | none | nothing, and nothing reaches it |
+| `restricted-lab` | user-mode, `restrict=on` | it cannot route past the sandbox |
+| `nat` | user-mode | the same outbound reach the host has, with **no egress policy** |
+| `internet-allowlist` | — | refused at start: an allowlist needs a gateway this build does not have |
+
+`hostfwd` punches a hole from the host into the guest and is recorded when the VM starts,
+because it undoes part of what `restrict=on` provides.
 
 ## Lifecycle
 
@@ -85,6 +108,21 @@ uv run palette vm stop   --vm-id desktop
 uv run palette vm reset  --vm-id desktop
 uv run palette vm list
 ```
+
+A start can also carry host material, which is what the CLI flags below are for:
+
+```bash
+uv run palette vm start --vm-id scratch \
+    --image D:/images/debian-testing.qcow2 \
+    --iso  D:/templates/firmware.iso \
+    --disk E:/data/scratch.qcow2 \
+    --qemu-arg=-smp --qemu-arg=4
+```
+
+`--image` replaces the read-only backing store for this instance; the writable layer is still
+created under `.runtime/` and is still what a reset throws away. `--qemu-arg` is appended last
+and is exactly as powerful as it sounds — read `threat-model.md` first. Operators may always
+use these; a caller acting as an agent needs the matching `allow_agent_*` switch.
 
 * **start** creates a fresh overlay from the read-only base, starts QEMU hidden, negotiates
   QMP, resumes the paused guest and polls for a first valid framebuffer.

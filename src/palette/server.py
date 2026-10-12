@@ -223,15 +223,32 @@ def register_lifecycle_tools(server: MCPServer, service: PaletteService) -> None
         title="Start the VM",
         annotations=CONTROL,
         description=(
-            "Create a new instance from an allowed profile and boot it. Refused unless "
-            "the profile grants agents this permission; operators use the CLI."
+            "Create a new instance from an allowed profile and boot it. A caller may also "
+            "name the base image, attach CD-ROMs or extra disks from host paths, and append "
+            "raw QEMU arguments; each of those needs its own switch in the profile, and the "
+            "last one hands the host to the caller. Operators use the CLI."
         ),
     )
     async def vm_start(
-        vm_id: str, profile_id: str | None = None
+        vm_id: str,
+        profile_id: str | None = None,
+        image: str | None = None,
+        image_format: str | None = None,
+        iso: list[str] | None = None,
+        extra_disks: list[str] | None = None,
+        qemu_args: list[str] | None = None,
     ) -> Annotated[CallToolResult, LifecycleResult]:
         try:
-            result = await service.start(vm_id, profile_id=profile_id, actor="agent")
+            result = await service.start(
+                vm_id,
+                profile_id=profile_id,
+                actor="agent",
+                image=image,
+                image_format=image_format,
+                iso=iso,
+                extra_disks=extra_disks,
+                qemu_args=qemu_args,
+            )
         except PaletteError as exc:
             return _failure(LifecycleResult, exc, vm_id=vm_id)
         return _success(result)

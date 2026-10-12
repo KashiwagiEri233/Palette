@@ -42,6 +42,7 @@ from ..qmp.client import QmpClient
 from ..qmp.transport import ProcessQmpTransport
 from .images import ImageManager, InstancePaths
 from .launcher import (
+    LaunchOverrides,
     LaunchPlan,
     build_launch_plan,
     locate_binary,
@@ -96,6 +97,9 @@ class VmInstance:
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
     started_monotonic: float = field(default_factory=time.monotonic)
     stop_requested: bool = False
+    #: Host material the caller supplied for this instance. Kept so a reset rebuilds the
+    #: instance that was asked for instead of quietly reverting to the profile's defaults.
+    overrides: LaunchOverrides = field(default_factory=LaunchOverrides)
 
     @property
     def state(self) -> VmState:
@@ -168,7 +172,13 @@ class VmManager:
         return instance
 
     # -- start -----------------------------------------------------------------------
-    async def start(self, vm_id: str, profile_id: str | None = None) -> VmInstance:
+    async def start(
+        self,
+        vm_id: str,
+        profile_id: str | None = None,
+        *,
+        overrides: LaunchOverrides | None = None,
+    ) -> VmInstance:
         validate_identifier(vm_id, what="vm_id")
         profile = self.config.profile(profile_id)
         async with self._lock:
@@ -179,12 +189,14 @@ class VmManager:
                 VmState.PAUSED,
             }:
                 raise PaletteError(ErrorCode.VM_ALREADY_RUNNING, f"VM {vm_id!r} is already running")
-            return await self._start_locked(vm_id, profile)
+            return await self._start_locked(vm_id, profile, overrides or LaunchOverrides())
 
-    async def _start_locked(self, vm_id: str, profile: Profile) -> VmInstance:
+    async def _start_locked(
+        self, vm_id: str, profile: Profile, overrides: LaunchOverrides
+    ) -> VmInstance:
         guard_root = PathGuard(self.config.runtime_root)
         policy = Policy(profile, guard_root)
-        policy.require_network_offline()
+        policy.require_network_supported()
 
         binary = locate_binary(profile, self.config.host)
         if binary is None:
@@ -242,11 +254,12 @@ class VmManager:
             policy=policy,
             paths=paths,
             cleanup_root=paths.root,
+            overrides=overrides,
         )
         self._instances[vm_id] = instance
 
         try:
-            await self._provision(instance, images, profile, binary, accelerator)
+            await self._provision(instance, images, profile, binary, accelerator, overrides)
         except PaletteError as exc:
             view.last_error = ErrorPayload(**exc.as_payload())
             with contextlib.suppress(PaletteError):
@@ -286,6 +299,7 @@ class VmManager:
         profile: Profile,
         binary: str,
         accelerator: str,
+        overrides: LaunchOverrides,
     ) -> None:
         """The startup sequence, in the order the plan requires."""
         paths = instance.paths
@@ -295,15 +309,19 @@ class VmManager:
         images.write_manifest(
             paths,
             {
-                "base_image": profile.images.base,
+                "base_image": str(overrides.image) if overrides.image else profile.images.base,
+                "base_from_caller": overrides.image is not None,
                 "overlay": str(paths.overlay),
+                "attached_volumes": [str(volume.path) for volume in overrides.volumes],
                 "state": str(VmState.STARTING),
                 "host_boot_epoch": instance.view.boot_epoch,
             },
         )
 
-        # 1. writable layer from the read-only base, with the backing chain verified.
-        await images.create_overlay(paths)
+        # 1. writable layer from the read-only base, with the backing chain verified. A
+        #    caller-supplied image replaces the profile's pinned base here and nowhere else:
+        #    the writable layer is still ours, per-instance, and discarded by reset.
+        await images.create_overlay(paths, base=overrides.image, base_format=overrides.image_format)
         images.stage_firmware_vars(paths)
 
         # 2. command line, then the process itself, hidden and with a whitelisted env.
@@ -317,6 +335,8 @@ class VmManager:
             hardware_vars_path=paths.hardware_vars,
             accelerator=accelerator,
             start_paused=True,
+            extra_volumes=overrides.volumes,
+            caller_args=overrides.qemu_args,
         )
         instance.plan = plan
         process = await spawn_qemu(plan)
@@ -604,7 +624,11 @@ class VmManager:
                 images.delete_instance(vm_id, previous_instance)
         if self.audit:
             self.audit.record("vm.reset", vm_id=vm_id, previous_instance=previous_instance)
-        renewed = await self.start(vm_id, profile.profile_id)
+        renewed = await self.start(
+            vm_id,
+            profile.profile_id,
+            overrides=instance.overrides if instance is not None else None,
+        )
         # Pruning runs after the new instance exists, so the retention limit is applied to
         # the *stopped* layers rather than to a set that is about to grow by one.
         with contextlib.suppress(Exception):

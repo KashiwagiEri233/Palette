@@ -19,6 +19,8 @@ import contextlib
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Literal
 
 from .audit import AuditLog, NullAuditLog
@@ -43,6 +45,8 @@ from .models import (
     WaitResult,
 )
 from .policy import PathGuard, Policy, validate_identifier
+from .vm.images import validate_caller_path
+from .vm.launcher import ExtraVolume, LaunchOverrides
 from .vm.manager import VmInstance, VmManager, VmState
 
 logger = logging.getLogger("palette.service")
@@ -521,20 +525,108 @@ class PaletteService:
 
     # -- lifecycle --------------------------------------------------------------------
     async def start(
-        self, vm_id: str, *, profile_id: str | None = None, actor: Actor = "operator"
+        self,
+        vm_id: str,
+        *,
+        profile_id: str | None = None,
+        actor: Actor = "operator",
+        image: str | None = None,
+        image_format: str | None = None,
+        iso: Sequence[str] | None = None,
+        extra_disks: Sequence[str] | None = None,
+        qemu_args: Sequence[str] | None = None,
     ) -> LifecycleResult:
+        """Start a VM, optionally with host material the caller supplied.
+
+        Each kind of override has its own switch and its own consequence, so they are
+        authorised and validated one at a time rather than as a bundle. Nothing here is
+        filtered for content: a caller who may pass QEMU arguments may pass any of them,
+        which is exactly the condition the threat model records as "the host boundary is
+        the caller's to keep".
+        """
         validate_identifier(vm_id, what="vm_id")
         profile = self.config.profile(profile_id)
         # The lifecycle gate uses the profile being started, not one already running.
         gate = Policy(profile, _runtime_guard(self.config))
         gate.require_lifecycle("start", actor=actor)
-        instance = await self.manager.start(vm_id, profile.profile_id)
+        overrides = self._build_overrides(
+            gate,
+            actor=actor,
+            image=image,
+            image_format=image_format,
+            iso=iso,
+            extra_disks=extra_disks,
+            qemu_args=qemu_args,
+        )
+        instance = await self.manager.start(vm_id, profile.profile_id, overrides=overrides)
+        if self.audit.enabled and not overrides.is_empty:
+            # Shape only: kinds and counts. The paths themselves go into the manifest, where
+            # they belong, and not into a log that outlives the instance.
+            self.audit.record(
+                "vm.started_with_overrides",
+                vm_id=vm_id,
+                instance_id=instance.view.instance_id,
+                overrides=",".join(overrides.describe()),
+            )
         return LifecycleResult(
             ok=True,
             vm_id=vm_id,
             state=str(instance.state),
             instance_id=instance.view.instance_id,
             profile_id=profile.profile_id,
+            note=(
+                "started with caller-supplied " + ", ".join(overrides.describe())
+                if not overrides.is_empty
+                else None
+            ),
+        )
+
+    def _build_overrides(
+        self,
+        gate: Policy,
+        *,
+        actor: Actor,
+        image: str | None,
+        image_format: str | None,
+        iso: Sequence[str] | None,
+        extra_disks: Sequence[str] | None,
+        qemu_args: Sequence[str] | None,
+    ) -> LaunchOverrides:
+        """Authorise, then validate, then normalise what the caller handed us."""
+        resolved_image: Path | None = None
+        if image is not None:
+            gate.require_host_material("image", actor=actor)
+            resolved_image = validate_caller_path(image, what="image")
+        if image_format is not None and resolved_image is None:
+            raise PaletteError(
+                ErrorCode.INVALID_ARGUMENT,
+                "image_format only means something together with image",
+            )
+
+        volumes: list[ExtraVolume] = []
+        optical = list(iso or ())
+        disks = list(extra_disks or ())
+        if optical or disks:
+            gate.require_host_material("iso", actor=actor)
+        for path in optical:
+            volumes.append(
+                ExtraVolume(path=str(validate_caller_path(path, what="ISO")), media="cdrom")
+            )
+        for path in disks:
+            volumes.append(
+                ExtraVolume(path=str(validate_caller_path(path, what="extra disk")), media="disk")
+            )
+
+        args = list(qemu_args or ())
+        if args:
+            gate.require_host_material("qemu_args", actor=actor)
+            args = _validate_qemu_args(args)
+
+        return LaunchOverrides(
+            image=resolved_image,
+            image_format=image_format,
+            volumes=tuple(volumes),
+            qemu_args=tuple(args),
         )
 
     async def stop(
@@ -609,6 +701,40 @@ class PaletteService:
             payload["frame_epoch"] = frame.display_epoch
         payload.update({key: value for key, value in fields.items() if _safe_audit_value(value)})
         self.audit.record(f"tool.{event}", **payload)
+
+
+#: Bounds on caller-supplied QEMU arguments. Deliberately not a content filter — a caller
+#: who may pass arguments may pass any of them, including ones that add a monitor channel or
+#: point QEMU at a host file. These limits only stop a broken or absurd vector before a
+#: process is spawned.
+MAX_CALLER_ARGS = 64
+MAX_CALLER_ARG_CHARS = 4096
+
+
+def _validate_qemu_args(args: Sequence[str]) -> list[str]:
+    if len(args) > MAX_CALLER_ARGS:
+        raise PaletteError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"at most {MAX_CALLER_ARGS} QEMU arguments may be supplied per start",
+            details={"count": len(args)},
+        )
+    cleaned: list[str] = []
+    for argument in args:
+        if not isinstance(argument, str) or not argument:
+            raise PaletteError(
+                ErrorCode.INVALID_ARGUMENT, "QEMU arguments must be non-empty strings"
+            )
+        if "\x00" in argument:
+            raise PaletteError(
+                ErrorCode.INVALID_ARGUMENT, "a QEMU argument must not contain a NUL byte"
+            )
+        if len(argument) > MAX_CALLER_ARG_CHARS:
+            raise PaletteError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"a single QEMU argument may be at most {MAX_CALLER_ARG_CHARS} characters",
+            )
+        cleaned.append(argument)
+    return cleaned
 
 
 def _safe_audit_value(value: Any) -> bool:
