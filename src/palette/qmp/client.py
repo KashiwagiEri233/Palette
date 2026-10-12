@@ -14,7 +14,7 @@ import json
 import logging
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from ..errors import ErrorCode, PaletteError, QmpCommandError, QmpDisconnectedError
@@ -50,6 +50,35 @@ ALLOWED_COMMANDS = frozenset(
         "quit",
     }
 )
+
+
+def qapi_declares_argument(arg_type: Any, by_name: Mapping[Any, Any], wanted: str) -> bool:
+    """Whether a QAPI command's ``arg-type`` declares an argument called ``wanted``.
+
+    ``arg-type`` has two spellings in the wild:
+
+    * a **type name** (often a number, because anonymous types are named by index) whose
+      members live in their own schema entry — this is what QEMU 11 emits, e.g.
+      ``{"name": "screendump", ..., "arg-type": "132"}`` followed by
+      ``{"name": "132", "meta-type": "object", "members": [...]}``;
+    * an **inline list or dict** of members, which older outputs used.
+
+    A command with no arguments spells it as the builtin ``"0"``, which resolves to nothing
+    and answers ``False`` rather than raising.
+    """
+    if isinstance(arg_type, str):
+        target = by_name.get(arg_type)
+        members = target.get("members") if isinstance(target, dict) else None
+        return _members_contain(members, wanted)
+    if isinstance(arg_type, dict):
+        return _members_contain(arg_type.get("members"), wanted)
+    return _members_contain(arg_type, wanted)
+
+
+def _members_contain(members: Any, wanted: str) -> bool:
+    if not isinstance(members, list):
+        return False
+    return any(isinstance(member, dict) and member.get("name") == wanted for member in members)
 
 
 class QmpClient:
@@ -218,15 +247,24 @@ class QmpClient:
         The advertised argument only proves the build knows about PNG; whether libpng was
         compiled in is a runtime question the capture backend answers by falling back to
         PPM when the call fails.
+
+        The shape below was copied from ``query-qmp-schema`` on a real QEMU 11.1, not from
+        memory: a command's ``arg-type`` is a **type name**, and the arguments live in a
+        separate entry whose ``meta-type`` is ``object``. A hand-written double is free to
+        get that wrong, and it did — hence ``qapi_declares_argument`` below being a
+        separately tested function rather than an inline comprehension.
         """
         try:
             schema = await self.execute("query-qmp-schema", timeout=self._command_timeout * 3)
         except PaletteError:
             return None
-        for entry in schema or []:
+        if not isinstance(schema, list):
+            return None
+        entries = [entry for entry in schema if isinstance(entry, dict)]
+        by_name = {entry.get("name"): entry for entry in entries}
+        for entry in entries:
             if entry.get("name") == "screendump" and entry.get("meta-type") == "command":
-                arguments = entry.get("arg-type") or []
-                return any(argument.get("name") == "format" for argument in arguments)
+                return qapi_declares_argument(entry.get("arg-type"), by_name, "format")
         return None
 
     def has_command(self, name: str) -> bool:

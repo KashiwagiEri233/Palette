@@ -9,6 +9,10 @@
 # and digest; the file itself stays out of the repository.
 /images/*
 !/images/README*.md
+# Installation and live media, wherever they are put. A 1.2 GiB ISO left in the repository
+# root was one `git add -A` away from being committed once; this is the guard against that.
+*.iso
+*.ISO
 
 # --- Local upstream source used only for architecture/API research --------------------
 /.references/

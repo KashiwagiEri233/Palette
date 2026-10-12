@@ -825,17 +825,24 @@ class ActionController:
         self, captured: CapturedImage, *, cursor_position_source: CursorPositionSource
     ) -> Frame:
         view = self.view
-        if view.native_size is not None and view.native_size != captured.native_size:
-            # The guest changed resolution. Every frame captured before this moment maps
-            # to a surface that no longer exists, so it is retired here rather than
-            # relying on every caller to notice.
+        previous_size = view.native_size
+        # The view follows what was actually captured, *always*. Leaving the old size in
+        # place after a change is not a cosmetic staleness: every later action compares its
+        # frame against this value, so a single resize would refuse every subsequent action
+        # for the rest of the instance's life. A guest that starts at the firmware's
+        # 640x480 and switches to its real mode makes that the normal path, not an edge case.
+        view.native_size = captured.native_size
+        if previous_size is not None and previous_size != captured.native_size:
+            # Every frame captured *before* this moment maps to a surface that no longer
+            # exists, so they are retired here rather than relying on each caller to notice.
+            # The frame being built right now carries the new size and stays usable.
             view.display_epoch += 1
             self._frames.clear(reason="the display resolution changed")
             logger.info(
                 "display size changed for %s: %sx%s -> %sx%s (display_epoch=%d)",
                 view.vm_id,
-                view.native_size.width,
-                view.native_size.height,
+                previous_size.width,
+                previous_size.height,
                 captured.native_size.width,
                 captured.native_size.height,
                 view.display_epoch,
@@ -847,8 +854,7 @@ class ActionController:
                     instance_id=view.instance_id,
                     display_epoch=view.display_epoch,
                 )
-        elif view.native_size is None:
-            view.native_size = captured.native_size
+        elif previous_size is None:
             expected = self.profile.display
             if (captured.native_size.width, captured.native_size.height) != (
                 expected.width,
@@ -956,16 +962,20 @@ class ActionController:
             raise
 
     async def _ensure_size_is_current(self) -> None:
-        """Cheap pre-action size check.
+        """Pre-action size check.
 
-        QMP has no usable framebuffer-resize notification, so the only way to learn that
-        the guest changed resolution is to look. Re-capturing on every action would double
-        the cost of a click, so this refreshes at most once per configured interval.
+        QMP has no usable framebuffer-resize notification, so the only way to learn that the
+        guest changed resolution is to look — and the design asks for that look *before* a
+        coordinate action, because a click built on a frame from a surface that has since
+        changed lands somewhere else.
+
+        ``capture.size_check_interval_seconds`` trades that correctness for cost: a non-zero
+        value lets a capture that recent stand as evidence of the current size, saving one
+        screendump per action and opening a window in which a resize goes unnoticed. Zero,
+        the default, means every coordinate action looks.
         """
         interval = self.profile.capture.size_check_interval_seconds
-        if interval <= 0:
-            return
-        if time.monotonic() - self._last_capture_at < interval:
+        if interval > 0 and (time.monotonic() - self._last_capture_at) < interval:
             return
         await self._capture_frame()
 

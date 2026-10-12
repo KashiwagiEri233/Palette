@@ -8,7 +8,7 @@ import json
 import pytest
 
 from palette.errors import ErrorCode, PaletteError, QmpCommandError, QmpDisconnectedError
-from palette.qmp.client import ALLOWED_COMMANDS, QmpClient
+from palette.qmp.client import ALLOWED_COMMANDS, QmpClient, qapi_declares_argument
 from support.fake_qmp_server import GREETING, FakeQmpServer, connected_client
 
 
@@ -114,7 +114,7 @@ class TestCorrelation:
             client = QmpClient(transport)
             await client.start()
             schema = await client.execute("query-qmp-schema")
-            assert len(schema[0]["note"]) == 300_000
+            assert len(json.dumps(schema)) > 300_000
             await client.close()
 
     async def test_an_oversized_frame_is_a_clean_disconnect(self) -> None:
@@ -269,22 +269,26 @@ class TestProbe:
             await client.close()
 
     async def test_an_older_build_without_png_is_detected_from_the_schema(self) -> None:
-        server = FakeQmpServer()
-        server.schema_bytes = 0
+        """The schema is where the answer comes from — and its shape has to be the real one.
+
+        The double emits a command whose ``arg-type`` is a type *name* pointing at a separate
+        ``object`` entry, exactly as QEMU 11.1 does. An earlier version of this double inlined
+        the members under ``arg-type``, which made the probe look correct while it raised
+        ``AttributeError`` against a real QEMU.
+        """
+        server = FakeQmpServer(schema_advertises_png=False)
         async with connected_client(server) as transport:
             client = QmpClient(transport)
+            await client.start()
+            assert (await client.probe())["supports_png_screendump"] is False
+            await client.close()
 
-            async def schema_without_format(*_args, **_kwargs):
-                return [
-                    {
-                        "name": "screendump",
-                        "meta-type": "command",
-                        "arg-type": [{"name": "filename"}],
-                    }
-                ]
-
-            client.execute = schema_without_format  # type: ignore[method-assign]
-            assert await client._supports_png_screendump() is False
+    async def test_png_support_is_detected_in_the_real_schema_shape(self) -> None:
+        server = FakeQmpServer(schema_advertises_png=True)
+        async with connected_client(server) as transport:
+            client = QmpClient(transport)
+            await client.start()
+            assert (await client.probe())["supports_png_screendump"] is True
             await client.close()
 
     async def test_the_greeting_is_retained_for_diagnostics(self) -> None:
@@ -337,3 +341,62 @@ class TestFramingDetail:
             await transport.writer.drain()
             assert (await client.execute("query-status"))["status"] == "running"
             await client.close()
+
+
+#: Verbatim from ``query-qmp-schema`` on QEMU 11.1.0. Kept at module level because it is a
+#: recorded fact about another program, not state belonging to a test class.
+REAL_QMP_SCHEMA: list[dict] = [
+    {"name": "screendump", "ret-type": "0", "meta-type": "command", "arg-type": "132"},
+    {
+        "name": "132",
+        "members": [
+            {"name": "filename", "type": "str"},
+            {"name": "device", "default": None, "type": "str"},
+            {"name": "head", "default": None, "type": "int"},
+            {"name": "format", "default": None, "type": "415"},
+        ],
+        "meta-type": "object",
+    },
+    {"name": "query-status", "ret-type": "1", "meta-type": "command", "arg-type": "0"},
+]
+
+
+class TestQapiSchemaShape:
+    """``arg-type`` resolution, pinned against output captured from a real QEMU 11.1.
+
+    This exists because the probe used to assume an inline member list and worked only
+    against a double that made the same assumption. The fragment above is verbatim.
+    """
+
+    def by_name(self) -> dict:
+        return {entry.get("name"): entry for entry in REAL_QMP_SCHEMA}
+
+    def test_a_named_type_resolves_to_its_members(self) -> None:
+        assert qapi_declares_argument("132", self.by_name(), "format") is True
+        assert qapi_declares_argument("132", self.by_name(), "device") is True
+
+    def test_a_missing_argument_is_false_not_an_error(self) -> None:
+        assert qapi_declares_argument("132", self.by_name(), "nonsense") is False
+
+    def test_the_builtin_no_argument_type_is_false(self) -> None:
+        """``query-status`` spells "no arguments" as the builtin ``0``."""
+        assert qapi_declares_argument("0", self.by_name(), "format") is False
+
+    def test_an_inline_member_list_still_resolves(self) -> None:
+        """Older outputs inlined the members; both spellings must work."""
+        inline = [{"name": "filename", "type": "str"}, {"name": "format", "type": "str"}]
+        assert qapi_declares_argument(inline, self.by_name(), "format") is True
+        assert qapi_declares_argument({"members": inline}, self.by_name(), "format") is True
+
+    def test_junk_answers_false_rather_than_raising(self) -> None:
+        for value in (None, 132, "", [], {"members": "nope"}):
+            assert qapi_declares_argument(value, self.by_name(), "format") is False
+
+    def test_the_recorded_fragment_still_matches_the_shape_the_probe_expects(self) -> None:
+        """A guard on the fixture itself: if QEMU changes the shape, this records what the
+        probe was written against rather than letting it drift silently."""
+        command = next(e for e in REAL_QMP_SCHEMA if e.get("name") == "screendump")
+        assert isinstance(command["arg-type"], str)
+        target = self.by_name()[command["arg-type"]]
+        assert target["meta-type"] == "object"
+        assert any(member["name"] == "format" for member in target["members"])

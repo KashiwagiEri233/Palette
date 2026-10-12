@@ -1,0 +1,75 @@
+# TCG debug profile: no hardware acceleration.
+#
+# Use this only when the host has no working accelerator and the image is one you trust.
+# TCG is QEMU's software CPU emulation: it is roughly an order of magnitude slower than
+# WHPX, and **QEMU offers no guest-isolation security guarantee for it** — a malicious guest
+# is not contained the way it is under a hardware hypervisor.
+#
+# Palette will not fall back to this on its own. A profile has to say `accelerator = "tcg"`
+# explicitly, which is what this file is for, and `palette doctor` reports the choice as a
+# non-blocking warning every time it runs.
+#
+# The base image below is a blank scratch disk, because the usual use of this profile is to
+# boot something a caller supplies (`--image` / `--iso`) rather than the pinned Debian
+# template. Create one with:
+#
+#     qemu-img create -f qcow2 images/live-scratch.qcow2 32G
+
+profile_id = "tcg-debug"
+description = "No acceleration. Trusted images only; slow, and no guest-isolation guarantee."
+
+frame_ttl_seconds = 60.0
+
+[qemu]
+binary = "qemu-system-x86_64"
+accelerator = "tcg"
+machine = "q35"
+
+[images]
+base = "G:/Workspace/Palette/images/live-scratch.qcow2"
+format = "qcow2"
+size_gib = 32
+
+[resources]
+vcpus = 2
+memory_mib = 4096
+# Software emulation is CPU-bound; give it a longer leash than the accelerated default.
+max_action_seconds = 60.0
+process_memory_limit_mib = 8192
+
+[display]
+# A live rescue image picks its own resolution; the capture reports whatever it actually is.
+width = 1024
+height = 768
+keymap = "us"
+
+[capture]
+max_long_edge = 1280
+timeout_seconds = 30.0
+# Always look before moving the pointer, even though a capture costs seconds under TCG:
+# a click placed with the wrong coordinate transform is worse than a slow one.
+size_check_interval_seconds = 0.0
+
+[timeouts]
+qmp_command_seconds = 30.0
+qmp_handshake_seconds = 60.0
+# Software emulation needs far longer to reach a framebuffer.
+startup_seconds = 600.0
+boot_poll_seconds = 5.0
+shutdown_seconds = 30.0
+force_kill_seconds = 15.0
+settle_after_input_ms = 400
+double_click_gap_ms = 200
+
+[network]
+# A rescue image should not reach the network during a test run.
+mode = "offline"
+
+[lifecycle]
+allow_agent_start = true
+allow_agent_images = true
+allow_agent_iso = true
+allow_agent_qemu_args = true
+
+[guest_tools]
+enabled = false

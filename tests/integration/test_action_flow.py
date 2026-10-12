@@ -368,6 +368,34 @@ class TestDisplayChange:
         assert receipt.error is not None
         assert receipt.error.code == ErrorCode.STALE_FRAME
 
+    async def test_actions_keep_working_after_the_guest_changes_resolution(
+        self, service: PaletteService, running_vm
+    ) -> None:
+        """The service-level twin of the controller regression: a resize must retire the old
+        frames without bricking the instance. The status a caller reads must agree with the
+        frames they are being handed."""
+        await service.observe("desktop")
+        write_behavior(running_vm, {"width": 400, "height": 300})
+        later = await service.observe("desktop")
+        assert later.frame is not None
+        assert later.frame.native_size.width == 400
+
+        receipt, image = await service.act(
+            "desktop",
+            instance_id=running_vm.view.instance_id,
+            frame_id=later.frame.frame_id,
+            request_id="after-resize-ok",
+            action={"type": "click", "x": 10, "y": 10},
+        )
+        assert receipt.ok is True, receipt.error
+        assert image is not None
+
+        status = await service.status("desktop")
+        assert status.status is not None
+        assert status.status.display is not None
+        assert status.status.display.width == 400
+        assert status.status.display.height == 300
+
     async def test_a_coordinate_is_mapped_through_the_frame_that_carried_it(
         self, service: PaletteService, running_vm
     ) -> None:

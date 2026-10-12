@@ -461,7 +461,11 @@ def build_doctor_report(
     check(
         "explicit_acceleration",
         profile.qemu.accelerator != "tcg",
-        "profile selects TCG; QEMU offers no guest isolation guarantee for that mode",
+        (
+            "profile selects TCG; QEMU offers no guest isolation guarantee for that mode"
+            if profile.qemu.accelerator == "tcg"
+            else f"profile selects {profile.qemu.accelerator}"
+        ),
         blocking=False,
     )
     for device in (

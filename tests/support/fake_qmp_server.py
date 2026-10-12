@@ -128,20 +128,29 @@ class FakeQmpServer:
         elif command == "query-commands":
             result = [{"name": name} for name in ("screendump", "input-send-event", "query-status")]
         elif command == "query-qmp-schema":
-            arguments = [
+            # Shape copied from a real QEMU 11.1: a command's `arg-type` is a *type name*,
+            # and the arguments live in a separate entry whose meta-type is "object".
+            # Faking this as an inline member list is what let a real bug through once.
+            members: list[dict[str, Any]] = [
                 {"name": "filename", "type": "str"},
-                {"name": "device", "type": "str"},
-                {"name": "head", "type": "int"},
+                {"name": "device", "default": None, "type": "str"},
+                {"name": "head", "default": None, "type": "int"},
             ]
             if self.schema_advertises_png:
-                arguments.append({"name": "format", "type": "ImageFormat"})
+                members.append({"name": "format", "default": None, "type": "415"})
+            if self.schema_bytes:
+                # A single enormous member name, so the response is one very long line.
+                members.append({"name": "x" * self.schema_bytes, "type": "str"})
             result = [
+                {"name": "screendump", "ret-type": "0", "meta-type": "command", "arg-type": "132"},
+                {"name": "132", "meta-type": "object", "members": members},
                 {
-                    "name": "screendump",
+                    "name": "input-send-event",
+                    "ret-type": "0",
                     "meta-type": "command",
-                    "arg-type": arguments,
-                    "note": "x" * max(0, self.schema_bytes),
-                }
+                    "arg-type": "145",
+                },
+                {"name": "query-status", "ret-type": "1", "meta-type": "command", "arg-type": "0"},
             ]
         elif command == "query-status":
             result = {"status": "running", "running": True}

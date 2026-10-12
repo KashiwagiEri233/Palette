@@ -124,9 +124,12 @@ class CaptureConfig(_Strict):
     max_long_edge: int = Field(default=1280, ge=2)
     max_bytes: int = Field(default=4 * 1024 * 1024, ge=1024)
     timeout_seconds: float = Field(default=10.0, gt=0)
-    #: How long a previous capture may be reused as evidence of the current framebuffer
-    #: size before a coordinate action forces a fresh size check.
-    size_check_interval_seconds: float = Field(default=5.0, ge=0)
+    #: How long a previous capture may stand as evidence of the current framebuffer size.
+    #: Zero — the default — means every coordinate action looks again before it moves the
+    #: pointer, which is what the design asks for: a click built on a frame from a surface
+    #: that has since changed lands somewhere else. A non-zero value trades that for one
+    #: fewer screendump per action, and opens a window in which a resize goes unnoticed.
+    size_check_interval_seconds: float = Field(default=0.0, ge=0)
     keep_frames: bool = Field(
         default=False, description="Persist captured frames on disk; off by default"
     )

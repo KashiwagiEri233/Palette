@@ -24,8 +24,10 @@ from support.profiles import make_profile
 class BlockingCapture(StubCaptureBackend):
     """A capture backend that can be held open, so scheduling can be observed.
 
-    The gate starts open, so a test can take one unobstructed observation first and only
-    then hold the next capture.
+    ``hold_after`` holds one specific capture rather than every capture from now on. That
+    matters because a coordinate action captures twice — once to confirm the surface size
+    before moving the pointer, once afterwards — and the interesting moment is usually the
+    second. ``hold`` is the blunt version: hold everything from here.
     """
 
     def __init__(self, **kwargs) -> None:
@@ -33,18 +35,30 @@ class BlockingCapture(StubCaptureBackend):
         self.gate = asyncio.Event()
         self.gate.set()
         self.entered = asyncio.Event()
+        self.hold_from: int | None = None
 
     async def capture(self, *, display_id: str, head: int, sink: Path):
-        self.entered.set()
-        await self.gate.wait()
+        index = self.calls + 1
+        if self.hold_from is not None and index >= self.hold_from:
+            self.entered.set()
+            await self.gate.wait()
         return await StubCaptureBackend.capture(self, display_id=display_id, head=head, sink=sink)
 
     def hold(self) -> None:
+        """Hold every capture from now on."""
         self.entered.clear()
+        self.hold_from = 1
+        self.gate.clear()
+
+    def hold_after(self, completed: int) -> None:
+        """Let ``completed`` captures through, then hold the next one."""
+        self.entered.clear()
+        self.hold_from = completed + 1
         self.gate.clear()
 
     def release(self) -> None:
         self.gate.set()
+        self.hold_from = None
 
 
 def view(**overrides) -> InstanceView:
@@ -261,11 +275,11 @@ class TestFrameFencing:
         resolution is to look. A coordinate action therefore refreshes the size first, and
         refuses rather than clicking into a surface that has moved underneath it."""
         capture = StubCaptureBackend()
-        overrides = {"capture": CaptureConfig(max_long_edge=320, size_check_interval_seconds=0.001)}
-        async with harness_factory(capture=capture, profile_overrides=overrides) as h:
+        # The default interval is zero, so the check runs without any help from the clock —
+        # this test needs no sleep and no clock manipulation, which is why it cannot flake.
+        async with harness_factory(capture=capture) as h:
             frame, _ = await h.controller.observe()
             capture.width, capture.height = 400, 300
-            await asyncio.sleep(0.01)  # let the size-check interval elapse
             receipt, image = await h.controller.act(
                 request_id="r1",
                 frame_id=frame.frame_id,
@@ -280,12 +294,38 @@ class TestFrameFencing:
             assert h.qmp.events() == []
             assert h.view.display_epoch == 2
 
-    async def test_an_unchanged_size_does_not_block_the_action(self, harness_factory) -> None:
+    async def test_the_size_check_is_skipped_inside_its_interval(self, harness_factory) -> None:
+        """The other half of the same mechanism: a recent capture is trusted as size evidence,
+        so an action does not pay for a second one."""
         capture = StubCaptureBackend()
-        overrides = {"capture": CaptureConfig(max_long_edge=320, size_check_interval_seconds=0.001)}
+        # A positive interval is the cost-saving escape hatch; the shipped profiles use zero.
+        overrides = {"capture": CaptureConfig(max_long_edge=320, size_check_interval_seconds=30.0)}
         async with harness_factory(capture=capture, profile_overrides=overrides) as h:
             frame, _ = await h.controller.observe()
-            await asyncio.sleep(0.01)
+            capture.width, capture.height = 400, 300
+            before = capture.calls
+            receipt, _ = await h.controller.act(
+                request_id="r1",
+                frame_id=frame.frame_id,
+                action_payload={"type": "move", "x": 5, "y": 5},
+            )
+            # One extra capture, and it is the post-action one — not a pre-action size check.
+            assert capture.calls == before + 1
+            assert receipt.ok is True
+            assert receipt.observation == "captured"
+            # The action was placed with the frame it was given, at the old epoch — and that
+            # is the whole point of the interval being non-zero: a click inside the window used
+            # a transform for a surface that had already changed. The post-action capture is
+            # what reveals it. Zero, the default, closes that window at the cost of a capture
+            # per action.
+            assert receipt.frame is not None
+            assert receipt.frame.native_size == Size(width=400, height=300)
+            assert h.view.display_epoch == 2
+
+    async def test_an_unchanged_size_does_not_block_the_action(self, harness_factory) -> None:
+        capture = StubCaptureBackend()
+        async with harness_factory(capture=capture) as h:
+            frame, _ = await h.controller.observe()
             receipt, _ = await h.controller.act(
                 request_id="r1",
                 frame_id=frame.frame_id,
@@ -293,6 +333,50 @@ class TestFrameFencing:
             )
             assert receipt.ok is True
             assert h.view.display_epoch == 1
+
+    async def test_an_action_still_works_after_a_resolution_change(self, harness_factory) -> None:
+        """Regression: a real WinPE boot found this.
+
+        The guest started at the firmware's 640x480 and switched to its own mode a few
+        seconds later. Retiring the old frames is correct; *keeping* the old size in the view
+        made every subsequent action stale for the rest of the instance's life, because the
+        fencing check compares each frame against that value. A resolution change at boot is
+        the normal case, not an edge case.
+        """
+        async with harness_factory() as h:
+            before, _ = await h.controller.observe()
+            assert before.native_size == Size(width=320, height=200)
+
+            h.capture.width, h.capture.height = 400, 300
+            after, _ = await h.controller.observe()
+            assert after.native_size == Size(width=400, height=300)
+            assert h.view.native_size == Size(width=400, height=300)
+
+            receipt, image = await h.controller.act(
+                request_id="after-resize",
+                frame_id=after.frame_id,
+                action_payload={"type": "click", "x": 10, "y": 10},
+            )
+            assert receipt.ok is True, receipt.error
+            assert image is not None
+            # The frame the action produced is usable in turn, at the new size.
+            assert receipt.frame is not None
+            assert receipt.frame.native_size == Size(width=400, height=300)
+            assert receipt.frame.display_epoch == after.display_epoch
+
+    async def test_repeated_resizes_keep_leaving_actions_working(self, harness_factory) -> None:
+        async with harness_factory() as h:
+            for index, (width, height) in enumerate([(320, 200), (640, 480), (1280, 800)]):
+                h.capture.width, h.capture.height = width, height
+                frame, _ = await h.controller.observe()
+                assert frame.native_size == Size(width=width, height=height)
+                receipt, _ = await h.controller.act(
+                    request_id=f"resize-{index}",
+                    frame_id=frame.frame_id,
+                    action_payload={"type": "move", "x": 5, "y": 5},
+                )
+                assert receipt.ok is True, receipt.error
+                assert h.view.native_size == Size(width=width, height=height)
 
     async def test_out_of_range_coordinates_are_refused_without_sending_input(
         self, harness_factory
@@ -643,7 +727,9 @@ class TestEffectStates:
         capture = StubCaptureBackend()
         async with harness_factory(capture=capture) as h:
             frame, _ = await h.controller.observe()
+            # Fail the post-action capture only: the pre-action size check is capture #2.
             capture.fail_with = PaletteError(ErrorCode.CAPTURE_FAILED, "the display went away")
+            capture.fail_after = 2
             receipt, image = await h.controller.act(
                 request_id="r1",
                 frame_id=frame.frame_id,
@@ -670,7 +756,9 @@ class TestEffectStates:
         }
         async with harness_factory(capture=capture, profile_overrides=overrides) as h:
             frame, _ = await h.controller.observe()
-            capture.hold()
+            # Let the observation and the pre-action size check through; hold the post-action
+            # capture, so the timeout lands *after* the input was sent.
+            capture.hold_after(2)
             with pytest.raises(PaletteError) as info:
                 await h.controller.act(
                     request_id="r1",
@@ -745,7 +833,7 @@ class TestLedgerAndRelease:
         capture = BlockingCapture()
         async with harness_factory(capture=capture) as h:
             frame, _ = await h.controller.observe()
-            capture.hold()
+            capture.hold_after(2)
             task = asyncio.create_task(
                 h.controller.act(
                     request_id="r1",

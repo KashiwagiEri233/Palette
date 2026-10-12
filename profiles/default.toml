@@ -70,9 +70,12 @@ allow_ppm_fallback = true
 max_long_edge = 1280
 max_bytes = 4194304
 timeout_seconds = 10.0
-# How long a capture stays usable as evidence of the current framebuffer size before a
-# coordinate action forces a fresh size check (QMP has no resize notification).
-size_check_interval_seconds = 5.0
+# How long a capture stays usable as evidence of the current framebuffer size. Zero means
+# every coordinate action looks again before it moves the pointer, which is what correctness
+# asks for: QMP has no resize notification, and a click built on a frame from a surface that
+# has since changed lands somewhere else. Raise it to save one screendump per action, and
+# accept a window in which a resize goes unnoticed.
+size_check_interval_seconds = 0.0
 # Screenshots are transient by default: captured, delivered, deleted.
 keep_frames = false
 
