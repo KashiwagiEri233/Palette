@@ -16,14 +16,22 @@ import ctypes
 import logging
 import sys
 from ctypes import wintypes
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 logger = logging.getLogger("palette.vm.guard")
 
-#: A plain bool rather than a direct ``sys.platform`` comparison in each branch: mypy
-#: narrows ``sys.platform`` to the host's literal value, which would make the other
-#: platform's branch look unreachable even though it is the one that ships to users.
+#: A plain bool rather than a direct ``sys.platform`` comparison in each branch: mypy narrows
+#: ``sys.platform`` to the *checking* machine's literal value, which makes the other platform's
+#: branch look unreachable — and, worse, type-checks that branch against the wrong platform's
+#: stubs. CI runs the checker on Linux, so both have to hold.
 IS_WINDOWS = sys.platform == "win32"
+
+#: typeshed exposes ``WinDLL`` and ``get_last_error`` only when the machine running the type
+#: checker is Windows, so a Linux check reports them missing even though this code cannot
+#: execute there. Fetching them by name keeps the module checkable on every platform, and the
+#: runtime guard — not the annotation — remains what decides whether they exist.
+_WinDLL: Any = getattr(ctypes, "WinDLL", None)
+_get_last_error: Any = getattr(ctypes, "get_last_error", lambda: 0)
 
 
 @runtime_checkable
@@ -101,7 +109,7 @@ if IS_WINDOWS:
         """Job Object wrapper built on ``ctypes`` so no extra dependency is required."""
 
         def __init__(self, *, memory_limit_bytes: int | None = None) -> None:
-            self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            self._kernel32 = _WinDLL("kernel32", use_last_error=True)
             self._handle: int | None = None
             self._memory_limit_bytes = memory_limit_bytes
             self._closed = False
@@ -116,7 +124,7 @@ if IS_WINDOWS:
                 return self._handle
             handle = int(self._kernel32.CreateJobObjectW(None, None))
             if not handle:
-                logger.error("CreateJobObject failed: %s", ctypes.get_last_error())
+                logger.error("CreateJobObject failed: %s", _get_last_error())
                 return None
             info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
             info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -135,7 +143,7 @@ if IS_WINDOWS:
                 ctypes.sizeof(info),
             )
             if not ok:
-                logger.error("SetInformationJobObject failed: %s", ctypes.get_last_error())
+                logger.error("SetInformationJobObject failed: %s", _get_last_error())
                 self._kernel32.CloseHandle(handle)
                 return None
             self._handle = handle
@@ -150,12 +158,12 @@ if IS_WINDOWS:
             access = _PROCESS_SET_QUOTA | _PROCESS_TERMINATE | _PROCESS_QUERY_INFORMATION
             process = self._kernel32.OpenProcess(access, False, pid)
             if not process:
-                logger.error("OpenProcess(%d) failed: %s", pid, ctypes.get_last_error())
+                logger.error("OpenProcess(%d) failed: %s", pid, _get_last_error())
                 return False
             try:
                 ok = self._kernel32.AssignProcessToJobObject(handle, process)
                 if not ok:
-                    logger.error("AssignProcessToJobObject failed: %s", ctypes.get_last_error())
+                    logger.error("AssignProcessToJobObject failed: %s", _get_last_error())
                 return bool(ok)
             finally:
                 self._kernel32.CloseHandle(process)

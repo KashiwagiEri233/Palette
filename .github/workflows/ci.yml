@@ -41,8 +41,17 @@ permissions:
 
 jobs:
   lint:
-    name: lint, types and docs
-    runs-on: ubuntu-latest
+    name: lint, types and docs (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both platforms, because mypy type-checks platform branches too and narrows
+        # `sys.platform` to the machine it runs on: a Linux-only check reports
+        # `ctypes.WinDLL` as missing, a Windows-only check never sees `os.geteuid`. The
+        # first run of this file failed in exactly that blind spot, from the other side.
+        # The job costs seconds, so checking both is cheaper than reasoning about it.
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0

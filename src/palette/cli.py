@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import json
 import logging
 import os
@@ -34,6 +35,10 @@ from .service import PaletteService
 from .vm.launcher import locate_binary, probe_binary, run_sync
 
 logger = logging.getLogger("palette.cli")
+
+#: See the note in ``vm/process_guard.py``: a plain bool, because mypy narrows ``sys.platform``
+#: to the checking machine's value and would then reject the other platform's branch.
+IS_WINDOWS = sys.platform == "win32"
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -447,7 +452,7 @@ def build_doctor_report(
     report["acceleration"] = {
         "available": probe.accelerators,
         "requested": profile.qemu.accelerator,
-        "whpx_api_dll": _whpx_dll_present() if sys.platform == "win32" else None,
+        "whpx_api_dll": _whpx_dll_present() if IS_WINDOWS else None,
         "note": (
             "the accelerator list proves the build knows about it; only a real start proves "
             "this host can use it"
@@ -549,14 +554,22 @@ def _whpx_dll_present() -> bool:
 
 
 def _is_admin() -> bool:
-    if sys.platform != "win32":
-        return os.geteuid() == 0 if hasattr(os, "geteuid") else False
-    try:
-        import ctypes
+    """Whether this process is elevated.
 
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
+    Both branches are looked up by name rather than written as attributes: ``ctypes.windll``
+    and ``os.geteuid`` each exist on only one platform, and the type checker sees whichever
+    platform it is running *on*, not the one the branch is for.
+    """
+    if IS_WINDOWS:
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:  # pragma: no cover - a Windows interpreter always has it
+            return False
+        try:
+            return bool(windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    geteuid = getattr(os, "geteuid", None)
+    return bool(geteuid()) if geteuid is not None else False
 
 
 def _is_writable(path: Path) -> bool:

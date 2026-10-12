@@ -56,6 +56,8 @@ uv run pytest tests/e2e -v                  # skipped unless PALETTE_E2E* env va
 uv run ruff check . && uv run ruff format . # lint and format; both are enforced
 uv run mypy                                 # strict, covers src/palette and scripts
 uv run python scripts/check_docs.py         # bilingual pairing, links, fences, UTF-8
+uv run mypy --platform linux                # see the platform note below
+uv run mypy --platform win32
 ```
 
 `.github/workflows/ci.yml` runs that lint set on every push and pull request. Its test job —
@@ -67,6 +69,14 @@ and does not run by default. Windows belongs in that matrix because the job obje
 Whichever jobs run, the physical-acceptance tests need a real QEMU and a guest image, so they
 **skip**; that is not coverage of them, and nothing in the workflow or the docs should imply it
 is.
+
+**Platform branches are type-checked too.** mypy narrows `sys.platform` to the machine it runs
+on, so a Windows-only branch is judged against Linux's stubs when checkers run there — the
+first CI run failed with `ctypes.WinDLL` "missing" on Ubuntu, in Windows code that never
+executes there, and the mirror case (`os.geteuid`) is just as real. Guard such branches with a
+plain boolean (`IS_WINDOWS = sys.platform == "win32"`) and reach single-platform attributes
+through `getattr`, then check both directions locally. The lint job runs on both platforms for
+the same reason.
 
 `scripts/p0_probe.py` runs the plan's P0 milestone (start → screenshot → click → screenshot)
 against whatever profile you point it at, and prints the timings. `scripts/mcp_stdio_smoke.py`
