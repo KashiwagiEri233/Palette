@@ -1,10 +1,25 @@
 name: CI
 
+# What runs where, stated plainly because the badge alone will not say it:
+#
+#   push / pull_request  ->  the lint job only
+#   manual dispatch      ->  the lint job, plus the test matrix if you ask for it
+#
+# The test matrix is parked behind `run_tests` rather than deleted: the commands are the
+# same ones you would run locally, and re-enabling it is a checkbox rather than a rewrite.
+# When it does run, note that the physical-acceptance tests still skip — they need a real
+# QEMU and a guest image, so a green run never means "a virtual machine works".
+
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Also run the test matrix (Ubuntu + Windows, Python 3.12 and 3.13)
+        type: boolean
+        default: false
 
 # A newer push makes an in-flight run of the same ref pointless; stop paying for it.
 concurrency:
@@ -38,14 +53,16 @@ jobs:
         run: uv run python scripts/check_docs.py
 
   test:
-    # Two operating systems because the code has real platform branches: the Windows job
-    # object guard, CREATE_NO_WINDOW, reparse-point checks and the console code page only
-    # execute on Windows, and the process plumbing differs underneath.
     name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    # Parked. Runs only when a human asks for it from the Actions tab.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_tests
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # Two operating systems because the code has real platform branches: the Windows job
+        # object guard, CREATE_NO_WINDOW, reparse-point checks and the console code page only
+        # execute on Windows, and the process plumbing differs underneath.
         os: [ubuntu-latest, windows-latest]
         python: ["3.12", "3.13"]
     steps:

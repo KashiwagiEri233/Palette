@@ -58,11 +58,15 @@ uv run mypy                                 # strict, covers src/palette and scr
 uv run python scripts/check_docs.py         # bilingual pairing, links, fences, UTF-8
 ```
 
-`.github/workflows/ci.yml` runs exactly that plus `scripts/mcp_stdio_smoke.py` and a
-`palette doctor` smoke check, on Ubuntu and Windows against Python 3.12 and 3.13 — Windows
-because the job object guard, `CREATE_NO_WINDOW` and the reparse-point checks only execute
-there. The physical-acceptance tests need a real QEMU and a guest image, so they **skip** in
-CI; that is not coverage of them, and nothing in the workflow or the docs should imply it is.
+`.github/workflows/ci.yml` runs that lint set on every push and pull request. Its test job —
+the suite, `scripts/mcp_stdio_smoke.py` and a `palette doctor` smoke check, on Ubuntu and
+Windows against Python 3.12 and 3.13 — is **parked behind a manual `workflow_dispatch` input**
+and does not run by default. Windows belongs in that matrix because the job object guard,
+`CREATE_NO_WINDOW` and the reparse-point checks only execute there.
+
+Whichever jobs run, the physical-acceptance tests need a real QEMU and a guest image, so they
+**skip**; that is not coverage of them, and nothing in the workflow or the docs should imply it
+is.
 
 `scripts/p0_probe.py` runs the plan's P0 milestone (start → screenshot → click → screenshot)
 against whatever profile you point it at, and prints the timings. `scripts/mcp_stdio_smoke.py`

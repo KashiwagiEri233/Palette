@@ -228,11 +228,15 @@ The integration suite starts a real child process that speaks QMP over real pipe
 covers framing, teardown and lifecycle behaviour without needing a hypervisor. The docs check
 enforces the two-language pairing and that every relative link resolves.
 
-CI (`.github/workflows/ci.yml`) runs all of the above on Ubuntu and Windows against Python
-3.12 and 3.13, plus a real stdio MCP session and a `palette doctor` smoke check. Windows is in
-the matrix because the job object guard, `CREATE_NO_WINDOW` and the reparse-point checks only
-run there.
+CI (`.github/workflows/ci.yml`) runs the **lint job** — ruff, ruff format, mypy and the
+documentation check — on every push and pull request. The **test matrix** (Ubuntu and Windows,
+Python 3.12 and 3.13, plus a real stdio MCP session and a `palette doctor` smoke check) is
+parked behind a manual `workflow_dispatch` input: it costs nothing until someone asks for it
+from the Actions tab, and putting it back on pushes is a one-line change. Windows is in that
+matrix because the job object guard, `CREATE_NO_WINDOW` and the reparse-point checks only run
+there.
 
-**It cannot run the physical-acceptance suite**, because that needs a real QEMU and a guest
-image. Those tests skip. A green badge means the code and its documentation hold together — not
-that a virtual machine works. That second claim needs the P0 probe on a real host.
+**Neither job can run the physical-acceptance suite**, because that needs a real QEMU and a
+guest image. Those tests skip. A green badge means the code and its documentation hold
+together — not that a virtual machine works. That second claim needs the P0 probe on a real
+host.
