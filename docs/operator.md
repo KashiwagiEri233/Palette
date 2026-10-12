@@ -232,9 +232,10 @@ CI (`.github/workflows/ci.yml`) runs the **lint job** — ruff, ruff format, myp
 documentation check — on every push and pull request. The **test matrix** (Ubuntu and Windows,
 Python 3.12 and 3.13, plus a real stdio MCP session and a `palette doctor` smoke check) is
 parked behind a manual `workflow_dispatch` input: it costs nothing until someone asks for it
-from the Actions tab, and putting it back on pushes is a one-line change. Windows is in that
-matrix because the job object guard, `CREATE_NO_WINDOW` and the reparse-point checks only run
-there.
+from the Actions tab, and putting it back on pushes is a one-line change. Both jobs run on
+Windows as well as Linux: the test matrix needs it because the job object guard,
+`CREATE_NO_WINDOW` and the reparse-point checks only run there, and the lint job needs it
+because mypy type-checks platform branches and would judge them against the wrong stubs.
 
 **Neither job can run the physical-acceptance suite**, because that needs a real QEMU and a
 guest image. Those tests skip. A green badge means the code and its documentation hold

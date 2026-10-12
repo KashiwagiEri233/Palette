@@ -216,8 +216,9 @@ uv run python scripts/check_docs.py
 CI（`.github/workflows/ci.yml`）在每次 push 与 pull request 上跑 **lint job**：ruff、ruff
 format、mypy 与文档检查。**测试矩阵**（Ubuntu 与 Windows、Python 3.12 与 3.13，另加真实 stdio
 MCP 会话与 `palette doctor` 冒烟检查）挂在 `workflow_dispatch` 的手动入口后面：没人从 Actions
-页面主动触发就不会消耗任何额度，要重新挂回 push 只需改一行。矩阵里必须有 Windows，因为 job
-object 进程保护、`CREATE_NO_WINDOW` 与 reparse point 检查只在那里执行。
+页面主动触发就不会消耗任何额度，要重新挂回 push 只需改一行。两个 job 都在 Windows 上跑：测试矩阵
+需要它，因为 job object 进程保护、`CREATE_NO_WINDOW` 与 reparse point 检查只在那里执行；lint
+job 也需要它，因为 mypy 会类型检查平台分支，在错误的 stubs 下会得出错误结论。
 
 **两个 job 都跑不了实机验收**，那需要真实 QEMU 与客户机镜像，对应测试会跳过。绿色徽章的含义是
 「代码与文档自洽」，**不是**「虚拟机可用」——后者要在真实宿主上跑 P0 探针。
