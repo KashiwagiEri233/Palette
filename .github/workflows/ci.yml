@@ -10,6 +10,15 @@ name: CI
 # When it does run, note that the physical-acceptance tests still skip — they need a real
 # QEMU and a guest image, so a green run never means "a virtual machine works".
 
+# Actions are pinned to a full commit SHA, not to a version tag. A tag is a mutable name, and
+# an unresolvable one fails the whole run before any step executes - which is exactly how the
+# first version of this file failed: `astral-sh/setup-uv@v10` was guessed from the latest
+# *release* (v10.3.0), but that action publishes no moving major tag above v9. To bump one:
+#
+#   git ls-remote --tags https://github.com/<owner>/<repo> refs/tags/v<version>
+#
+# and put the SHA it prints on the `uses:` line with the version in the trailing comment.
+
 on:
   push:
     branches: [main]
@@ -35,8 +44,8 @@ jobs:
     name: lint, types and docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
       - name: Install
@@ -66,8 +75,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python }}
