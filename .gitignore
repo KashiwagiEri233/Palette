@@ -1,0 +1,43 @@
+# --- Palette runtime state -----------------------------------------------------------
+# Instance overlays, frame scratch space, logs and the audit trail. Never committed:
+# they contain a guest's disk state and a record of what an agent did.
+/.runtime/*
+!/.runtime/README*.md
+
+# --- Local guest images ---------------------------------------------------------------
+# Templates are large, licensed, host-specific artefacts. The profile records the origin
+# and digest; the file itself stays out of the repository.
+/images/*
+!/images/README*.md
+
+# --- Local upstream source used only for architecture/API research --------------------
+/.references/
+
+# --- Python ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Tooling caches -------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Editor / OS ----------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
+
+# --- Screenshots and captures that escaped the runtime root ---------------------------
+*.ppm
+frame-*.png
+
+# --- Local design notes ---------------------------------------------------------------
+# Kept on disk for reference, deliberately not published with the repository.
+/PLAN.md

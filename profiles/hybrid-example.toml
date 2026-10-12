@@ -1,0 +1,72 @@
+# Example hybrid profile: the visual baseline plus the guest enhancement channel.
+#
+# Copy this file and point `images.base` at your own template. It is shipped as an
+# example rather than as the default because enabling the channel changes the trust story:
+# the guest now runs a service that accepts structured operations from the host.
+#
+# Two things this profile deliberately does NOT do:
+#   * it does not grant agents lifecycle authority - starting, stopping and resetting stay
+#     operator actions;
+#   * it does not enable both capabilities "because they are there". Text input and app
+#     launching are separate grants, and an operator enables the one they need.
+
+profile_id = "hybrid-example"
+description = "Debian 13 + XFCE with the guest tool service, hybrid mode."
+
+frame_ttl_seconds = 30.0
+
+[qemu]
+binary = "qemu-system-x86_64"
+version_pin = "11.1"
+accelerator = "whpx"
+machine = "q35"
+
+[images]
+base = "G:/Workspace/Palette/images/debian-13-xfce-desktop.qcow2"
+format = "qcow2"
+size_gib = 24
+
+[network]
+mode = "offline"
+restrict = true
+
+[lifecycle]
+allow_agent_start = false
+allow_agent_stop = false
+allow_agent_reset = false
+allow_agent_force_stop = false
+
+[guest_tools]
+enabled = true
+protocol_version = "1.0"
+# Registered capabilities. Each one is independently authorized; the guest must also
+# advertise it, and the intersection is what vm_status reports.
+capabilities = ["guest.input_text", "guest.launch_app"]
+# Preferred first. `native_text` writes through the guest platform's own API;
+# `clipboard_paste` sets the *guest's* clipboard (never the host's) and pastes. There is
+# no automatic downgrade between them.
+input_methods = ["native_text"]
+max_text_chars = 4096
+request_timeout_seconds = 20.0
+max_message_bytes = 1048576
+target_session = "interactive"
+
+# The application registry. An app_id resolves to a fixed executable with a bounded set of
+# options; Palette never accepts a free-form command line, a path or an argv array from an
+# agent, and never uses a shell.
+[guest_tools.allowed_apps.text-editor]
+executable = "/usr/bin/mousepad"
+allowed_options = ["file"]
+
+[guest_tools.allowed_apps.file-manager]
+executable = "/usr/bin/thunar"
+allowed_options = ["directory"]
+
+[text]
+mode = "keyboard"
+max_chars = 256
+
+[retention]
+keep_overlays = true
+max_overlays = 8
+persist_screenshots = false

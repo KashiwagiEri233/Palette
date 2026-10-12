@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Palette offline fixture</title>
+<style>
+  :root { color-scheme: light; }
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 0; padding: 16px; background: #f4f4f2; color: #111; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .row { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+  .panel { background: #fff; border: 1px solid #c9c9c4; border-radius: 6px; padding: 12px; }
+  #grid { display: grid; grid-template-columns: repeat(16, 40px); grid-template-rows: repeat(10, 40px); gap: 0; }
+  #grid button {
+    width: 40px; height: 40px; border: 1px solid #d8d8d4; background: #eef1ee;
+    font: 11px/1 ui-monospace, monospace; color: #667; padding: 0; cursor: crosshair;
+  }
+  #grid button.marked { background: #1f7a4d; color: #fff; border-color: #145232; }
+  #target { width: 220px; height: 140px; border: 2px dashed #7a7a75; background: #fff;
+            display: flex; align-items: center; justify-content: center; color: #7a7a75; }
+  #target.armed { background: #1f7a4d; color: #fff; border-style: solid; }
+  table { border-collapse: collapse; }
+  th, td { text-align: left; padding: 3px 10px 3px 0; }
+  th { font-weight: 600; color: #555; }
+  output { font: 13px/1.4 ui-monospace, monospace; }
+  input[type=text] { width: 320px; padding: 6px; font: 14px system-ui; }
+</style>
+</head>
+<body>
+<h1>Palette offline fixture</h1>
+<p>
+  Everything on this page is local. It exists so that a visual agent's clicks, drags,
+  scrolls and typing leave a mark that can be seen in the next screenshot, and so that a
+  test can tell "the input arrived" from "the input arrived at the right pixel".
+</p>
+
+<div class="row">
+  <div class="panel">
+    <h2>Grid</h2>
+    <div id="grid" role="grid" aria-label="Click grid"></div>
+    <p>Last: <output id="grid-last">none</output> &middot; clicks: <output id="grid-count">0</output>
+       &middot; double-clicks: <output id="dbl-count">0</output></p>
+  </div>
+
+  <div class="panel">
+    <h2>Drag and scroll</h2>
+    <div id="target">drop a drag here</div>
+    <p>drags: <output id="drag-count">0</output><br>
+       wheel up: <output id="wheel-up">0</output><br>
+       wheel down: <output id="wheel-down">0</output><br>
+       vertical offset: <output id="offset">0</output></p>
+    <div id="scroller" style="height:80px;overflow:auto;border:1px solid #ddd;padding:6px">
+      <div style="height:400px">Scroll me. The counter above tracks the wheel, the offset
+        tracks the position, so a scroll that never reached the guest is visible as a
+        counter that did not move.</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Keyboard</h2>
+    <label for="entry">Text field</label><br>
+    <input id="entry" type="text" autocomplete="off" spellcheck="false"
+           placeholder="type here">
+    <p>last key: <output id="key-last">none</output><br>
+       keys: <output id="key-count">0</output><br>
+       modifiers seen: <output id="key-mods">none</output></p>
+    <p>shortcuts observed: <output id="key-chords">none</output></p>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var grid = document.getElementById("grid");
+  var cells = [];
+  for (var y = 0; y < 10; y++) {
+    for (var x = 0; x < 16; x++) {
+      var cell = document.createElement("button");
+      cell.type = "button";
+      cell.dataset.x = String(x);
+      cell.dataset.y = String(y);
+      cell.textContent = x + "," + y;
+      cell.addEventListener("click", onCellClick);
+      cell.addEventListener("dblclick", function () { bump("dbl-count"); });
+      cell.addEventListener("contextmenu", function (event) {
+        event.preventDefault();
+        mark(this, "right");
+      });
+      grid.appendChild(cell);
+      cells.push(cell);
+    }
+  }
+
+  var clicks = 0;
+  function onCellClick(event) {
+    clicks += 1;
+    set("grid-count", clicks);
+    set("grid-last", this.dataset.x + "," + this.dataset.y + (event.shiftKey ? " +shift" : ""));
+    mark(this, "left");
+  }
+  function mark(cell, button) {
+    cell.classList.add("marked");
+    cell.textContent = button === "right" ? "R" : "L";
+  }
+
+  var drags = 0;
+  var target = document.getElementById("target");
+  target.addEventListener("mouseenter", function () { target.classList.add("armed"); });
+  target.addEventListener("mouseleave", function () { target.classList.remove("armed"); });
+  target.addEventListener("mouseup", function () {
+    drags += 1;
+    set("drag-count", drags);
+    target.textContent = "drag " + drags + " arrived";
+  });
+  // A drag that never releases outside the box still counts once the pointer leaves.
+  document.addEventListener("mouseup", function (event) {
+    if (target.contains(event.target) || drags === 0) { return; }
+  });
+
+  var scroller = document.getElementById("scroller");
+  scroller.addEventListener("wheel", function (event) {
+    if (event.deltaY < 0) { bump("wheel-up"); } else { bump("wheel-down"); }
+    set("offset", String(scroller.scrollTop));
+  }, { passive: true });
+  scroller.addEventListener("scroll", function () { set("offset", String(scroller.scrollTop)); });
+
+  var keys = 0;
+  var seenModifiers = { };
+  var chords = [];
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Shift" || event.key === "Control" || event.key === "Alt" || event.key === "Meta") {
+      seenModifiers[event.key] = true;
+      set("key-mods", Object.keys(seenModifiers).sort().join("+"));
+      return;
+    }
+    keys += 1;
+    set("key-count", keys);
+    set("key-last", event.key + (event.ctrlKey ? " (ctrl)" : ""));
+    if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) {
+      var chord = [];
+      if (event.ctrlKey) { chord.push("CTRL"); }
+      if (event.altKey) { chord.push("ALT"); }
+      if (event.shiftKey) { chord.push("SHIFT"); }
+      if (event.metaKey) { chord.push("META"); }
+      chord.push(event.key.length === 1 ? event.key.toUpperCase() : event.key);
+      var label = chord.join("+");
+      if (chords.indexOf(label) === -1) { chords.push(label); }
+      set("key-chords", chords.join(", "));
+    }
+  }, true);
+
+  function set(id, value) { document.getElementById(id).textContent = String(value); }
+  function bump(id) { set(id, Number(document.getElementById(id).textContent) + 1); }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,126 @@
+# Offline Debian desktop for visual agents: the default, and the baseline that must keep
+# working on its own no matter what the enhancement channel does.
+#
+# No secrets belong in this file. The base image digest is pinned once the template has
+# been built (see docs/guest-template.md), which is what turns "the image on this machine"
+# into "the image this profile is allowed to run".
+
+profile_id = "default"
+description = "Debian 13 + XFCE, 1280x800, offline, visual-only."
+
+# A frame older than this is refused, so an agent cannot click on a stale picture of a
+# desktop that has since changed. Measured on the host's monotonic clock.
+frame_ttl_seconds = 30.0
+
+[qemu]
+# Either an absolute path or a name resolved against PATH and qemu_search_paths.
+binary = "qemu-system-x86_64"
+# Pinning the version makes an upgrade a deliberate act: parameters and behaviour change
+# between releases, and the plan requires a regression pass rather than blind adoption.
+version_pin = "11.1"
+accelerator = "whpx"
+machine = "q35"
+# `allow_accelerator_fallback` is intentionally absent and may not be enabled: a silent
+# fall back to TCG would change the isolation story the security section relies on.
+
+[images]
+# Absolute path to the read-only template disk. Replace this with the real artefact.
+base = "G:/Workspace/Palette/images/debian-13-xfce-desktop.qcow2"
+format = "qcow2"
+# Fill in after building the template; until then doctor reports the image as unverified.
+# sha256 = "<64 hex characters>"
+size_gib = 24
+
+[devices]
+# Input is bound to this display explicitly, and input-send-event is addressed to the
+# display id - not to the keyboard or pointer id.
+display_id = "video0"
+display_model = "VGA"
+keyboard_id = "agent-kbd"
+pointer_id = "agent-pointer"
+head = 0
+
+[resources]
+vcpus = 2
+memory_mib = 4096
+max_queue_depth = 32
+max_queued_wait_seconds = 5.0
+max_action_seconds = 30.0
+# A host-side ceiling on the QEMU process itself; guest RAM is not a host cap.
+process_memory_limit_mib = 8192
+# process_max_runtime_seconds = 3600
+# max_overlay_bytes = 17179869184
+
+[display]
+# Configured inside the guest template, and re-checked at capture time: a mismatch is
+# logged rather than silently rescaled.
+width = 1280
+height = 800
+scale_percent = 100
+keymap = "us"
+
+[capture]
+prefer_format = "png"
+allow_ppm_fallback = true
+max_long_edge = 1280
+max_bytes = 4194304
+timeout_seconds = 10.0
+# How long a capture stays usable as evidence of the current framebuffer size before a
+# coordinate action forces a fresh size check (QMP has no resize notification).
+size_check_interval_seconds = 5.0
+# Screenshots are transient by default: captured, delivered, deleted.
+keep_frames = false
+
+[network]
+# The MVP default: no network device at all. "Restricted user networking" is not the same
+# thing as an egress policy and is not offered here.
+mode = "offline"
+restrict = true
+
+[text]
+# Strict keyboard mode. US-layout printable ASCII only; control characters must be sent
+# as explicit key actions.
+mode = "keyboard"
+max_chars = 256
+char_interval_ms = 12
+max_total_ms = 15000
+
+[timeouts]
+qmp_command_seconds = 10.0
+qmp_handshake_seconds = 10.0
+startup_seconds = 120.0
+boot_poll_seconds = 1.0
+shutdown_seconds = 60.0
+force_kill_seconds = 10.0
+settle_after_input_ms = 120
+double_click_gap_ms = 90
+click_hold_ms = 40
+
+[lifecycle]
+# Agents observe and operate; they do not start, stop or reset VMs unless an operator
+# decides otherwise for a specific profile.
+allow_agent_start = false
+allow_agent_stop = false
+allow_agent_reset = false
+allow_agent_force_stop = false
+operator_only_tools = true
+
+[guest_tools]
+# The retained enhancement channel, off. Turning it on is a deliberate, separately
+# authorised act - see hybrid-example.toml.
+enabled = false
+protocol_version = "1.0"
+capabilities = []
+input_methods = []
+max_text_chars = 4096
+request_timeout_seconds = 20.0
+target_session = "interactive"
+
+[retention]
+# Stopped instances are kept so their results can be retrieved; the base image is never
+# written to and never committed to.
+keep_overlays = true
+max_overlays = 8
+persist_screenshots = false
+audit_max_bytes = 8388608
+audit_max_files = 5

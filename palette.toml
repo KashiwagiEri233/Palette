@@ -1,0 +1,22 @@
+# Host-level settings. Per-VM definitions live in profiles/*.toml.
+#
+# This file is trusted configuration: nothing here is ever derived from agent input.
+
+[host]
+# The profile used by `palette serve` and by lifecycle commands that do not name one.
+default_profile = "default"
+
+# Where instance overlays, frames, logs and the audit trail live. Everything Palette
+# deletes lives under this directory, and nothing outside it is ever touched.
+runtime_root = ".runtime"
+
+# Off by default: audit records carry action type, length, timing and outcome only.
+audit_enabled = true
+log_level = "INFO"
+
+# Extra places to look for a QEMU installation that is not on PATH.
+qemu_search_paths = [
+    "C:/Program Files/qemu",
+    "C:/Program Files/qemu/bin",
+    "C:/Program Files (x86)/qemu",
+]
