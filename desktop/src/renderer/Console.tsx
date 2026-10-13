@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import RFB from '@novnc/novnc'
 import { Button } from '@/components/ui/button'
 import { NativeSelect } from '@/components/ui/native-select'
-import { PcMouseIcon, ExpandIcon, RefreshIcon } from '@/components/icons'
+import { PcMouseIcon, ExpandIcon, CollapseIcon, RefreshIcon } from '@/components/icons'
 import type { ControlLease, VmRecord, VmStatus, InputEvent } from '../shared/types'
 import { InputQueue, physicalKey, pointerPosition } from '@/lib/input'
 
@@ -19,6 +19,8 @@ export function Console({ vm, reportError }: { vm: VmRecord; reportError: (messa
   const [scale, setScale] = useState('fit')
   const [revision, setRevision] = useState(0)
   const [displayError, setDisplayError] = useState('')
+  const [fullscreen, setFullscreen] = useState(false)
+  const [fullscreenPending, setFullscreenPending] = useState(false)
   const running = vm.status.state === 'RUNNING'
 
   async function release(): Promise<void> {
@@ -30,6 +32,33 @@ export function Console({ vm, reportError }: { vm: VmRecord; reportError: (messa
       try { await window.palette.request('control.release', vm.vm_id, { lease_id: previous.lease_id }) }
       catch (error) { reportError(String(error)) }
     }
+  }
+
+  useEffect(() => {
+    const syncFullscreen = (): void => setFullscreen(document.fullscreenElement === panel.current)
+    const escapeFullscreen = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape' && document.fullscreenElement === panel.current) {
+        event.preventDefault(); event.stopPropagation()
+        void toggleFullscreen()
+      }
+    }
+    syncFullscreen()
+    document.addEventListener('fullscreenchange', syncFullscreen)
+    document.addEventListener('keydown', escapeFullscreen, true)
+    return () => {
+      document.removeEventListener('fullscreenchange', syncFullscreen)
+      document.removeEventListener('keydown', escapeFullscreen, true)
+    }
+  }, [])
+
+  async function toggleFullscreen(): Promise<void> {
+    setFullscreenPending(true)
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen()
+      else await panel.current?.requestFullscreen()
+      surface.current?.focus()
+    } catch (error) { reportError(String(error)) }
+    finally { setFullscreenPending(false) }
   }
 
   useEffect(() => {
@@ -128,7 +157,7 @@ export function Console({ vm, reportError }: { vm: VmRecord; reportError: (messa
         <Button variant={controlling ? 'default' : 'secondary'} disabled={!connected} onClick={() => controlling ? void release() : void acquire()}><PcMouseIcon className="size-4" />{controlling ? '交还 Agent' : '接管'}</Button>
         <NativeSelect aria-label="画面缩放" value={scale} onChange={event => { setScale(event.target.value); if (rfb.current) rfb.current.scaleViewport = event.target.value === 'fit' }}><option value="fit">适应窗口</option><option value="native">原始尺寸</option></NativeSelect>
         <Button variant="ghost" size="icon" aria-label="重新连接画面" onClick={() => setRevision(value => value + 1)}><RefreshIcon className="size-4" /></Button>
-        <Button variant="ghost" size="icon" aria-label="全屏" onClick={() => void panel.current?.requestFullscreen().then(() => surface.current?.focus()).catch(error => reportError(String(error)))}><ExpandIcon className="size-4" /></Button>
+        <Button variant="ghost" size="icon" aria-label={fullscreen ? '退出全屏' : '全屏'} title={fullscreen ? '退出全屏' : '全屏'} aria-pressed={fullscreen} disabled={fullscreenPending} onClick={() => void toggleFullscreen()}>{fullscreen ? <CollapseIcon className="size-4" /> : <ExpandIcon className="size-4" />}</Button>
       </div>
     </div>
     <div ref={surface} className={`console-surface ${controlling ? 'captured' : ''}`} tabIndex={0} aria-label="虚拟机画面" onKeyDown={event => key(event, true)} onKeyUp={event => key(event, false)}

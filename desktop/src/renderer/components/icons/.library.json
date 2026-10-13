@@ -2,9 +2,10 @@
   "library": "iconoir",
   "prefix": "iconoir",
   "source": "iconify",
-  "installedAt": "2026-10-13T05:31:18.400Z",
+  "installedAt": "2026-10-13T15:46:23.225Z",
   "icons": [
     "arrow-left",
+    "collapse",
     "computer",
     "expand",
     "folder",

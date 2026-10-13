@@ -73,6 +73,10 @@ app.whenReady().then(async () => {
   window.webContents.session.webRequest.onHeadersReceived((details, callback) => callback({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [`default-src 'self'; script-src 'self'${process.env.ELECTRON_RENDERER_URL ? " 'unsafe-inline'" : ''}; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self' ws://127.0.0.1:*${process.env.ELECTRON_RENDERER_URL ? ' ws://localhost:5173' : ''}; object-src 'none'; base-uri 'none'`] } }))
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   window.webContents.on('will-navigate', event => event.preventDefault())
+  window.webContents.on('leave-html-full-screen', () => {
+    // Escape can end HTML fullscreen while the native window remains fullscreen.
+    if (window.isFullScreen()) window.setFullScreen(false)
+  })
   window.on('blur', () => { void releaseAll(); window.webContents.send('control-lost') })
   window.webContents.on('render-process-gone', () => { void releaseAll() })
   window.on('close', event => {

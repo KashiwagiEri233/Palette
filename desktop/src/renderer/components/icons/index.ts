@@ -10,6 +10,7 @@ export { SettingsIcon } from "./settings";
 export { PcMouseIcon } from "./pc-mouse";
 export { FolderIcon } from "./folder";
 export { ExpandIcon } from "./expand";
+export { CollapseIcon } from "./collapse";
 export { NavArrowDownIcon } from "./nav-arrow-down";
 export { XmarkIcon } from "./xmark";
 export { RefreshIcon } from "./refresh";

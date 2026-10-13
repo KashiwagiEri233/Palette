@@ -12,6 +12,20 @@ test('desktop lifecycle, streaming, control, font loading and exit confirmation'
   const application = await electron.launch({ args: [resolve('out/main/index.js')], env: { ...process.env, PALETTE_ROOT: root, PALETTE_UV: uv } })
   try {
     const page = await application.firstWindow()
+    // On macOS the DOM fullscreen event precedes the native window transition.
+    async function transitionFullscreen(event: 'enter-full-screen' | 'leave-full-screen', action: () => Promise<unknown>): Promise<void> {
+      await application.evaluate(({ BrowserWindow }, event) => {
+        const state = globalThis as typeof globalThis & { fullscreenTransition?: Promise<void> }
+        state.fullscreenTransition = new Promise((resolve, reject) => {
+          const window = BrowserWindow.getAllWindows()[0]
+          const complete = (): void => { clearTimeout(timeout); resolve() }
+          const timeout = setTimeout(() => { window.removeListener(event, complete); reject(new Error(`Native fullscreen transition timed out: ${event}`)) }, 10_000)
+          window.once(event, complete)
+        })
+      }, event)
+      await action()
+      await application.evaluate(() => (globalThis as typeof globalThis & { fullscreenTransition?: Promise<void> }).fullscreenTransition)
+    }
     const errors: string[] = []
     page.on('pageerror', error => errors.push(error.message))
     await expect(page.getByText('后台已连接')).toBeVisible({ timeout: 30_000 })
@@ -76,10 +90,16 @@ test('desktop lifecycle, streaming, control, font loading and exit confirmation'
     await expect.poll(async () => page.evaluate(async () => (await window.palette.request('vms.list') as { vms: { status: { input_ledger: { keys: string[] } } }[] }).vms[0].status.input_ledger.keys)).toEqual([])
     await page.getByRole('button', { name: '交还 Agent' }).click()
     await expect(page.getByText('仅查看', { exact: true })).toBeVisible()
-    await page.getByRole('button', { name: '全屏', exact: true }).click()
+    await transitionFullscreen('enter-full-screen', () => page.getByRole('button', { name: '全屏', exact: true }).click())
     await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true)
-    await page.evaluate(() => document.exitFullscreen())
+    await transitionFullscreen('leave-full-screen', () => page.getByRole('button', { name: '退出全屏', exact: true }).click())
     await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(false)
+    await expect(page.getByRole('button', { name: '全屏', exact: true })).toHaveAttribute('aria-pressed', 'false')
+    await transitionFullscreen('enter-full-screen', () => page.getByRole('button', { name: '全屏', exact: true }).click())
+    await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true)
+    await transitionFullscreen('leave-full-screen', () => page.keyboard.press('Escape'))
+    await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(false)
+    await expect(page.getByRole('button', { name: '全屏', exact: true })).toBeVisible()
     await page.getByLabel('开发环境 的操作').selectOption('stop')
     await expect(page.getByRole('button', { name: '启动', exact: true })).toBeVisible({ timeout: 10_000 })
     await page.getByRole('button', { name: '启动', exact: true }).click()
