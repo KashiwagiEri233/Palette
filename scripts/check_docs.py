@@ -24,9 +24,16 @@ SKIP_DIRS = frozenset(
     {".git", ".venv", ".references", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
 )
 
-#: Pages that deliberately have no counterpart. ``PLAN.md`` is a local design document that is
-#: not published; ``CLAUDE.md`` is instructions for a coding agent, not user documentation.
-UNPAIRED = frozenset({"PLAN.md", "CLAUDE.md"})
+#: Development plans and coding-agent rules are not bilingual user documentation.
+#: Their UTF-8, code fences and relative links are still checked.
+UNPAIRED = frozenset(
+    {
+        "PLAN.md",
+        "CLAUDE.md",
+        "desktop/.better-design/rules.md",
+        "desktop/src/.better-design/rules.md",
+    }
+)
 
 LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 SWITCHER_EN_TO_ZH = "[简体中文]("
