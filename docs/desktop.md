@@ -88,6 +88,10 @@ data needs a graceful shutdown. After updating backend source, restart the owner
 
 ## Verification
 
+The “状态” tab polls lifecycle, instance, control owner, action sequence, queued tasks and
+held inputs every two seconds. Follow the [acceptance procedure](acceptance-test.md) to
+test MCP connection, actual clicks and GUI synchronization.
+
 ```bash
 uv run pytest
 uv run ruff check .

@@ -75,6 +75,9 @@ owner 时作为代理；没有 owner 时继续使用原来的 stdio 生命周期
 
 ## 验证
 
+“状态”页每 2 秒更新运行状态、实例、控制权、操作序号、排队任务及保持的键鼠输入。
+MCP 连接和实际点击的验收步骤见[完整测试流程](acceptance-test.zh-CN.md)。
+
 ```bash
 uv run pytest
 uv run ruff check .

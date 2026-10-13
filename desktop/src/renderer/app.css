@@ -116,6 +116,12 @@
 .configuration-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px 32px; }
 .configuration-grid dt { color: var(--muted-foreground); font-size: 11px; margin-bottom: 8px; }
 .configuration-grid dd { margin: 0; font-size: 13px; }
+.live-status { padding: 28px 0; max-width: 860px; }
+.live-status-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 32px; }
+.live-status-heading h2 { font-size: 16px; }
+.live-status-heading > span { color: var(--muted-foreground); font-size: 11px; }
+.live-status dd { overflow-wrap: anywhere; }
+.live-status > p { margin-top: 24px; font-size: 12px; }
 .form-stack { display: flex; flex-direction: column; gap: 20px; padding: 8px 0; }
 .form-stack label { display: inline-block; margin-bottom: 8px; font-size: 12px; }
 .source-options { display: flex; gap: 8px; }
