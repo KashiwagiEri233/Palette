@@ -29,6 +29,16 @@ from this checkout with an explicit uv project, independently of the configurati
 directory selected in Settings. Set `PALETTE_UV` to the absolute uv executable if it
 is not on PATH. `PALETTE_ROOT` selects an initial configuration directory.
 
+On Windows, the title bar is integrated into the workspace with native minimize,
+maximize, and close buttons. Drag an empty area of the top bar or the Palette brand
+to move the window; Windows window snapping remains available. The default menu bar
+is hidden. The minimum window size is 960 × 640 logical pixels; system display scaling
+is respected. Chinese text uses Microsoft YaHei, and long forms scroll within the
+window. In machine settings, the heading and save/cancel actions stay visible while
+the settings body scrolls.
+When a dialog opens, the native window button area darkens with its backdrop and
+returns to its normal color after the last dialog closes.
+
 ## Create and manage machines
 
 Choose an image or ISO, a matching architecture/profile, CPU, memory, disk capacity,

@@ -71,7 +71,14 @@ app.whenReady().then(async () => {
     if (url.hostname !== 'palette' || local.startsWith('..') || isAbsolute(local)) return new Response('Not found', { status: 404 })
     return net.fetch(pathToFileURL(path).toString())
   })
-  window = new BrowserWindow({ width: 1440, height: 900, minWidth: 960, minHeight: 640, title: 'Palette', backgroundColor: '#f4f1eb', titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default', webPreferences: { preload: join(here, '../preload/index.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true } })
+  window = new BrowserWindow({
+    width: 1440, height: 900, minWidth: 960, minHeight: 640,
+    title: 'Palette', backgroundColor: '#ffffff',
+    titleBarStyle: process.platform === 'win32' ? 'hidden' : process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    ...(process.platform === 'win32' ? { titleBarOverlay: { color: '#ffffff', symbolColor: '#252525', height: 48 } } : {}),
+    webPreferences: { preload: join(here, '../preload/index.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true }
+  })
+  if (process.platform === 'win32') window.removeMenu()
   window.webContents.session.setPermissionRequestHandler((contents, permission, callback) => callback(permission === 'fullscreen' && contents === window.webContents))
   window.webContents.session.webRequest.onHeadersReceived((details, callback) => callback({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [`default-src 'self'; script-src 'self'${process.env.ELECTRON_RENDERER_URL ? " 'unsafe-inline'" : ''}; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self' ws://127.0.0.1:*${process.env.ELECTRON_RENDERER_URL ? ' ws://localhost:5173' : ''}; object-src 'none'; base-uri 'none'`] } }))
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
@@ -97,6 +104,14 @@ app.whenReady().then(async () => {
     }).finally(() => { handlingClose = false })
   })
   ipcMain.handle('connect', event => { trusted(event); return connectOwner() })
+  ipcMain.handle('window-backdrop', (event, opacity: unknown) => {
+    trusted(event)
+    if (typeof opacity !== 'number' || !Number.isFinite(opacity) || opacity < 0 || opacity > 1) throw new Error('窗口遮罩参数无效')
+    if (process.platform !== 'win32') return
+    const shade = Math.round(255 * (1 - opacity))
+    const channel = shade.toString(16).padStart(2, '0')
+    window.setTitleBarOverlay({ color: `#${channel.repeat(3)}`, symbolColor: shade < 128 ? '#e5e5e5' : '#252525' })
+  })
   ipcMain.handle('request', async (event, method: DesktopMethod, vmId?: string, payload: Record<string, unknown> = {}) => {
     trusted(event)
     if (!methods.has(method) || (vmId !== undefined && !/^[A-Za-z0-9_.-]{1,128}$/.test(vmId)) || typeof payload !== 'object' || payload === null || Array.isArray(payload)) throw new Error('请求无效')

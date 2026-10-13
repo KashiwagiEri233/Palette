@@ -7,5 +7,8 @@ import '@fontsource/inter/700.css'
 import './globals.css'
 import './app.css'
 import App from './App'
+import { syncWindowBackdrop } from './lib/window-backdrop'
 
+document.documentElement.dataset.platform = window.palette.platform
+syncWindowBackdrop()
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>)

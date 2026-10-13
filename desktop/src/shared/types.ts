@@ -17,6 +17,8 @@ export interface VmRecord { vm_id: string; name: string; persistent: boolean; de
 export interface ControlLease { lease_id: string; instance_id: string; controller_epoch: number; boot_epoch: number; display_epoch: number }
 export interface DoctorReport { ok: boolean; checks: { name: string; ok: boolean; blocking?: boolean; detail?: unknown }[] }
 export interface DesktopApi {
+  readonly platform: string
+  setWindowBackdrop(opacity: number): Promise<void>
   connect(): Promise<OwnerInfo>
   request(method: DesktopMethod, vmId?: string, payload?: Record<string, unknown>): Promise<unknown>
   chooseFile(source: 'image' | 'iso'): Promise<string | null>

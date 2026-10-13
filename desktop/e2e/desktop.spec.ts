@@ -65,8 +65,9 @@ test('desktop lifecycle, streaming, control, font loading and exit confirmation'
     await page.getByRole('button', { name: '开发环境' }).first().click()
     await page.getByRole('button', { name: '启动', exact: true }).click()
     await expect(page.getByText('仅查看', { exact: true })).toBeVisible({ timeout: 20_000 })
-    await expect(page.locator('canvas')).toBeVisible()
-    expect(await page.locator('canvas').evaluate((canvas: HTMLCanvasElement) => ({ width: canvas.width, height: canvas.height }))).toEqual({ width: 320, height: 200 })
+    const guestCanvas = page.getByRole('tabpanel', { name: '控制台' }).locator('canvas')
+    await expect(guestCanvas).toBeVisible()
+    expect(await guestCanvas.evaluate((canvas: HTMLCanvasElement) => ({ width: canvas.width, height: canvas.height }))).toEqual({ width: 320, height: 200 })
     const identity = await page.evaluate(async () => {
       const { vms } = await window.palette.request('vms.list') as { vms: { vm_id: string; status: { action_seq: number } }[] }
       return vms[0]
@@ -141,6 +142,6 @@ test('desktop lifecycle, streaming, control, font loading and exit confirmation'
     await application.close().catch(() => {})
     try { execFileSync(uv, ['run', 'palette', '--root', root, 'daemon', 'stop'], { cwd: repository }) } catch { /* Test cleanup may have stopped it already. */ }
     await new Promise(resolve => setTimeout(resolve, 500))
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 })
   }
 })

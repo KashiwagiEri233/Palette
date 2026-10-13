@@ -112,9 +112,11 @@ class RuntimePaths:
                 stream.write(endpoint.model_dump_json().encode())
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.metadata)
         finally:
             os.close(fd)
+        try:
+            os.replace(temporary, self.metadata)
+        finally:
             temporary.unlink(missing_ok=True)
 
     def retire(self, generation: str) -> None:

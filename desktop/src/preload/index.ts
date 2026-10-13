@@ -2,6 +2,8 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type { DesktopApi } from '../shared/types'
 
 const api: DesktopApi = {
+  platform: process.platform,
+  setWindowBackdrop: opacity => ipcRenderer.invoke('window-backdrop', opacity),
   connect: () => ipcRenderer.invoke('connect'),
   request: (method, vmId, payload) => ipcRenderer.invoke('request', method, vmId, payload),
   chooseFile: source => ipcRenderer.invoke('choose-file', source),

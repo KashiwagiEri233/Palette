@@ -16,8 +16,9 @@ const DialogOverlay = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Backdrop
     ref={ref}
+    data-window-backdrop=""
     className={cn(
-      "fixed inset-0 z-50 bg-black/70 backdrop-blur-sm",
+      "app-dialog-backdrop fixed inset-0 z-50 backdrop-blur-sm",
       "transition-opacity duration-200 data-starting-style:opacity-0 data-ending-style:opacity-0",
       className
     )}
@@ -39,7 +40,7 @@ const DialogContent = React.forwardRef<
       ref={ref}
       style={{ ...cashmereGrainStyle, ...style }}
       className={cn(
-        "fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 p-6",
+        "app-dialog fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 p-6",
         "rounded-xl border border-border",
         "bg-popover text-popover-foreground",
         "[box-shadow:var(--shadow-l)]",

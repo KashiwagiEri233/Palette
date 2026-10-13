@@ -103,6 +103,6 @@ test('VM settings persist hardware, expand storage, protect running VMs and nego
     await application.evaluate(({ app }) => app.exit(0)).catch(() => {})
     await application.close().catch(() => {})
     try { execFileSync(uv, ['run', 'palette', '--root', root, 'daemon', 'stop'], { cwd: repository }) } catch { /* The test owner may already be stopped. */ }
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 })
   }
 })
