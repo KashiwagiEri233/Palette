@@ -184,3 +184,34 @@ body:has(.console-panel:fullscreen) .workspace-topbar { -webkit-app-region: no-d
   .detail-workspace .page-header { align-items: flex-start; flex-direction: column; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0s !important; transition-duration: 0s !important; } }
+/* VM configuration uses the same quiet surfaces as the workspace. */
+.vm-settings-dialog { width: min(960px, calc(100vw - 48px)); max-width: 960px; max-height: calc(100vh - 64px); padding: 24px; overflow: hidden; display: flex; flex-direction: column; }
+.vm-settings-layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); min-height: min(420px, calc(100vh - 260px)); overflow: hidden; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.vm-settings-navigation { padding: 20px 16px 20px 0; border-right: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+.vm-settings-navigation button { justify-content: flex-start; }
+.vm-settings-navigation button[aria-pressed="true"], .hardware-tabs button[aria-pressed="true"] { background: var(--muted); color: var(--foreground); }
+.vm-settings-summary { margin-top: auto; padding: 24px 12px 0; display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted-foreground); overflow-wrap: anywhere; }
+.vm-settings-summary strong { color: var(--foreground); font-weight: 500; }
+.vm-settings-body { padding: 24px; overflow-y: auto; min-height: 0; max-height: calc(100vh - 270px); }
+.vm-settings-body h2 { font-size: 16px; font-weight: 600; margin-bottom: 24px; }
+.settings-fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.settings-fieldset:disabled input, .settings-fieldset:disabled select, .settings-fieldset:disabled button { opacity: .65; cursor: default; }
+.field-hint { font-size: 12px; line-height: 1.6; color: var(--muted-foreground); margin-top: 8px; }
+.settings-forward-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.forward-row { display: grid; grid-template-columns: 120px minmax(0, 1fr) minmax(0, 1fr) auto; gap: 10px; align-items: end; }
+.settings-disk-section { display: grid; justify-items: start; gap: 16px; margin-bottom: 24px; padding-bottom: 24px; border-bottom: 1px solid var(--border); }
+.settings-disk-section .configuration-grid { width: 100%; }
+.settings-preserved { padding-top: 20px; margin-top: 20px; border-top: 1px solid var(--border); }
+.settings-error { margin-top: 20px; font-size: 13px; line-height: 1.6; }
+.settings-notice, .settings-upgrade { padding: 12px 16px; background: var(--muted); border-radius: 8px; font-size: 13px; line-height: 1.6; margin-bottom: 16px; }
+.hardware-tabs { display: flex; gap: 4px; margin-bottom: 20px; flex-wrap: wrap; }
+.create-advanced { border-top: 1px solid var(--border); padding-top: 12px; }
+.create-advanced > button { margin-bottom: 12px; }
+.create-dialog { max-height: calc(100vh - 64px); overflow-y: auto; }
+@media (max-width: 700px) {
+  .vm-settings-layout { grid-template-columns: 1fr; }
+  .vm-settings-navigation { flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--border); padding: 12px 0; }
+  .vm-settings-summary { display: none; }
+  .vm-settings-body { padding: 20px 4px; max-height: calc(100vh - 350px); }
+  .forward-row { grid-template-columns: 1fr 1fr; }
+}

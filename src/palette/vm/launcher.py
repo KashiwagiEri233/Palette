@@ -55,7 +55,7 @@ def spawn_daemon(config_root: Path) -> None:
             stdout=subprocess.DEVNULL,
             stderr=log,
             cwd=config_root,
-            env=build_child_env(),
+            env=build_child_env(audio=True),
             creationflags=CREATION_FLAGS,
             start_new_session=START_NEW_SESSION,
         )
@@ -109,8 +109,13 @@ class QemuProbe:
         }
 
 
-def build_child_env() -> dict[str, str]:
-    return {key: os.environ[key] for key in ENV_WHITELIST if key in os.environ}
+def build_child_env(*, audio: bool = False) -> dict[str, str]:
+    env = {key: os.environ[key] for key in ENV_WHITELIST if key in os.environ}
+    if audio and sys.platform == "linux":
+        for key in ("XDG_RUNTIME_DIR", "PULSE_SERVER", "PIPEWIRE_REMOTE"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+    return env
 
 
 #: CREATE_NO_WINDOW keeps QEMU hidden on Windows: the agent operates a VM, never the host
@@ -520,7 +525,21 @@ def build_launch_plan(
             argv += ["-drive", f"if=pflash,format=raw,file={hardware_vars_path}"]
 
     # The display device must exist before the input devices that bind to it.
-    argv += ["-device", f"{devices.display_model},id={devices.display_id}"]
+    display = f"{devices.display_model},id={devices.display_id}"
+    if devices.default_resolution:
+        display += f",xres={profile.display.width},yres={profile.display.height}"
+    argv += ["-device", display]
+    if profile.audio.enabled:
+        if profile.audio.backend is None:
+            raise PaletteError(ErrorCode.UNSUPPORTED_CAPABILITY, "宿主音频后端尚未确认")
+        argv += [
+            "-audiodev",
+            f"{profile.audio.backend},id=audio0",
+            "-device",
+            "intel-hda,id=sound0",
+            "-device",
+            "hda-output,bus=sound0.0,audiodev=audio0",
+        ]
     argv += ["-device", "qemu-xhci,id=xhci"]
     argv += [
         "-device",
@@ -552,9 +571,10 @@ def build_launch_plan(
         argv += ["-S"]
         notes.append("started paused; the manager resumes it once QMP is negotiated")
 
+    env = build_child_env(audio=profile.audio.enabled)
     return LaunchPlan(
         argv=argv,
-        env=build_child_env(),
+        env=env,
         cwd=workdir,
         accelerator=accelerator or qemu.accelerator,
         notes=notes,
@@ -681,7 +701,7 @@ def spawn_supervised_child(argv: Sequence[str]) -> subprocess.Popen[bytes]:
         stdin=0,
         stdout=1,
         stderr=2,
-        env=build_child_env(),
+        env=build_child_env(audio="-audiodev" in argv),
         close_fds=True,
         start_new_session=True,
     )

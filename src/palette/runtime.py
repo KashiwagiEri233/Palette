@@ -33,6 +33,7 @@ class RuntimeOwner:
         self.operator.acquire()
         try:
             await self.service.startup()
+            await self.desktop.recover_operations()
             await self.display.start()
             self.service.manager.console_enabled = True
             self.agent = AgentServer(self.service, self.operator, self.desktop)
@@ -59,6 +60,7 @@ class RuntimeOwner:
             return {
                 "version": __version__,
                 "desktop_protocol": 1,
+                "features": ["vm-settings-v2", "disk-resize"],
                 "owner_kind": self.kind,
                 "pid": os.getpid(),
                 "generation": self.operator.endpoint.generation,
@@ -97,6 +99,14 @@ class RuntimeOwner:
             return await self.desktop.create(payload)
         if method == "vms.update":
             return await self.desktop.update(vm_id, payload)
+        if method == "vms.settings.get":
+            return await self.desktop.get_settings(vm_id)
+        if method == "vms.disk.resize":
+            return await self.desktop.resize_disk(vm_id, payload)
+        if method == "hardware.capabilities":
+            return await self.desktop.probe.get(
+                self.service.config.profile(payload.get("profile_id"))
+            )
         if method == "vms.start":
             if vm_id in self.desktop.definitions:
                 return await self.desktop.start(vm_id)

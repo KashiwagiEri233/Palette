@@ -451,6 +451,23 @@ def main(argv: list[str]) -> int:
         return 0
     if "-device" in argv and "help" in argv:
         sys.stdout.write(DEVICE_HELP)
+        for name in (
+            "virtio-gpu-pci",
+            "ramfb",
+            "virtio-net-pci",
+            "e1000",
+            "rtl8139",
+            "intel-hda",
+            "hda-output",
+        ):
+            print(f'name "{name}"')
+        return 0
+    if "-device" in argv and any(value.endswith(",help") for value in argv):
+        if "ramfb,help" not in argv:
+            print("  xres=<uint32>\n  yres=<uint32>")
+        return 0
+    if "-audiodev" in argv and "help" in argv:
+        print("Available audio drivers:\ncoreaudio\ndsound\npipewire\npa\nalsa")
         return 0
 
     qemu = FakeQemu(argv)

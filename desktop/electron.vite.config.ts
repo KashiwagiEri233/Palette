@@ -8,6 +8,7 @@ export default defineConfig({
   preload: { plugins: [externalizeDepsPlugin()], build: { rollupOptions: { output: { format: 'cjs' } } } },
   renderer: {
     resolve: { alias: { '@': resolve('src/renderer') } },
+    optimizeDeps: { esbuildOptions: { target: 'esnext' } },
     plugins: [react(), tailwindcss()]
   }
 })

@@ -16,6 +16,9 @@ let handlingClose = false
 const leases = new Map<string, string>()
 const methods = new Set<DesktopMethod>(['profiles', 'doctor', 'vms.list', 'vms.create', 'vms.update', 'vms.start', 'vms.stop', 'vms.restart', 'vms.reset', 'vms.delete', 'display.ticket', 'display.sync', 'control.acquire', 'control.input', 'control.heartbeat', 'control.release'])
 methods.add('image.info')
+methods.add('hardware.capabilities')
+methods.add('vms.settings.get')
+methods.add('vms.disk.resize')
 protocol.registerSchemesAsPrivileged([{ scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }])
 
 function run(args: string[]): Promise<string> {
@@ -41,7 +44,7 @@ async function connectOwner(): Promise<OwnerInfo> {
   const result = await call(runtimeRoot, 'hello')
   if (result.desktop_protocol !== 1) throw new Error('后台协议版本不兼容')
   // Agent credentials never cross the preload boundary.
-  return { owner_kind: result.owner_kind, config_root: result.config_root, runtime_root: result.runtime_root, version: result.version } as OwnerInfo
+  return { owner_kind: result.owner_kind, config_root: result.config_root, runtime_root: result.runtime_root, version: result.version, features: Array.isArray(result.features) ? result.features : [] } as OwnerInfo
 }
 
 async function releaseAll(): Promise<void> {

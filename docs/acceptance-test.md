@@ -268,7 +268,39 @@ Do not copy the HVF configuration to Windows/Linux. Select the platform's accele
 verify the PE boot path, display and storage drivers. A UEFI shell or missing boot device
 requires checking a usable ARM64 EFI loader in the ISO; it is not a passed Agent desktop test.
 
-## 10. Acceptance record
+## 10. Hardware settings acceptance
+
+Use a disposable VM with a real guest. Record each item separately from fake-QEMU regressions:
+
+1. Write a guest file, shut down, change CPU/RAM, and verify the resources in the guest after
+   boot. Confirm running machines expose read-only settings and refuse operator edits.
+2. Expand the managed disk, verify virtual capacity and the saved file, then expand the guest
+   partition manually. Restart the backend and verify disk and UEFI persistence.
+3. Change a supported default resolution and compare the requested setting with the actual
+   guest geometry. For RAMFB confirm the unsupported control explains its limitation.
+4. Replace/eject ISO media and test automatic, disk-first, and CD-first boot preferences.
+5. Test offline/restricted/NAT independently. For an explicit forwarding rule, run a guest
+   service, connect through localhost, and confirm the host listener is not publicly bound.
+6. Enable sound with installed guest HDA drivers and play a test tone through the host.
+   Verify no microphone capture; absent drivers or an unavailable audio backend are not passes.
+7. Exercise unsaved changes, invalid values, reopened settings, old-backend notices, and
+   screenshot/layout checks at the normal window sizes. A failed disk-integrity recovery must
+   keep startup blocked and preserve its operation record.
+
+### Local hardware checks, 2026-10-14
+
+On macOS 27.0.1 / ARM64, QEMU 11.1.2 / HVF used a separate disposable VM and the supplied
+WinPE ISO. Real `qemu-img` expanded the managed disk from 8 to 12 GiB; `qemu-io` verified a
+4096-byte pattern at offset 1048576 survived, and UEFI variable bytes remained unchanged.
+QMP confirmed two vCPUs. The live process arguments confirmed 1024 MiB RAM, a VirtIO NIC,
+loopback-only forwarding, Intel HDA output, and CoreAudio initialization. A localhost
+connection reached the forwarded listener; no guest service or outbound connectivity was
+verified. VirtIO GPU received `xres=1920,yres=1080`, while the captured firmware framebuffer
+remained 640×480. Guest partition expansion, guest resource checks, OS display-driver behavior,
+and actual audio playback remain unverified. Evidence is local and ignored:
+`.runtime/settings-acceptance/report.json` and `.runtime/settings-acceptance/display.png`.
+
+## 11. Acceptance record
 
 ```text
 Date / host OS / architecture:
@@ -288,7 +320,7 @@ Passed, failed or unexecuted items / reasons:
 Automated regression:
 
 ```bash
-uv run pytest tests/integration/test_desktop.py tests/unit/test_display.py
+uv run pytest tests/integration/test_desktop.py tests/integration/test_vm_settings.py tests/unit/test_display.py
 uv run python scripts/check_docs.py
 npm --prefix desktop test
 npm --prefix desktop run test:e2e

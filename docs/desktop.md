@@ -39,9 +39,8 @@ The selected firmware and virtual disk drivers must match the guest; Windows ISO
 installations may require VirtIO drivers supplied on installation media.
 
 VM definitions are stored under `<runtime>/definitions`. Their disk and UEFI variable
-stores survive shutdown and new process instances. Stopped definitions can be renamed
-and their CPU, memory, network and ISO attachment changed. Installation media can be
-removed after installation. Existing CLI-created machines remain temporary desktops;
+stores survive shutdown and new process instances. **虚拟机设置** is available from each
+machine's action menu and detail header. Existing CLI-created machines remain temporary desktops;
 CLI lifecycle commands honor existing Desktop definitions and their persistent disks.
 
 Restart preserves the disk. **Restore initial state** discards changes: an imported
@@ -50,6 +49,39 @@ Deletion removes managed files subject to dependency checks, never the imported 
 Normal GUI shutdown reports an ACPI timeout and leaves the machine running. Forced
 stop is a separate confirmed operation. Closing the window asks whether to keep
 machines running, shut them down, or cancel.
+
+## Virtual machine settings
+
+The settings panel groups General, CPU and memory, Disk and boot, Display, Network, and
+Sound. Running machines are read-only; shut down before changing hardware. Save applies
+changes to the next start, with revision checks preventing stale edits. Unsaved changes
+can be saved, discarded, or kept for further editing.
+
+CPU supports 1–64 vCPUs; RAM supports 256–1048576 MiB. Host resource information is a
+reference, not a reservation. Disk expansion is a separate confirmed operation and requires
+saving or discarding other edits first. Capacity can only grow, up to 4096 GiB. The panel
+distinguishes configured capacity, actual virtual capacity, and host allocation. Expansion
+does not enlarge guest partitions. Only managed writable layers change; backing images and
+UEFI variables remain intact. Interrupted expansion is recovered from the disk and journal;
+uncertain integrity blocks startup rather than attempting a destructive shrink.
+
+Choose, replace, mount, or eject an ISO for either source type. Boot order offers automatic,
+disk-first, and CD-first; CD-first requires mounted media. Automatic selects media on the
+first start and disk afterwards. Existing UEFI boot entries may affect the guest's choice.
+
+Display and NIC options are filtered by architecture and installed QEMU capabilities.
+Supported display devices can request a default resolution, while RAMFB delegates it to
+firmware/the guest. This is a startup hint, not guaranteed guest resolution or console zoom.
+Network offers offline, restricted, and NAT modes, plus NIC model, MAC address and TCP/UDP
+forwarding bound to `127.0.0.1`. Existing trusted profile network options remain visible and
+preserved; conflicting hardware overrides are rejected.
+
+Sound uses Intel HDA output to the host default audio device, without microphone capture.
+QEMU must offer CoreAudio on macOS, DirectSound on Windows, or PipeWire/PulseAudio/ALSA on
+Linux; the guest also needs a sound driver. An unavailable backend is reported explicitly.
+The creation wizard reuses the hardware forms under **更多硬件选项**. Version-1 definitions
+are read without rewriting storage and upgraded on a successful save. An older owner shows
+an upgrade notice; Desktop never restarts that owner automatically.
 
 ## Console and control
 

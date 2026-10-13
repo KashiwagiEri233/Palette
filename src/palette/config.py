@@ -118,6 +118,7 @@ class ImagesConfig(_Strict):
 class DeviceConfig(_Strict):
     display_id: str = "video0"
     display_model: str = "VGA"
+    default_resolution: bool = False
     keyboard_id: str = "agent-kbd"
     pointer_id: str = "agent-pointer"
     head: int = Field(default=0, ge=0)
@@ -175,6 +176,7 @@ class NetworkConfig(_Strict):
     mode: Literal["offline", "restricted-lab", "nat", "internet-allowlist"] = "restricted-lab"
     #: Pins the guest MAC, for a lab network where the address matters.
     mac: str | None = None
+    model: Literal["virtio-net-pci", "e1000", "rtl8139"] | None = None
     #: Additional QEMU ``-nic`` settings, passed through verbatim for the chosen mode.
     extra_options: str | None = None
     #: Port forwards for `restricted-lab`/`nat`, e.g. ["tcp::8080-:80"]. Recorded in the
@@ -191,6 +193,8 @@ class NetworkConfig(_Strict):
         if self.mode == "offline":
             return "none"
         parts = ["user"]
+        if self.model:
+            parts.append(f"model={self.model}")
         if self.mode == "restricted-lab":
             parts.append("restrict=on")
         if self.mac:
@@ -199,6 +203,11 @@ class NetworkConfig(_Strict):
         if self.extra_options:
             parts.append(self.extra_options)
         return ",".join(parts)
+
+
+class AudioConfig(_Strict):
+    enabled: bool = False
+    backend: Literal["coreaudio", "dsound", "pipewire", "pa", "alsa"] | None = None
 
 
 class TextConfig(_Strict):
@@ -310,6 +319,7 @@ class Profile(_Strict):
     display: DisplayConfig = Field(default_factory=DisplayConfig)
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
+    audio: AudioConfig = Field(default_factory=AudioConfig)
     text: TextConfig = Field(default_factory=TextConfig)
     timeouts: TimeoutConfig = Field(default_factory=TimeoutConfig)
     lifecycle: LifecyclePolicy = Field(default_factory=LifecyclePolicy)

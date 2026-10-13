@@ -63,6 +63,7 @@ class ImageInfo:
     format: str
     chain: tuple[Path, ...]
     virtual_size: int = 0
+    actual_size: int = 0
 
 
 def sha256_file(path: Path, *, chunk_size: int = _HASH_CHUNK) -> str:
@@ -406,7 +407,15 @@ class ImageManager:
         virtual_size = entries[0].get("virtual-size", 0)
         if type(virtual_size) is not int or virtual_size < 0:
             raise PaletteError(ErrorCode.IMAGE_INVALID, "invalid virtual disk size")
-        return ImageInfo(format=str(image_format), chain=tuple(chain), virtual_size=virtual_size)
+        actual_size = entries[0].get("actual-size", 0)
+        if type(actual_size) is not int or actual_size < 0:
+            raise PaletteError(ErrorCode.IMAGE_INVALID, "invalid allocated disk size")
+        return ImageInfo(
+            format=str(image_format),
+            chain=tuple(chain),
+            virtual_size=virtual_size,
+            actual_size=actual_size,
+        )
 
     async def _verify_backing_chain(
         self, overlay: Path, base: Path, backing_format: str

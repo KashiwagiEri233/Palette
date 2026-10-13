@@ -38,6 +38,19 @@ def main(argv: list[str]) -> int:
         return cmd_create(rest)
     if command == "info":
         return cmd_info(rest)
+    if command == "resize":
+        options = _parse_flags(rest, with_value={"-f"})
+        path, size = options["positional"]
+        chain = _read_chain(path)
+        if not chain or not size.endswith("G"):
+            return 1
+        chain["virtual_size"] = int(size[:-1]) * 1024**3
+        with open(path, "wb") as handle:
+            handle.write(MAGIC + json.dumps(chain).encode("utf-8"))
+        return 0
+    if command == "check":
+        options = _parse_flags(rest, with_value={"-f"})
+        return 0 if _read_chain(options["positional"][-1]) else 2
     if command == "commit":
         # Palette must never commit a task's writes back into the base image. Failing here
         # turns any accidental call into a loud test failure rather than a silent merge.
@@ -63,7 +76,9 @@ def cmd_create(argv: list[str]) -> int:
         "driver": options["flags"].get("-f", "qcow2"),
         "backing": options["flags"].get("-b"),
         "backing_format": options["flags"].get("-F"),
-        "virtual_size": VIRTUAL_SIZE,
+        "virtual_size": int(positional[-1][:-1]) * 1024**3
+        if positional[-1].endswith("G")
+        else VIRTUAL_SIZE,
     }
     try:
         os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)

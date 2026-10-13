@@ -251,6 +251,21 @@ class VmManager:
             )
         accelerator = require_accelerator(profile, probe)
         profile = resolve_firmware(profile, binary)
+        if profile.audio.enabled:
+            from ..vm_settings import CapabilityProbe
+
+            capabilities = await CapabilityProbe(self.config.host).get(profile)
+            if not capabilities["audio_available"]:
+                raise PaletteError(
+                    ErrorCode.UNSUPPORTED_CAPABILITY, "当前 QEMU 缺少输出声卡或宿主音频后端"
+                )
+            profile = profile.model_copy(
+                update={
+                    "audio": profile.audio.model_copy(
+                        update={"backend": capabilities["audio_backend"]}
+                    )
+                }
+            )
 
         images = ImageManager(
             guard_root,

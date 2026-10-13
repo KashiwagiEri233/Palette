@@ -248,7 +248,19 @@ async def test_iso_blank_disk_and_install_media(service: PaletteService, tmp_pat
     assert any("scsi-cd" in value and "bootindex=0" in value for value in instance.plan.argv)
     assert any("virtio-blk-pci" in value and "bootindex=1" in value for value in instance.plan.argv)
     await desktop.stop(definition["vm_id"])
-    await desktop.update(definition["vm_id"], {"iso_attached": False})
+    current = await desktop.get_settings(definition["vm_id"])
+    await desktop.update(
+        definition["vm_id"],
+        {
+            "revision": current["revision"],
+            "name": current["draft"]["name"],
+            "vcpus": current["draft"]["vcpus"],
+            "memory_mib": current["draft"]["memory_mib"],
+            "network": current["draft"]["network"],
+            "settings": current["settings"],
+            "iso_attached": False,
+        },
+    )
     await desktop.start(definition["vm_id"])
     assert not service.manager.get(definition["vm_id"]).overrides.volumes
 

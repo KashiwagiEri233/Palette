@@ -254,7 +254,36 @@ MCP 完整点击调用的单次耗时：开始按钮 693.15 ms，双击 889.70 m
 WinPE 的启动路径、显示和磁盘驱动。出现 UEFI shell 或无法找到启动设备时，先检查 ISO
 是否包含可用的 ARM64 EFI 启动文件；这是引导未完成，不是 Agent 点击成功。
 
-## 10. 记录验收结果
+## 10. 硬件设置验收
+
+使用可丢弃的真实客户机，每项单独记录，不与 fake QEMU 回归结果混合：
+
+1. 写入客户机文件，关机后修改 CPU、内存，启动后在客户机内核对资源。运行中设置
+   应只读，后端也必须拒绝运维配置写入。
+2. 扩容受管理磁盘，核对实盘容量和原有文件，再手动扩展客户机分区。重启后台后
+   确认磁盘与 UEFI 变量保持不变。
+3. 修改支持的默认分辨率，分别记录请求值和客户机实际尺寸。RAMFB 的不可用控件
+   应解释限制。
+4. 更换、移除 ISO，分别验证自动、硬盘优先和光盘优先的启动偏好。
+5. 单独测试离线、隔离和 NAT。端口转发需在客户机启动服务，经 localhost 连接，
+   并确认宿主没有公开监听该端口。
+6. 客户机安装 HDA 驱动后启用声音，播放测试音并确认宿主实际输出、不采集麦克风。
+   缺少驱动或后端不可用不能判定为通过。
+7. 检查未保存修改、非法输入、重开设置、旧后台提示和常用窗口尺寸下的截图布局。
+   磁盘完整性恢复失败必须继续阻止启动并保留操作记录。
+
+### 本机硬件检查记录：2026-10-14
+
+macOS 27.0.1 / ARM64，QEMU 11.1.2 / HVF，使用独立测试 VM 和提供的 WinPE ISO。
+真实 `qemu-img` 将受管理磁盘从 8 扩至 12 GiB；`qemu-io` 确认偏移 1048576 处的
+4096 字节数据模式保留，UEFI 变量字节未改变。QMP 确认 2 个 vCPU，实际进程参数确认
+1024 MiB 内存、VirtIO 网卡、仅本机转发、Intel HDA 输出及 CoreAudio 初始化。
+localhost 可以连接转发监听端口，未验证客户机服务或外网连接。VirtIO GPU 收到
+`xres=1920,yres=1080`，但固件画面仍为 640×480。客户机分区扩展、系统内资源检查、
+显示驱动行为和实际声音播放尚未验证。本机证据不纳入 Git：
+`.runtime/settings-acceptance/report.json`、`.runtime/settings-acceptance/display.png`。
+
+## 11. 记录验收结果
 
 ```text
 日期／宿主系统／架构：
@@ -274,7 +303,7 @@ MCP 客户端／模型／是否实际收到图片：
 自动回归命令：
 
 ```bash
-uv run pytest tests/integration/test_desktop.py tests/unit/test_display.py
+uv run pytest tests/integration/test_desktop.py tests/integration/test_vm_settings.py tests/unit/test_display.py
 uv run python scripts/check_docs.py
 npm --prefix desktop test
 npm --prefix desktop run test:e2e
