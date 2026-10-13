@@ -85,6 +85,7 @@ ActionResult = Receipt | GuestToolResult
 
 class JobKind(StrEnum):
     ACTION = "action"
+    OPERATOR_INPUT = "operator_input"
     OBSERVE = "observe"
     RELEASE = "release"
 
@@ -352,6 +353,7 @@ class ActionController:
         self._closing = False
         self._generation = 0
         self._last_capture_at: float = 0.0
+        self.mutation_guard: Callable[[], None] | None = None
 
     # -- lifecycle -------------------------------------------------------------------
     async def start(self) -> None:
@@ -844,7 +846,16 @@ class ActionController:
                 continue
             self._current = job
             job.started.set()
-            task = asyncio.create_task(job.runner(), name=f"job-{job.label}")
+            guard_passed = False
+
+            async def guarded_runner(current: _Job = job) -> Any:
+                nonlocal guard_passed
+                if current.kind is JobKind.ACTION and self.mutation_guard is not None:
+                    self.mutation_guard()
+                guard_passed = True
+                return await current.runner()
+
+            task = asyncio.create_task(guarded_runner(), name=f"job-{job.label}")
             job.task = task
             timer = asyncio.get_running_loop().call_later(
                 self.profile.resources.max_action_seconds,
@@ -852,7 +863,7 @@ class ActionController:
                 job,
                 PaletteError(
                     ErrorCode.ACTION_OUTCOME_UNKNOWN
-                    if job.kind is JobKind.ACTION
+                    if job.kind in {JobKind.ACTION, JobKind.OPERATOR_INPUT}
                     else ErrorCode.TIMEOUT,
                     f"{job.label} exceeded its execution deadline",
                     retryable=False,
@@ -876,7 +887,10 @@ class ActionController:
                 )
             finally:
                 timer.cancel()
-                if job.kind is JobKind.ACTION and not self._ledger.is_clean:
+                if (
+                    (job.kind is JobKind.ACTION and guard_passed)
+                    or (job.kind is JobKind.OPERATOR_INPUT and error is not None)
+                ) and not self._ledger.is_clean:
                     await self._bounded_release()
                 self._finish_job(job, result=result, error=error)
                 self._current = None
@@ -1088,6 +1102,32 @@ class ActionController:
         arguments["events"] = events
         await self._qmp.execute(
             "input-send-event", arguments, timeout=timeout, on_sending=on_sending
+        )
+
+    async def operator_input(
+        self, events: list[dict[str, Any]], validate: Callable[[], None]
+    ) -> int:
+        """Send one authenticated batch; successful held inputs survive the batch."""
+        identity = self._identity()
+
+        async def run() -> int:
+            validate()
+            self._require_identity(identity)
+            self._note_presses(events)
+            progress = _InputProgress(self.view, self.view.action_seq)
+            await self._send_events(
+                events,
+                timeout=self.profile.timeouts.qmp_command_seconds,
+                on_sending=progress.sending,
+            )
+            self._note_releases(events)
+            self._require_identity(identity)
+            if self._audit is not None:
+                self._audit.record("operator.input", vm_id=self.view.vm_id, count=len(events))
+            return self.view.action_seq
+
+        return cast(
+            int, await self._submit(self._make_job(JobKind.OPERATOR_INPUT, "operator", run))
         )
 
     async def _run_action(

@@ -2,8 +2,8 @@ name: CI
 
 # What runs where, stated plainly because the badge alone will not say it:
 #
-#   push / pull_request  ->  the lint job only
-#   manual dispatch      ->  the lint job, plus the test matrix if you ask for it
+#   push / pull_request  ->  lint and desktop jobs
+#   manual dispatch      ->  lint and desktop, plus the Python test matrix if requested
 #
 # The test matrix is parked behind `run_tests` rather than deleted: the commands are the
 # same ones you would run locally, and re-enabling it is a checkbox rather than a rewrite.
@@ -40,6 +40,27 @@ permissions:
   contents: read
 
 jobs:
+  desktop:
+    name: desktop types, build and input tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+        working-directory: desktop
+      - run: npm run build
+        working-directory: desktop
+      - run: npm test
+        working-directory: desktop
+
   lint:
     name: lint, types and docs (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

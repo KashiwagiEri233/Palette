@@ -69,8 +69,34 @@ class TakeControl(StrictModel):
     reason: str = Field(min_length=1, max_length=4096)
 
 
+class DesktopCommand(StrictModel):
+    method: Literal[
+        "hello",
+        "profiles",
+        "image.info",
+        "doctor",
+        "vms.list",
+        "vms.create",
+        "vms.update",
+        "vms.start",
+        "vms.stop",
+        "vms.restart",
+        "vms.reset",
+        "vms.delete",
+        "display.ticket",
+        "display.sync",
+        "control.acquire",
+        "control.input",
+        "control.heartbeat",
+        "control.release",
+        "daemon.stop",
+    ]
+    vm_id: str | None = Field(default=None, max_length=128)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 Command = Annotated[
-    Start | Stop | Reset | Status | EmergencyStop | TakeControl,
+    Start | Stop | Reset | Status | EmergencyStop | TakeControl | DesktopCommand,
     Field(discriminator="method"),
 ]
 

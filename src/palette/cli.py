@@ -19,8 +19,10 @@ import logging
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -104,7 +106,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     serve = sub.add_parser("serve", help="run the MCP server on stdio")
     serve.add_argument("--profile", default=None, help="default profile for lifecycle commands")
+    serve.add_argument(
+        "--standalone", action="store_true", help="own this runtime until stdio closes"
+    )
+    serve.add_argument(
+        "--connect-only", action="store_true", help="only connect to an existing owner"
+    )
     serve.set_defaults(handler=_cmd_serve)
+
+    daemon = sub.add_parser("daemon", help="manage the shared desktop and MCP owner")
+    daemon_sub = daemon.add_subparsers(dest="daemon_command", required=True)
+    for action in ("run", "start", "status", "stop"):
+        operation = daemon_sub.add_parser(action)
+        operation.set_defaults(handler=_cmd_daemon)
 
     config = sub.add_parser("config", help="inspect trusted configuration")
     config_sub = config.add_subparsers(dest="config_command", required=True)
@@ -225,6 +239,23 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         else NullAuditLog()
     )
     service = PaletteService(config, audit=audit)
+    if not args.standalone:
+        from .agent_ipc import RemoteService, discover
+        from .operator.protocol import Endpoint
+
+        owner_info = asyncio.run(discover(config))
+        if owner_info is not None:
+            service = RemoteService(
+                config,
+                Endpoint.model_validate(owner_info["agent_endpoint"]),
+                default_profile=args.profile,
+            )
+        elif args.connect_only:
+            raise PaletteError(ErrorCode.PRECONDITION_FAILED, "no running palette owner")
+    elif args.connect_only:
+        raise PaletteError(
+            ErrorCode.INVALID_ARGUMENT, "standalone and connect-only are mutually exclusive"
+        )
     server = build_server(service)
     logger.info("palette %s serving MCP on stdio", __version__)
     try:
@@ -236,6 +267,59 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         if isinstance(error, PaletteError):
             raise error from None
         raise
+    return EXIT_OK
+
+
+def _cmd_daemon(args: argparse.Namespace) -> int:
+    from .agent_ipc import discover
+    from .runtime import RuntimeOwner
+
+    config = _load(args)
+    if args.daemon_command == "status":
+        info = asyncio.run(discover(config))
+        if info is None:
+            raise PaletteError(ErrorCode.PRECONDITION_FAILED, "no running palette owner")
+        info.pop("agent_endpoint", None)
+        print(json.dumps(info, indent=2))
+        return EXIT_OK
+    if args.daemon_command == "stop":
+        print(json.dumps(asyncio.run(OperatorClient(config.runtime_root).call("daemon.stop"))))
+        return EXIT_OK
+    if args.daemon_command == "start":
+        if asyncio.run(discover(config)) is not None:
+            return EXIT_OK
+        from .vm.launcher import spawn_daemon
+
+        spawn_daemon(config.config_root)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if asyncio.run(discover(config)) is not None:
+                return EXIT_OK
+            time.sleep(0.1)
+        raise PaletteError(ErrorCode.TIMEOUT, "daemon did not publish a ready endpoint")
+
+    async def run() -> None:
+        owner = RuntimeOwner(
+            PaletteService(
+                config,
+                audit=AuditLog(
+                    config.runtime_root / "audit" / "palette.jsonl",
+                    enabled=config.host.audit_enabled,
+                ),
+            ),
+            kind="daemon",
+        )
+        loop = asyncio.get_running_loop()
+        if not IS_WINDOWS:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, owner.stopping.set)
+        try:
+            await owner.start()
+            await owner.stopping.wait()
+        finally:
+            await owner.close()
+
+    asyncio.run(run())
     return EXIT_OK
 
 

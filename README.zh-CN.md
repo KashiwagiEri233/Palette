@@ -1,5 +1,8 @@
 # Palette
 
+Electron 桌面应用支持创建虚拟机、保留磁盘修改和实时人工操控。源码运行与 MCP 共用
+后台的说明见[桌面应用指南](docs/desktop.zh-CN.md)。
+
 [English](README.md) | **简体中文**
 
 [![CI](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml/badge.svg)](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml)

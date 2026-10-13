@@ -23,7 +23,7 @@ import shutil
 import time
 import uuid
 from collections import deque
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
@@ -106,6 +106,9 @@ class VmInstance:
     #: instance that was asked for instead of quietly reverting to the profile's defaults.
     overrides: LaunchOverrides = field(default_factory=LaunchOverrides)
     guest_refresh: asyncio.Task[None] | None = None
+    persistent_storage: bool = False
+    console_address: tuple[str, int] | None = None
+    console_password: str | None = None
 
     @property
     def state(self) -> VmState:
@@ -148,6 +151,8 @@ class VmManager:
         self._lock = asyncio.Lock()
         self._cleanup_waiters: set[asyncio.Task[Any]] = set()
         self._guest_tool_transport_factory = guest_tool_transport_factory
+        self.persistent_roots: set[Path] = set()
+        self.console_enabled = False
 
     # -- lookup ----------------------------------------------------------------------
     def get(self, vm_id: str) -> VmInstance:
@@ -184,9 +189,12 @@ class VmManager:
         profile_id: str | None = None,
         *,
         overrides: LaunchOverrides | None = None,
+        profile_override: Profile | None = None,
+        storage: InstancePaths | None = None,
+        on_storage_ready: Callable[[VmInstance], None] | None = None,
     ) -> VmInstance:
         validate_identifier(vm_id, what="vm_id")
-        profile = self.config.profile(profile_id)
+        profile = profile_override or self.config.profile(profile_id)
         async with self._lock:
             existing = self._instances.get(vm_id)
             if existing is not None and existing.state in {
@@ -198,12 +206,19 @@ class VmManager:
             try:
                 if existing is not None:
                     await self._finish_cleanup(self._stop_locked(existing, force=True))
-                return await self._start_locked(vm_id, profile, overrides or LaunchOverrides())
+                return await self._start_locked(
+                    vm_id, profile, overrides or LaunchOverrides(), storage, on_storage_ready
+                )
             finally:
                 self._apply_retention(vm_id, profile)
 
     async def _start_locked(
-        self, vm_id: str, profile: Profile, overrides: LaunchOverrides
+        self,
+        vm_id: str,
+        profile: Profile,
+        overrides: LaunchOverrides,
+        storage: InstancePaths | None = None,
+        on_storage_ready: Callable[[VmInstance], None] | None = None,
     ) -> VmInstance:
         validate_target(profile)
         guard_root = PathGuard(self.config.runtime_root)
@@ -249,7 +264,17 @@ class VmManager:
         instance_id = f"inst_{uuid.uuid4().hex[:12]}"
         boot_epoch = self._boot_epochs.get(vm_id, 0) + 1
         self._boot_epochs[vm_id] = boot_epoch
+        if storage is not None:
+            guard_root.assert_managed(storage.overlay)
+            if images.read_manifest(vm_id, storage.instance_id) is None:
+                raise PaletteError(
+                    ErrorCode.IMAGE_INVALID, "persistent storage manifest is invalid"
+                )
+            await images.inspect_image(storage.overlay, image_format="qcow2")
         paths = images.allocate_instance(vm_id, instance_id)
+        if storage is not None:
+            paths.overlay = storage.overlay
+            paths.hardware_vars = storage.hardware_vars
 
         view = InstanceView(
             vm_id=vm_id,
@@ -268,12 +293,22 @@ class VmManager:
             paths=paths,
             cleanup_root=paths.root,
             overrides=overrides,
+            persistent_storage=storage is not None,
         )
         self._instances[vm_id] = instance
 
         try:
             async with asyncio.timeout(profile.timeouts.startup_seconds):
-                await self._provision(instance, images, profile, binary, accelerator, overrides)
+                await self._provision(
+                    instance,
+                    images,
+                    profile,
+                    binary,
+                    accelerator,
+                    overrides,
+                    storage,
+                    on_storage_ready,
+                )
         except asyncio.CancelledError:
             await self._finish_cleanup(self._rollback_start(instance, images))
             raise
@@ -329,8 +364,9 @@ class VmManager:
         instance.view.state = str(VmState.FAILED)
         await self._teardown(instance, force=True)
         images.update_manifest(instance.paths, {"state": "FAILED", "process_exited": True})
-        with contextlib.suppress(PaletteError, OSError):
-            images.delete_instance(instance.view.vm_id, instance.view.instance_id)
+        if not instance.persistent_storage:
+            with contextlib.suppress(PaletteError, OSError):
+                images.delete_instance(instance.view.vm_id, instance.view.instance_id)
         if self.find(instance.view.vm_id) is instance:
             self._instances.pop(instance.view.vm_id)
 
@@ -342,6 +378,8 @@ class VmManager:
         binary: str,
         accelerator: str,
         overrides: LaunchOverrides,
+        storage: InstancePaths | None = None,
+        on_storage_ready: Callable[[VmInstance], None] | None = None,
     ) -> None:
         """The startup sequence, in the order the plan requires."""
         paths = instance.paths
@@ -366,8 +404,17 @@ class VmManager:
         # 1. writable layer from the read-only base, with the backing chain verified. A
         #    caller-supplied image replaces the profile's pinned base here and nowhere else:
         #    the writable layer is still ours, per-instance, and discarded by reset.
-        await images.create_overlay(paths, base=overrides.image, base_format=overrides.image_format)
-        images.stage_firmware_vars(paths)
+        if storage is None:
+            await images.create_overlay(
+                paths,
+                base=overrides.image,
+                base_format=overrides.image_format,
+                size_gib=profile.images.size_gib if on_storage_ready is not None else None,
+            )
+            images.stage_firmware_vars(paths)
+        if on_storage_ready is not None:
+            on_storage_ready(instance)
+            instance.persistent_storage = True
         volumes = []
         volume_chain: list[str] = []
         for volume in overrides.volumes:
@@ -399,6 +446,7 @@ class VmManager:
             start_paused=True,
             extra_volumes=overrides.volumes,
             caller_args=overrides.qemu_args,
+            managed_console=self.console_enabled,
         )
         instance.plan = plan
         process = await spawn_qemu(
@@ -453,6 +501,15 @@ class VmManager:
             ) from exc
 
         instance.view.qmp_ready = True
+        if self.console_enabled and {"query-vnc", "set_password"}.issubset(qmp.commands or ()):
+            import secrets
+
+            password = secrets.token_hex(4)
+            await qmp.execute("set_password", {"protocol": "vnc", "password": password})
+            display = await qmp.execute("query-vnc")
+            if display.get("enabled") and display.get("service"):
+                instance.console_address = ("127.0.0.1", int(display["service"]))
+                instance.console_password = password
         await qmp.execute("cont")
         instance.transition(VmState.RUNNING)
 
@@ -804,10 +861,11 @@ class VmManager:
                 or (instance.process is not None and instance.process.returncode is None)
             )
         }
-        protected: list[Path] = []
+        protected: list[Path] = list(self.persistent_roots)
         for instance in self._instances.values():
             if instance.process is not None and instance.process.returncode is None:
                 protected.append(instance.paths.root)
+                protected.append(instance.paths.overlay)
                 protected.append(instance.overrides.image or Path(instance.profile.images.base))
                 protected.extend(Path(volume.path) for volume in instance.overrides.volumes)
         try:
@@ -826,6 +884,29 @@ class VmManager:
                 instance.controller.invalidate(reason="control changed hands")
                 await self._finish_cleanup(self._release_controller(instance))
             return instance.view.controller_epoch
+
+    async def graceful_stop(self, vm_id: str) -> None:
+        """Desktop shutdown: a failed ACPI request must never turn into a kill."""
+        async with self._lock:
+            instance = self.get(vm_id)
+            if instance.process is None or instance.process.returncode is not None:
+                await self._finish_cleanup(self._stop_locked(instance, force=False))
+                return
+            if instance.qmp is None or not instance.qmp.connected:
+                raise PaletteError(ErrorCode.QMP_UNAVAILABLE, "graceful shutdown is unavailable")
+            previous = instance.view.state
+            previous_stop_requested = instance.stop_requested
+            instance.stop_requested = True
+            instance.view.state = str(VmState.STOPPING)
+            try:
+                await instance.qmp.execute("system_powerdown")
+                await self._await_exit(instance, timeout=instance.profile.timeouts.shutdown_seconds)
+            except BaseException:
+                instance.view.state = previous
+                instance.stop_requested = previous_stop_requested
+                raise
+            await self._finish_cleanup(self._stop_locked(instance, force=False))
+            self._apply_retention(vm_id, instance.profile)
 
     @staticmethod
     async def _release_controller(instance: VmInstance) -> None:

@@ -53,7 +53,9 @@ def cmd_create(argv: list[str]) -> int:
     if len(positional) < 1:
         print("create needs an output filename", file=sys.stderr)
         return 1
-    output = positional[-1]
+    output = (
+        positional[-2] if len(positional) >= 2 and positional[-1].endswith("G") else positional[-1]
+    )
     if options["flags"].get("-f") == "raw" and "-b" in options["flags"]:
         print("raw images do not support backing files", file=sys.stderr)
         return 1

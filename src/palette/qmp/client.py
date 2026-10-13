@@ -38,6 +38,8 @@ ALLOWED_COMMANDS = frozenset(
         "query-qmp-schema",
         "query-status",
         "query-mice",
+        "query-vnc",
+        "set_password",
         "query-cpus-fast",
         "query-block",
         "qom-list",

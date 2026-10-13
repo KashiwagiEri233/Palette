@@ -62,6 +62,7 @@ class InstancePaths:
 class ImageInfo:
     format: str
     chain: tuple[Path, ...]
+    virtual_size: int = 0
 
 
 def sha256_file(path: Path, *, chunk_size: int = _HASH_CHUNK) -> str:
@@ -288,6 +289,7 @@ class ImageManager:
         *,
         base: Path | None = None,
         base_format: str | None = None,
+        size_gib: int | None = None,
     ) -> Path:
         """Create the writable layer for one instance and verify its backing chain.
 
@@ -338,6 +340,14 @@ class ImageManager:
             str(backing),
             str(overlay),
         ]
+        if size_gib is not None:
+            base_info = await self.inspect_image(backing, image_format=backing_format)
+            if size_gib * 1024**3 < base_info.virtual_size:
+                raise PaletteError(
+                    ErrorCode.IMAGE_INVALID,
+                    "disk capacity must not be smaller than the source image",
+                )
+            argv.append(f"{size_gib}G")
         code, _stdout, stderr = await run_tool(argv, timeout=120.0)
         if code != 0:
             raise PaletteError(
@@ -393,7 +403,10 @@ class ImageManager:
                 current = previous.parent / current
             previous = current.resolve()
             chain.append(previous)
-        return ImageInfo(format=str(image_format), chain=tuple(chain))
+        virtual_size = entries[0].get("virtual-size", 0)
+        if type(virtual_size) is not int or virtual_size < 0:
+            raise PaletteError(ErrorCode.IMAGE_INVALID, "invalid virtual disk size")
+        return ImageInfo(format=str(image_format), chain=tuple(chain), virtual_size=virtual_size)
 
     async def _verify_backing_chain(
         self, overlay: Path, base: Path, backing_format: str
@@ -567,7 +580,13 @@ class ImageManager:
         for root, entry in records.items():
             paths = [
                 entry[key]
-                for key in ("base_image", "firmware_code", "firmware_vars")
+                for key in (
+                    "base_image",
+                    "firmware_code",
+                    "firmware_vars",
+                    "overlay",
+                    "hardware_vars",
+                )
                 if isinstance(entry.get(key), str)
             ]
             for key in ("backing_chain", "attached_volumes", "volume_backing_chain"):

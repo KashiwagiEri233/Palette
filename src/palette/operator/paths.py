@@ -9,7 +9,6 @@ import os
 import secrets
 import stat
 import sys
-import tempfile
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -64,7 +63,7 @@ class RuntimePaths:
         self.socket_directory: Path | None = None
         if not IS_WINDOWS:
             uid = _getuid()
-            temporary = Path(tempfile.gettempdir())
+            temporary = Path("/tmp")  # noqa: S108 - the per-user directory below is private and verified
             candidate = temporary / f"palette-{uid}" / f"{digest}.sock"
             if len(os.fsencode(candidate)) >= 104:
                 temporary = Path("/tmp")  # noqa: S108 - private user directory is verified below

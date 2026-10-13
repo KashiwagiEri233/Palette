@@ -36,7 +36,6 @@ from .models import (
     StatusResult,
     WaitResult,
 )
-from .operator import OperatorServer
 from .service import PaletteService
 
 logger = logging.getLogger("palette.server")
@@ -73,21 +72,19 @@ def build_server(service: PaletteService) -> MCPServer:
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[dict[str, Any]]:
-        operator = OperatorServer(service)
-        operator.acquire()
+        from .agent_ipc import RemoteService
+        from .runtime import RuntimeOwner
+
+        if isinstance(service, RemoteService):
+            yield {}
+            return
+        owner = RuntimeOwner(service)
         try:
-            await service.startup()
-            await operator.start()
+            await owner.start()
             yield {}
         finally:
             with CancelScope(shield=True):
-                try:
-                    try:
-                        await operator.stop()
-                    finally:
-                        await service.shutdown()
-                finally:
-                    operator.release()
+                await owner.close()
 
     server: MCPServer = MCPServer(
         name="palette",

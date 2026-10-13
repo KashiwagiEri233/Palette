@@ -1,5 +1,8 @@
 # Palette
 
+The Electron desktop application supports VM creation, persistent disks and live human
+control. See the [desktop guide](docs/desktop.md) for source setup and MCP sharing.
+
 **English** | [简体中文](README.zh-CN.md)
 
 [![CI](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml/badge.svg)](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml)

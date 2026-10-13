@@ -37,6 +37,30 @@ logger = logging.getLogger("palette.vm.launcher")
 #: QEMU's stdout carries QMP; the reader needs room for ``query-qmp-schema``.
 STREAM_LIMIT = 16 * 1024 * 1024
 
+
+def spawn_daemon(config_root: Path) -> None:
+    """Start the Python runtime independently of the launching UI or stdio client."""
+    from ..config import load_config
+
+    config = load_config(config_root)
+    config.runtime_root.mkdir(parents=True, exist_ok=True)
+    log_path = config.runtime_root / "daemon.log"
+    fd = os.open(
+        log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600
+    )
+    with os.fdopen(fd, "ab") as log:
+        subprocess.Popen(  # noqa: S603 - fixed module and argument vector, never a shell
+            [sys.executable, "-m", "palette.cli", "--root", str(config_root), "daemon", "run"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=log,
+            cwd=config_root,
+            env=build_child_env(),
+            creationflags=CREATION_FLAGS,
+            start_new_session=START_NEW_SESSION,
+        )
+
+
 #: Only these variables are handed to the child. Everything else — including any
 #: credential the operator happens to have exported — stays out of the VM's process.
 ENV_WHITELIST = (
@@ -421,7 +445,8 @@ def _extra_volume_args(volumes: Sequence[ExtraVolume], notes: list[str]) -> list
             ),
         ]
         if volume.media == "cdrom":
-            argv += ["-device", f"scsi-cd,drive={node},bus=scsi0.0"]
+            boot = f",bootindex={volume.boot_index}" if volume.boot_index is not None else ""
+            argv += ["-device", f"scsi-cd,drive={node},bus=scsi0.0{boot}"]
         else:
             argv += ["-device", f"virtio-blk-pci,drive={node}"]
         notes.append(f"attached a caller-supplied {volume.media}")
@@ -439,6 +464,7 @@ def build_launch_plan(
     hardware_vars_path: Path | None = None,
     accelerator: str | None = None,
     start_paused: bool = True,
+    managed_console: bool = False,
     extra_volumes: Sequence[ExtraVolume] = (),
     caller_args: Sequence[str] = (),
 ) -> LaunchPlan:
@@ -465,6 +491,8 @@ def build_launch_plan(
     if qemu.cpu:
         argv += ["-cpu", qemu.cpu]
     argv += ["-nodefaults", "-display", "none"]
+    if managed_console:
+        argv += ["-vnc", "127.0.0.1:0,to=99,password=on,share=force-shared"]
     nic = network.qemu_nic_argument()
     if qemu.arch == "aarch64" and network.attaches_nic and "model=" not in nic:
         nic += ",model=virtio-net-pci"
@@ -504,7 +532,12 @@ def build_launch_plan(
         f"head={devices.head}",
     ]
 
-    argv += _block_args(overlay_path=overlay_path, profile=profile, notes=notes)
+    argv += _block_args(
+        overlay_path=overlay_path,
+        profile=profile,
+        notes=notes,
+        boot_index=1 if any(volume.boot_index == 0 for volume in extra_volumes) else 0,
+    )
     argv += _extra_volume_args(extra_volumes, notes)
 
     # QMP over the child's own stdin/stdout, never a socket. ``signal=off`` keeps QEMU
@@ -534,7 +567,9 @@ def build_launch_plan(
     )
 
 
-def _block_args(*, overlay_path: Path, profile: Profile, notes: list[str]) -> list[str]:
+def _block_args(
+    *, overlay_path: Path, profile: Profile, notes: list[str], boot_index: int = 0
+) -> list[str]:
     """Explicit blockdev graph: file node and format node are separate.
 
     The format is stated, never probed from the file's extension, so a renamed or
@@ -566,7 +601,7 @@ def _block_args(*, overlay_path: Path, profile: Profile, notes: list[str]) -> li
         "-blockdev",
         format_node,
         "-device",
-        "virtio-blk-pci,drive=disk,bootindex=0",
+        f"virtio-blk-pci,drive=disk,bootindex={boot_index}",
     ]
 
 

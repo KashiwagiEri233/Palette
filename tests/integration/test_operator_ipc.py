@@ -162,6 +162,7 @@ async def test_a_second_serve_process_cannot_take_over(
             "--root",
             str(tmp_path),
             "serve",
+            "--standalone",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

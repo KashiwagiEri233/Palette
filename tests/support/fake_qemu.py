@@ -21,6 +21,7 @@ import contextlib
 import json
 import os
 import signal
+import socket
 import struct
 import sys
 import threading
@@ -59,6 +60,8 @@ COMMANDS = [
     "query-qmp-schema",
     "query-status",
     "query-mice",
+    "query-vnc",
+    "set_password",
     "query-cpus-fast",
     "query-block",
     "qom-list",
@@ -97,6 +100,94 @@ class FakeQemu:
         self.log_path = f"{self.overlay_path}.log.jsonl" if self.overlay_path else None
         self.behavior_path = f"{self.overlay_path}.behavior.json" if self.overlay_path else None
         self.events: list[str] = []
+        self.vnc_password = ""
+        self.vnc_port: int | None = None
+        if "-vnc" in argv:
+            self.start_vnc()
+
+    def start_vnc(self) -> None:
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        self.vnc_port = listener.getsockname()[1]
+
+        def client(connection: socket.socket) -> None:
+            def read(size: int) -> bytes:
+                value = b""
+                while len(value) < size:
+                    chunk = connection.recv(size - len(value))
+                    if not chunk:
+                        raise EOFError
+                    value += chunk
+                return value
+
+            try:
+                from Crypto.Cipher import DES
+
+                connection.settimeout(10)
+                connection.sendall(b"RFB 003.008\n")
+                read(12)
+                connection.sendall(b"\x01\x02")
+                if read(1) != b"\x02":
+                    return
+                challenge = bytes(range(16))
+                connection.sendall(challenge)
+                key = bytes(
+                    int(f"{byte:08b}"[::-1], 2)
+                    for byte in self.vnc_password.encode().ljust(8, b"\0")[:8]
+                )
+                if read(16) != DES.new(key, DES.MODE_ECB).encrypt(challenge):  # noqa: S304 - test VNCAuth
+                    return
+                connection.sendall(b"\0" * 4)
+                read(1)
+                name = b"Fake QEMU"
+                connection.sendall(
+                    struct.pack(
+                        ">HHBBBBHHHBBBxxxI",
+                        DEFAULT_WIDTH,
+                        DEFAULT_HEIGHT,
+                        32,
+                        24,
+                        0,
+                        1,
+                        255,
+                        255,
+                        255,
+                        16,
+                        8,
+                        0,
+                        len(name),
+                    )
+                    + name
+                )
+                while True:
+                    kind = read(1)[0]
+                    if kind == 0:
+                        read(19)
+                    elif kind == 2:
+                        header = read(3)
+                        read(struct.unpack(">H", header[1:])[0] * 4)
+                    elif kind == 3:
+                        read(9)
+                        time.sleep(0.03)
+                        connection.sendall(
+                            b"\0\0\0\x01"
+                            + struct.pack(">HHHHi", 0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT, 0)
+                            + bytes([40, 100, 170, 0]) * DEFAULT_WIDTH * DEFAULT_HEIGHT
+                        )
+                    else:
+                        raise ValueError("unexpected RFB message")
+            except (OSError, EOFError, ValueError):
+                pass
+            finally:
+                connection.close()
+
+        def accept() -> None:
+            while True:
+                connection, _ = listener.accept()
+                threading.Thread(target=client, args=(connection,), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
 
     # -- configuration ---------------------------------------------------------------
     def _find_overlay_path(self) -> str | None:
@@ -162,6 +253,18 @@ class FakeQemu:
             self.reply(message_id, [{"name": name} for name in COMMANDS])
         elif command == "query-qmp-schema":
             self.reply(message_id, SCHEMA)
+        elif command == "set_password":
+            self.vnc_password = arguments["password"]
+            self.reply(message_id, {})
+        elif command == "query-vnc":
+            self.reply(
+                message_id,
+                {
+                    "enabled": self.vnc_port is not None,
+                    "host": "127.0.0.1",
+                    "service": str(self.vnc_port),
+                },
+            )
         elif command == "query-status":
             self.reply(
                 message_id,

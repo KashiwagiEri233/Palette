@@ -1,0 +1,82 @@
+import { test, expect, _electron as electron } from '@playwright/test'
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { execFileSync } from 'node:child_process'
+
+test('desktop lifecycle, streaming, control, font loading and exit confirmation', async () => {
+  const repository = resolve('..')
+  const root = await mkdtemp(join(tmpdir(), 'palette-desktop-'))
+  const uv = process.env.PALETTE_UV ?? 'uv'
+  execFileSync(uv, ['run', 'python', resolve('scripts/setup_fixture.py'), root], { cwd: repository })
+  const application = await electron.launch({ args: [resolve('out/main/index.js')], env: { ...process.env, PALETTE_ROOT: root, PALETTE_UV: uv } })
+  try {
+    const page = await application.firstWindow()
+    const errors: string[] = []
+    page.on('pageerror', error => errors.push(error.message))
+    await expect(page.getByText('后台已连接')).toBeVisible({ timeout: 30_000 })
+    await expect(page.getByRole('heading', { name: '还没有虚拟机' })).toBeVisible()
+    await application.evaluate(({ dialog }, path) => {
+      dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] })
+    }, join(root, 'base.qcow2'))
+    await page.getByRole('button', { name: '创建虚拟机', exact: true }).first().click()
+    const wizard = page.getByRole('dialog')
+    await wizard.getByRole('button', { name: '浏览', exact: true }).click()
+    await expect(wizard.getByLabel('镜像文件')).toHaveValue(join(root, 'base.qcow2'))
+    await wizard.getByRole('button', { name: '下一步', exact: true }).click()
+    await wizard.getByLabel('名称', { exact: true }).fill('开发环境')
+    await wizard.getByLabel('CPU 核数').fill('1')
+    await wizard.getByLabel('内存 / GiB').fill('0.5')
+    await wizard.getByLabel('磁盘 / GiB').fill('24')
+    await wizard.getByLabel('网络', { exact: true }).selectOption('offline')
+    await wizard.getByRole('button', { name: '下一步', exact: true }).click()
+    await expect(wizard.getByRole('heading', { name: '确认创建' })).toBeVisible()
+    await wizard.getByRole('button', { name: '创建虚拟机', exact: true }).click()
+    await expect(page.getByRole('button', { name: '开发环境' }).first()).toBeVisible({ timeout: 10_000 })
+    await page.getByRole('button', { name: '开发环境' }).first().click()
+    await page.getByRole('button', { name: '启动', exact: true }).click()
+    await expect(page.getByText('仅查看', { exact: true })).toBeVisible({ timeout: 20_000 })
+    await expect(page.locator('canvas')).toBeVisible()
+    expect(await page.locator('canvas').evaluate((canvas: HTMLCanvasElement) => ({ width: canvas.width, height: canvas.height }))).toEqual({ width: 320, height: 200 })
+    await page.getByRole('button', { name: '接管', exact: true }).click()
+    await expect(page.getByText('人工控制', { exact: true })).toBeVisible()
+    await page.keyboard.down('a')
+    await expect.poll(async () => page.evaluate(async () => (await window.palette.request('vms.list') as { vms: { status: { input_ledger: { keys: string[] } } }[] }).vms[0].status.input_ledger.keys)).toContain('a')
+    await page.keyboard.up('a')
+    await expect.poll(async () => page.evaluate(async () => (await window.palette.request('vms.list') as { vms: { status: { input_ledger: { keys: string[] } } }[] }).vms[0].status.input_ledger.keys)).toEqual([])
+    await page.getByRole('button', { name: '交还 Agent' }).click()
+    await expect(page.getByText('仅查看', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: '全屏', exact: true }).click()
+    await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true)
+    await page.evaluate(() => document.exitFullscreen())
+    await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(false)
+    await page.getByLabel('开发环境 的操作').selectOption('stop')
+    await expect(page.getByRole('button', { name: '启动', exact: true })).toBeVisible({ timeout: 10_000 })
+    await page.getByRole('button', { name: '启动', exact: true }).click()
+    await expect(page.getByText('仅查看', { exact: true })).toBeVisible({ timeout: 20_000 })
+    await page.evaluate(async () => { await document.fonts.ready })
+    expect(await page.locator('h1').evaluate(element => getComputedStyle(element).fontFamily)).toContain('Inter')
+    expect(await page.locator('body').innerText()).not.toMatch(/prompt|Cashmere|Electron|TypeScript|生成|设计系统/i)
+    await page.screenshot({ path: 'test-results/console-1440.png' })
+    await page.getByRole('button', { name: '返回虚拟机列表' }).click()
+    const capture = await readFile(resolve('scripts/capture-spacing.js'), 'utf8')
+    const states: unknown[] = []
+    for (const width of [1440, 1728, 390]) {
+      await application.evaluate(({ BrowserWindow }, width) => { const window = BrowserWindow.getAllWindows()[0]; window.setMinimumSize(390, 640); window.setContentSize(width, width === 390 ? 844 : 900) }, width)
+      await page.waitForFunction(width => window.innerWidth === width, width)
+      states.push(await page.evaluate(capture))
+      await page.screenshot({ path: `test-results/vms-${width}.png` })
+    }
+    await writeFile(resolve('test-results/spacing.json'), JSON.stringify(states))
+    await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close())
+    await expect(page.getByRole('heading', { name: '虚拟机仍在运行' })).toBeVisible()
+    await page.getByRole('button', { name: '取消', exact: true }).click()
+    expect(errors).toEqual([])
+  } finally {
+    await application.evaluate(({ app }) => app.exit(0)).catch(() => {})
+    await application.close().catch(() => {})
+    try { execFileSync(uv, ['run', 'palette', '--root', root, 'daemon', 'stop'], { cwd: repository }) } catch { /* Test cleanup may have stopped it already. */ }
+    await new Promise(resolve => setTimeout(resolve, 500))
+    await rm(root, { recursive: true, force: true })
+  }
+})

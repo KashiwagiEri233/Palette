@@ -1,0 +1,15 @@
+/* Ported from https://www.aicss.dev/components/code-block */
+.cb { border-radius: 12px; background: var(--card); box-shadow: 0 0 0 1px var(--border); padding: 12px 16px 16px; overflow: hidden; }
+.cbHead { display: flex; align-items: center; gap: 8px; margin: -12px -16px 0; padding: 10px 12px 10px 16px; background: transparent; border-bottom: 0.5px solid var(--border); }
+.cbFile { display: inline-flex; align-items: center; gap: 7px; }
+.cbIcon { display: block; width: 15px; height: 15px; color: var(--muted-foreground); flex: none; }
+.cbLang { font-family: ui-monospace, monospace; font-size: 12.5px; line-height: 1; color: var(--foreground); }
+.cbCopy { margin-left: auto; margin-top: -7px; margin-bottom: -7px; display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted-foreground); border: 0; background: none; padding: 3px 3px 3px 7px; border-radius: 7px; cursor: pointer; }
+@media (hover: hover) and (pointer: fine) {
+.cbCopy:hover { color: var(--foreground); background: var(--muted); } }
+.cbBody { position: relative; margin: 0 -16px -16px; padding: 10px 0; font-family: ui-monospace, monospace; font-size: 12.5px; line-height: 20px; }
+.cbBody::before { content: ""; position: absolute; top: 0; bottom: 0; left: 32px; width: 0.5px; background: var(--border); }
+.cbRow { display: grid; grid-template-columns: 32px 1fr; }
+.cbLn { user-select: none; text-align: right; padding: 0 7px; color: var(--muted-foreground); font-size: 11px; }
+.cbCode { white-space: pre; padding: 0 12px 0 8px; color: var(--foreground); overflow-x: auto; scrollbar-width: none; }
+.cbCode::-webkit-scrollbar { display: none; }

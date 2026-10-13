@@ -373,6 +373,8 @@ class VmStatus(BaseModel):
     guest_tools: GuestToolStatus = Field(default_factory=GuestToolStatus)
     queued_actions: int = 0
     controller_owned: bool = True
+    control_owner: Literal["agent", "operator"] = "agent"
+    control_state: Literal["available", "held", "releasing", "faulted"] = "available"
     frame_ttl_seconds: float = 0.0
     last_error: ErrorPayload | None = None
     uptime_seconds: float | None = None

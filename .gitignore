@@ -45,3 +45,7 @@ frame-*.png
 # --- Local design notes ---------------------------------------------------------------
 # Kept on disk for reference, deliberately not published with the repository.
 /PLAN.md
+desktop/node_modules/
+desktop/out/
+desktop/.cache/
+desktop/test-results/

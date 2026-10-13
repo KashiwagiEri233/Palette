@@ -70,12 +70,17 @@ class PaletteService:
             audit=self.audit,
             guest_tool_transport_factory=guest_tool_transport_factory,
         )
+        from .control import ControlManager
+
+        self.control = ControlManager(self)
 
     # -- lifecycle --------------------------------------------------------------------
     async def startup(self) -> None:
         self.config.runtime_root.mkdir(parents=True, exist_ok=True)
+        self.control.start()
 
     async def shutdown(self) -> None:
+        await self.control.close()
         await self.manager.shutdown()
 
     # -- helpers ----------------------------------------------------------------------
@@ -176,6 +181,10 @@ class PaletteService:
             ),
             queued_actions=controller.queued_jobs if controller else 0,
             controller_owned=True,
+            control_owner="operator" if vm_id in self.control.leases else "agent",
+            control_state=self.control.leases[vm_id].state
+            if vm_id in self.control.leases
+            else "available",
             frame_ttl_seconds=instance.profile.frame_ttl_seconds,
             last_error=instance.view.last_error,
             uptime_seconds=(
@@ -305,12 +314,14 @@ class PaletteService:
         reason about.
         """
         validate_identifier(request_id, what="request_id")
+        self.control.require_agent(vm_id)
         instance = await self.manager.require_running(vm_id)
         self._require_instance_id(instance, instance_id)
         controller = self._controller(instance)
         return await controller.act(request_id=request_id, frame_id=frame_id, action_payload=action)
 
     async def release_inputs(self, vm_id: str, *, instance_id: str) -> ReleaseResult:
+        self.control.require_agent(vm_id)
         instance = self.manager.get(vm_id)
         self._require_instance_id(instance, instance_id)
         controller = instance.controller
@@ -344,6 +355,7 @@ class PaletteService:
         target: str = "focused",
     ) -> tuple[GuestToolResult, bytes | None]:
         validate_identifier(request_id, what="request_id")
+        self.control.require_agent(vm_id)
         instance = await self.manager.require_running(vm_id)
         self._require_instance_id(instance, instance_id)
         policy = instance.policy
@@ -381,6 +393,7 @@ class PaletteService:
         options: dict[str, Any],
     ) -> tuple[GuestToolResult, bytes | None]:
         validate_identifier(request_id, what="request_id")
+        self.control.require_agent(vm_id)
         validate_identifier(app_id, what="app_id")
         instance = await self.manager.require_running(vm_id)
         self._require_instance_id(instance, instance_id)
@@ -439,6 +452,8 @@ class PaletteService:
         the caller's to keep".
         """
         validate_identifier(vm_id, what="vm_id")
+        if actor == "agent":
+            self.control.require_agent(vm_id)
         profile = self.config.profile(profile_id)
         # The lifecycle gate uses the profile being started, not one already running.
         gate = Policy(profile, _runtime_guard(self.config))
@@ -530,6 +545,10 @@ class PaletteService:
     async def stop(
         self, vm_id: str, *, force: bool = False, actor: Actor = "operator"
     ) -> LifecycleResult:
+        if actor == "agent":
+            self.control.require_agent(vm_id)
+        else:
+            await self.control.revoke(vm_id)
         instance = self.manager.get(vm_id)
         instance.policy.require_lifecycle("force_stop" if force else "stop", actor=actor)
         stopped = await self.manager.stop(
@@ -545,6 +564,10 @@ class PaletteService:
     async def reset(
         self, vm_id: str, *, profile_id: str | None = None, actor: Actor = "operator"
     ) -> LifecycleResult:
+        if actor == "agent":
+            self.control.require_agent(vm_id)
+        else:
+            await self.control.revoke(vm_id)
         instance = self.manager.find(vm_id)
         profile = instance.profile if instance is not None else self.config.profile(profile_id)
         gate = Policy(profile, _runtime_guard(self.config))

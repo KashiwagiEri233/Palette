@@ -23,6 +23,7 @@ from .protocol import (
     OPERATION_TIMEOUT,
     Channel,
     Command,
+    DesktopCommand,
     EmergencyStop,
     Endpoint,
     Request,
@@ -84,6 +85,8 @@ class OperatorServer:
         self._requests: OrderedDict[str, tuple[str, asyncio.Task[Response]]] = OrderedDict()
         self._closing = False
         self._socket_identity: tuple[int, int] | None = None
+        self.desktop_route: Any = None
+        self.desktop_manager: Any = None
 
     def acquire(self) -> None:
         """Acquire before service startup; retain until service shutdown has completed."""
@@ -231,7 +234,43 @@ class OperatorServer:
             )
 
     async def _route(self, command: Command) -> dict[str, Any]:
+        if isinstance(command, DesktopCommand):
+            if self.desktop_route is None:
+                raise PaletteError(
+                    ErrorCode.UNSUPPORTED_CAPABILITY, "desktop owner is not available"
+                )
+            desktop_result: dict[str, Any] = await self.desktop_route(command)
+            return desktop_result
         if isinstance(command, Start):
+            if (
+                self.desktop_manager is not None
+                and command.vm_id in self.desktop_manager.definitions
+            ):
+                if (
+                    command.profile_id is not None
+                    and command.profile_id
+                    != self.desktop_manager.get(command.vm_id).draft.profile_id
+                ):
+                    raise PaletteError(
+                        ErrorCode.INVALID_ARGUMENT,
+                        "persistent VM profile is configured by the desktop definition",
+                    )
+                if any(
+                    value is not None
+                    for value in (
+                        command.image,
+                        command.image_format,
+                        command.iso,
+                        command.extra_disks,
+                        command.qemu_args,
+                    )
+                ):
+                    raise PaletteError(
+                        ErrorCode.INVALID_ARGUMENT,
+                        "persistent storage is configured by the desktop definition",
+                    )
+                started: dict[str, Any] = await self.desktop_manager.start(command.vm_id)
+                return {"ok": True, **started}
             result = await self.service.start(
                 command.vm_id,
                 actor="operator",
@@ -244,10 +283,24 @@ class OperatorServer:
             )
             return result.model_dump(mode="json")
         if isinstance(command, Stop):
+            if (
+                self.desktop_manager is not None
+                and command.vm_id in self.desktop_manager.definitions
+            ):
+                stopped: dict[str, Any] = await self.desktop_manager.stop(
+                    command.vm_id, force=command.force
+                )
+                return {"ok": True, **stopped}
             return (
                 await self.service.stop(command.vm_id, force=command.force, actor="operator")
             ).model_dump(mode="json")
         if isinstance(command, Reset):
+            if (
+                self.desktop_manager is not None
+                and command.vm_id in self.desktop_manager.definitions
+            ):
+                reset: dict[str, Any] = await self.desktop_manager.reset(command.vm_id)
+                return {"ok": True, **reset}
             return (
                 await self.service.reset(
                     command.vm_id, profile_id=command.profile_id, actor="operator"
