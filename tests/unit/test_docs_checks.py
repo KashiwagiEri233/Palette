@@ -6,13 +6,17 @@ from pathlib import Path
 import pytest
 
 CHECKER = runpy.run_path(str(Path(__file__).resolve().parents[2] / "scripts" / "check_docs.py"))
-AGENT_RULES = ["desktop/.better-design/rules.md", "desktop/src/.better-design/rules.md"]
+AGENT_RULES = [
+    "AGENTS.md",
+    "desktop/.better-design/rules.md",
+    "desktop/src/.better-design/rules.md",
+]
 
 
 @pytest.mark.parametrize("relative", AGENT_RULES)
 def test_agent_rules_do_not_need_translation(tmp_path: Path, relative: str) -> None:
     path = tmp_path / relative
-    path.parent.mkdir(parents=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("# Development rules\n", encoding="utf-8")
     assert CHECKER["check"](path, tmp_path) == []
     assert CHECKER["check_pairing"](tmp_path, [path]) == []
@@ -21,7 +25,7 @@ def test_agent_rules_do_not_need_translation(tmp_path: Path, relative: str) -> N
 @pytest.mark.parametrize("relative", AGENT_RULES)
 def test_agent_rules_still_validate_links_and_fences(tmp_path: Path, relative: str) -> None:
     path = tmp_path / relative
-    path.parent.mkdir(parents=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("[Missing](missing.md)\n```\n", encoding="utf-8")
     problems = CHECKER["check"](path, tmp_path)
     assert len(problems) == 2

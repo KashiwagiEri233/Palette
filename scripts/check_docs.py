@@ -30,6 +30,7 @@ UNPAIRED = frozenset(
     {
         "PLAN.md",
         "CLAUDE.md",
+        "AGENTS.md",
         "desktop/.better-design/rules.md",
         "desktop/src/.better-design/rules.md",
     }
