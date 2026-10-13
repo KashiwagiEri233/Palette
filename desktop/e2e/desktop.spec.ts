@@ -1,5 +1,5 @@
 import { test, expect, _electron as electron } from '@playwright/test'
-import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, readFile, writeFile, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
@@ -69,6 +69,15 @@ test('desktop lifecycle, streaming, control, font loading and exit confirmation'
     expect(await page.locator('body').innerText()).not.toMatch(/prompt|Cashmere|Electron|TypeScript|生成|设计系统/i)
     await page.screenshot({ path: 'test-results/console-1440.png' })
     await page.getByRole('button', { name: '返回虚拟机列表' }).click()
+    await page.getByLabel('搜索虚拟机').fill('不存在的虚拟机')
+    await expect(page.getByText('没有匹配的虚拟机', { exact: true })).toBeVisible()
+    await page.getByLabel('搜索虚拟机').fill('')
+    await expect(page.locator('tbody').getByRole('button', { name: '开发环境' })).toBeVisible()
+    await page.getByRole('button', { name: '环境设置', exact: true }).click()
+    await expect(page.getByRole('heading', { name: '环境设置' })).toBeVisible()
+    await expect(page.getByText(await realpath(root), { exact: true })).toBeVisible()
+    await page.screenshot({ path: 'test-results/settings-1440.png' })
+    await page.getByRole('button', { name: '全部虚拟机', exact: true }).click()
     const capture = await readFile(resolve('scripts/capture-spacing.js'), 'utf8')
     const states: unknown[] = []
     for (const width of [1440, 1728, 390]) {

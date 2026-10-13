@@ -36,6 +36,7 @@
 .app-sidebar { position: fixed; inset: 0 auto 0 0; width: var(--sidebar-width); padding: 40px 10px 10px; background: #f7f7f5; border: 0; box-shadow: none; }
 .sidebar-brand { height: 54px; gap: 10px; padding: 0 12px; border: 0; }
 .brand-name { font-size: 16px; font-weight: 600; letter-spacing: -.035em; }
+/* The location label is anchored opposite the brand, not part of its icon/text gap. */
 .local-label { margin-left: auto; color: var(--muted-foreground); font-size: 11px; }
 .app-sidebar > div:nth-child(2) { padding: 0; }
 .app-sidebar button { min-height: 36px; padding: 8px 12px; font-size: 13px; border-radius: 8px; box-shadow: none; }
@@ -88,6 +89,7 @@
 .list-heading span { margin-left: 7px; font-size: 11px; color: var(--muted-foreground); font-weight: 400; }
 .search-field { position: relative; display: flex; align-items: center; width: 180px; }
 .search-field > svg { position: absolute; left: 10px; color: #96968f; pointer-events: none; }
+/* The larger leading inset reserves space for the search icon. */
 .search-field input { height: 32px; padding-left: 32px; font-size: 12px; border: 1px solid transparent; background: #f7f7f5; border-radius: 8px; box-shadow: none; }
 .search-field input:focus { background: #fff; border-color: var(--border); }
 .vm-table-content > div:last-child { border-radius: 0; border: 0; box-shadow: none; }
