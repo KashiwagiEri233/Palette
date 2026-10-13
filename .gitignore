@@ -37,7 +37,7 @@ htmlcov/
 *.swp
 Thumbs.db
 desktop.ini
-
+.DS_Store
 # --- Screenshots and captures that escaped the runtime root ---------------------------
 *.ppm
 frame-*.png
