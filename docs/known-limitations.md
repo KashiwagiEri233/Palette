@@ -7,12 +7,16 @@ oversight, and none of it is hidden behind a friendlier message at runtime.
 
 ## Environment
 
-* **No physical acceptance has been run.** This repository was developed on a host with no
-  QEMU installation. `palette doctor` reports that plainly, and `tests/e2e` skips. Every
-  claim about WHPX, real capture latency and guest behaviour is unverified.
-* **Windows and WHPX only.** The KVM path is designed for — the transport and guard
-  interfaces are in place — but not implemented. `NullProcessGuard` reports that orphan
-  protection is unavailable rather than pretending otherwise.
+* **The expanded platform matrix has not had physical acceptance in this change.** Fake
+  QMP and subprocess tests do not prove real guest boot, capture latency or click accuracy.
+  E2E skips unless a real QEMU and matching image are configured.
+* **Platform support is explicit.** Native Windows x86_64/WHPX, macOS Intel/Apple Silicon
+  with HVF, and Linux x86_64/aarch64 with KVM have profiles and process protection. Explicit
+  `tcg-x86_64`/`tcg-aarch64` profiles provide software emulation; no fallback occurs. See
+  [platforms](platforms.md) for prerequisites and the unverified physical matrix.
+* **POSIX memory limits are sampled.** RSS is checked every 250 ms; temporary overshoot is
+  possible. This is not a Windows Job Object equivalent hard cap. The supervisor controls
+  the QEMU process group, not processes deliberately escaping it with a new session.
 * **No guest image ships.** The base image is an operator artefact with a recorded origin
   and digest.
 
@@ -24,8 +28,8 @@ oversight, and none of it is hidden behind a friendlier message at runtime.
 * **`type_text` is slow by design.** One input message per key phase, rate limited, so a
   256-character string is hundreds of round trips. It does not share the click latency
   budget.
-* **One VM per service process.** The manager is written for several, but nothing owns
-  scheduling between them.
+* **No cross-VM scheduling.** A service can own several VMs, each with its own action queue,
+  but does not balance their resources or schedule work across them.
 * **Vertical scrolling only.** Horizontal scrolling is expressible in QAPI and deliberately
   not exposed: it is untested, and offering it "because the enum exists" would be a claim
   without evidence.
@@ -45,8 +49,8 @@ oversight, and none of it is hidden behind a friendlier message at runtime.
 * **Exactly-once is in-process only.** De-duplication is bounded memory inside one service
   lifetime. Across a crash, the honest answer is `unknown`, and the service says so instead
   of replaying.
-* **A private anonymous pipe cannot be re-adopted.** If the service process dies, that QEMU
-  is not recoverable; the plan accepts this for the MVP.
+* **A private anonymous pipe cannot be re-adopted.** When the service dies, the Windows Job
+  Object or POSIX supervisor cleans up QEMU. A new service must start a new instance.
 * **Frames are not archived.** Only a 64×64 thumbnail per frame is retained, and only to
   answer "has the screen changed?".
 * **The pointer's real position is unknown.** `cursor_position_source` is `not_observed`
@@ -56,12 +60,13 @@ oversight, and none of it is hidden behind a friendlier message at runtime.
 
 ## Operations
 
-* **No remote transport.** stdio only. Streamable HTTP would need TLS, authentication,
+* **No remote MCP transport.** MCP uses stdio; the authenticated local operator socket/pipe
+  serves the CLI only. Streamable HTTP would need TLS, authentication,
   per-VM authorization, strict `Origin`/`Host` validation, limits and audit.
 * **No multi-tenant isolation.** One operator, one host user. See the threat model for what
   that does and does not buy.
-* **No scheduling platform.** One client controls one VM; `vm_id` exists so that several can
-  be addressed, not so that they can be orchestrated.
+* **No scheduling platform.** Clients address VMs by `vm_id`; coordinating tasks across them
+  remains the caller's responsibility.
 * **Guest enhancement tools are enabled by default and still unimplemented.** The contract,
   the policy gates, the bridge and the mock exist; the guest-side service and its transport do
   not. Enabling the channel costs nothing and delivers nothing until such a service answers

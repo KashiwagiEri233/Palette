@@ -44,7 +44,7 @@ def make_profile(
         qemu_img=sys.executable,
         qemu_img_prefix=["-I", str(FAKE_QEMU_IMG)],
         version_pin="11.1",
-        accelerator="whpx",
+        accelerator="tcg",
         machine="q35",
     )
     images = ImagesConfig(base=str(base_image), format="qcow2", size_gib=1)

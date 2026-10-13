@@ -265,7 +265,8 @@ class BridgeGuestToolBackend:
         self._negotiated = None
         self._service_online = False
         try:
-            await self.transport.open()
+            async with asyncio.timeout(self.config.request_timeout_seconds):
+                await self.transport.open()
         except Exception as exc:
             self._detail = f"guest tool transport unavailable: {type(exc).__name__}"
             logger.info("guest tool transport unavailable: %s", exc)
@@ -353,7 +354,12 @@ class BridgeGuestToolBackend:
 
     # -- operations ------------------------------------------------------------------
     async def input_text(
-        self, *, text: str, method: str, target: str = "focused"
+        self,
+        *,
+        text: str,
+        method: str,
+        target: str = "focused",
+        on_sending: Callable[[], None] | None = None,
     ) -> GuestToolOutcome:
         caps = await self.capabilities()
         self._require_ready(caps, "guest.input_text")
@@ -376,10 +382,17 @@ class BridgeGuestToolBackend:
             self._build_envelope(MessageKind.REQUEST, "guest.input_text", params.model_dump()),
             capability="guest.input_text",
             timeout=self.config.request_timeout_seconds,
+            on_sending=on_sending,
         )
         return _outcome_from_reply(reply, capability="guest.input_text")
 
-    async def launch_app(self, *, app_id: str, options: dict[str, Any]) -> GuestToolOutcome:
+    async def launch_app(
+        self,
+        *,
+        app_id: str,
+        options: dict[str, Any],
+        on_sending: Callable[[], None] | None = None,
+    ) -> GuestToolOutcome:
         caps = await self.capabilities()
         self._require_ready(caps, "guest.launch_app")
         if app_id not in self.config.allowed_apps:
@@ -399,6 +412,7 @@ class BridgeGuestToolBackend:
             self._build_envelope(MessageKind.REQUEST, "guest.launch_app", params.model_dump()),
             capability="guest.launch_app",
             timeout=self.config.request_timeout_seconds,
+            on_sending=on_sending,
         )
         return _outcome_from_reply(reply, capability="guest.launch_app")
 
@@ -439,32 +453,41 @@ class BridgeGuestToolBackend:
         )
 
     async def _request(
-        self, envelope: Envelope, *, capability: str, timeout: float
+        self,
+        envelope: Envelope,
+        *,
+        capability: str,
+        timeout: float,
+        on_sending: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
+        data = encode_frame(envelope.model_dump(), max_bytes=self.config.max_message_bytes)
+        if not self.transport.online:
+            raise PaletteError(ErrorCode.GUEST_TOOL_UNAVAILABLE, "the guest channel is offline")
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[envelope.id] = _Pending(future=future, capability=capability)
         try:
-            await self.transport.send(
-                encode_frame(envelope.model_dump(), max_bytes=self.config.max_message_bytes)
-            )
+            async with asyncio.timeout(timeout):
+                if on_sending is not None:
+                    on_sending()
+                await self.transport.send(data)
+                return await future
         except Exception as exc:
-            self._pending.pop(envelope.id, None)
-            self._service_online = False
+            if not isinstance(exc, TimeoutError):
+                self._service_online = False
             raise PaletteError(
-                ErrorCode.GUEST_TOOL_UNAVAILABLE,
-                f"the guest tool channel rejected a message: {type(exc).__name__}",
-            ) from exc
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        except TimeoutError:
-            self._pending.pop(envelope.id, None)
-            # A timed-out guest request may still have been executed inside the guest;
-            # the caller must not replay it blindly.
-            raise PaletteError(
-                ErrorCode.ACTION_OUTCOME_UNKNOWN,
-                "the guest tool request timed out; its effect inside the guest is unknown",
+                ErrorCode.GUEST_TOOL_UNAVAILABLE
+                if capability == "hello"
+                else ErrorCode.ACTION_OUTCOME_UNKNOWN,
+                "the guest request did not complete; its effect is unknown",
                 details={"capability": capability, "timeout_seconds": timeout},
-            ) from None
+                retryable=False,
+            ) from exc
+        finally:
+            self._pending.pop(envelope.id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
 
     async def _read_loop(self) -> None:
         generation = self._generation
@@ -519,7 +542,22 @@ class BridgeGuestToolBackend:
             logger.debug("ignoring guest tool message for unknown id %s", envelope.id)
             return
         if not pending.future.done():
-            pending.future.set_result(envelope.model_dump())
+            expected = (
+                MessageKind.HELLO_ACK.value
+                if pending.capability == "hello"
+                else MessageKind.RESPONSE.value
+            )
+            if envelope.kind not in {expected, MessageKind.ERROR.value} or envelope.v != (
+                self._negotiated or PROTOCOL_VERSION
+            ):
+                pending.future.set_exception(
+                    PaletteError(
+                        ErrorCode.GUEST_TOOL_UNAVAILABLE,
+                        "the guest reply has an invalid kind or version",
+                    )
+                )
+            else:
+                pending.future.set_result(envelope.model_dump())
 
     async def _teardown_reader(self) -> None:
         if self._reader is not None:
@@ -540,6 +578,7 @@ def _outcome_from_reply(reply: dict[str, Any], *, capability: str) -> GuestToolO
                 ErrorCode.GUEST_TOOL_UNAVAILABLE,
                 "the guest tool service reported a failure",
                 details={"capability": capability},
+                retryable=False,
             ),
         )
     try:
@@ -549,14 +588,22 @@ def _outcome_from_reply(reply: dict[str, Any], *, capability: str) -> GuestToolO
             ok=False,
             effect_state=EffectState.UNKNOWN,
             detail="the guest sent a result this host could not parse",
+            error=PaletteError(
+                ErrorCode.GUEST_TOOL_UNAVAILABLE, "invalid guest result", retryable=False
+            ),
         )
-    state = EffectState.SUBMITTED
-    with contextlib.suppress(ValueError):
-        state = EffectState(response.effect_state)
+    state = response.effect_state
     return GuestToolOutcome(
         ok=response.ok and state is not EffectState.UNKNOWN,
         effect_state=state,
         method=response.method,
         launch_id=response.launch_id,
         detail=response.detail,
+        error=PaletteError(
+            ErrorCode.GUEST_TOOL_UNAVAILABLE,
+            response.detail or "the guest operation failed",
+            retryable=False,
+        )
+        if not response.ok or state is EffectState.UNKNOWN
+        else None,
     )

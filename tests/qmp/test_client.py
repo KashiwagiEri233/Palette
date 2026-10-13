@@ -129,6 +129,44 @@ class TestCorrelation:
 
 
 class TestFailures:
+    async def test_command_deadline_includes_a_stalled_drain(self) -> None:
+        server = FakeQmpServer()
+        async with connected_client(server) as transport:
+            client = QmpClient(transport)
+            await client.start()
+            original = transport.writer
+
+            class StalledWriter:
+                def write(self, data):
+                    original.write(data)
+
+                async def drain(self):
+                    await asyncio.Event().wait()
+
+                def close(self):
+                    original.close()
+
+                async def wait_closed(self):
+                    await original.wait_closed()
+
+            transport.writer = StalledWriter()
+            attempted = []
+            with pytest.raises(PaletteError) as error:
+                await asyncio.wait_for(
+                    client.execute(
+                        "input-send-event",
+                        {"events": []},
+                        timeout=0.03,
+                        on_sending=lambda: attempted.append(True),
+                    ),
+                    timeout=0.5,
+                )
+            assert error.value.code == ErrorCode.TIMEOUT
+            assert attempted == [True]
+            assert client._pending == {}
+            assert any(message["execute"] == "input-send-event" for message in server.received)
+            await client.close()
+
     async def test_a_command_error_carries_the_qmp_class(self) -> None:
         server = FakeQmpServer(
             error_commands={"screendump": ("GenericError", "could not open file")}

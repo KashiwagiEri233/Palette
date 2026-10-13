@@ -95,6 +95,71 @@ def build(transport, *, settings: GuestToolsConfig | None = None) -> BridgeGuest
     )
 
 
+class TestBoundedTransport:
+    async def test_stalled_open_is_bounded(self):
+        class StalledOpen(MemoryGuestToolTransport):
+            async def open(self):
+                await asyncio.Event().wait()
+
+        bridge = build(StalledOpen(), settings=config(request_timeout_seconds=0.05))
+        caps = await asyncio.wait_for(bridge.connect(), timeout=0.5)
+        assert not caps.usable
+        assert bridge._pending == {}
+        await bridge.close()
+
+    async def test_stalled_send_is_bounded_and_unknown(self):
+        class StalledSend(MemoryGuestToolTransport):
+            stall = False
+
+            async def send(self, data):
+                await super().send(data)
+                if self.stall:
+                    await asyncio.Event().wait()
+
+        transport = StalledSend(guest_service())
+        bridge = build(transport, settings=config(request_timeout_seconds=0.05))
+        await bridge.connect()
+        transport.stall = True
+        sent = []
+        with pytest.raises(PaletteError) as error:
+            await asyncio.wait_for(
+                bridge.input_text(
+                    text="hello", method="native_text", on_sending=lambda: sent.append(True)
+                ),
+                timeout=0.5,
+            )
+        assert error.value.code == ErrorCode.ACTION_OUTCOME_UNKNOWN
+        assert sent == [True]
+        assert bridge._pending == {}
+        await bridge.close()
+
+    async def test_cancelled_request_removes_pending_future(self):
+        transport = MemoryGuestToolTransport(guest_service(ignore_requests=True))
+        bridge = build(transport)
+        await bridge.connect()
+        started = asyncio.Event()
+        request = asyncio.create_task(
+            bridge.input_text(text="hello", method="native_text", on_sending=started.set)
+        )
+        await started.wait()
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert bridge._pending == {}
+        await bridge.close()
+
+    async def test_invalid_effect_state_is_an_explicit_failure(self):
+        bridge = build(
+            MemoryGuestToolTransport(guest_service(reply={"ok": True, "effect_state": "invented"}))
+        )
+        await bridge.connect()
+        outcome = await bridge.input_text(text="hello", method="native_text")
+        assert not outcome.ok
+        assert outcome.effect_state == "unknown"
+        assert outcome.error is not None
+        await bridge.close()
+
+
 class TestHandshake:
     async def test_a_successful_handshake_reports_what_is_actually_available(self) -> None:
         transport = MemoryGuestToolTransport(guest_service())
@@ -298,7 +363,7 @@ class TestFailures:
         await transport.disconnect()
         with pytest.raises(PaletteError) as info:
             await task
-        assert info.value.code == ErrorCode.GUEST_TOOL_UNAVAILABLE
+        assert info.value.code == ErrorCode.ACTION_OUTCOME_UNKNOWN
         caps = await bridge.capabilities()
         assert caps.usable is False
         await bridge.close()

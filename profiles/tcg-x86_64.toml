@@ -1,0 +1,40 @@
+# Target architecture is the guest architecture, independent of the host executable.
+profile_id = "tcg-x86_64"
+description = "x86_64 desktop using tcg; supply a matching guest image."
+frame_ttl_seconds = 60.0
+
+[qemu]
+arch = "x86_64"
+binary = "qemu-system-x86_64"
+accelerator = "tcg"
+machine = "q35"
+cpu = "max"
+
+[images]
+base = "images/debian-13-xfce-x86_64.qcow2"
+format = "qcow2"
+
+[devices]
+display_model = "VGA"
+
+[resources]
+max_action_seconds = 60.0
+
+[capture]
+timeout_seconds = 30.0
+
+[timeouts]
+startup_seconds = 600.0
+qmp_handshake_seconds = 60.0
+qmp_command_seconds = 30.0
+shutdown_seconds = 30.0
+force_kill_seconds = 15.0
+settle_after_input_ms = 400
+
+[guest_tools.allowed_apps.text-editor]
+executable = "/usr/bin/mousepad"
+allowed_options = ["file"]
+
+[guest_tools.allowed_apps.file-manager]
+executable = "/usr/bin/thunar"
+allowed_options = ["directory"]

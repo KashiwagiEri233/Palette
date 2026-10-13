@@ -17,6 +17,7 @@ gap, and ``docs/threat-model.md`` records it as one.
 
 from __future__ import annotations
 
+import ntpath
 import os
 import re
 import stat
@@ -109,7 +110,7 @@ class PathGuard:
         candidate = self.root
         for part in parts:
             text = str(part)
-            if os.path.isabs(text) or text.startswith(("/", "\\")):
+            if os.path.isabs(text) or ntpath.splitdrive(text)[0] or text.startswith(("/", "\\")):
                 raise PaletteError(
                     ErrorCode.PATH_DENIED, "absolute path components are not allowed"
                 )

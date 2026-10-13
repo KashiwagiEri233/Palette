@@ -23,10 +23,12 @@ import shutil
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from collections.abc import Coroutine
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from ..audit import AuditLog
 from ..capture.base import CaptureBackend
@@ -37,6 +39,7 @@ from ..guest_tools.base import DisabledGuestToolBackend, GuestToolBackend
 from ..guest_tools.bridge import BridgeGuestToolBackend, GuestToolTransport
 from ..input.controller import ActionController, InstanceView
 from ..models import ErrorPayload
+from ..platforms import execution_info, validate_target
 from ..policy import PathGuard, Policy, validate_identifier
 from ..qmp.client import QmpClient
 from ..qmp.transport import ProcessQmpTransport
@@ -48,8 +51,10 @@ from .launcher import (
     locate_binary,
     probe_binary,
     require_accelerator,
+    resolve_firmware,
     spawn_qemu,
 )
+from .managed import ManagedProcess
 from .process_guard import ProcessGuard, create_process_guard
 
 logger = logging.getLogger("palette.vm")
@@ -86,7 +91,7 @@ class VmInstance:
     paths: InstancePaths
     cleanup_root: Path
     plan: LaunchPlan | None = None
-    process: asyncio.subprocess.Process | None = None
+    process: ManagedProcess | None = None
     transport: ProcessQmpTransport | None = None
     qmp: QmpClient | None = None
     capture: CaptureBackend | None = None
@@ -100,6 +105,7 @@ class VmInstance:
     #: Host material the caller supplied for this instance. Kept so a reset rebuilds the
     #: instance that was asked for instead of quietly reverting to the profile's defaults.
     overrides: LaunchOverrides = field(default_factory=LaunchOverrides)
+    guest_refresh: asyncio.Task[None] | None = None
 
     @property
     def state(self) -> VmState:
@@ -124,9 +130,8 @@ class VmInstance:
 class VmManager:
     """Owns the lifecycle of every served VM.
 
-    One manager per service process. The MVP serves one VM at a time, but the map and the
-    per-instance state exist so that "one task, one VM" is an extension rather than a
-    rewrite.
+    One manager per service process, with serialized lifecycle changes and an independent
+    action queue for each VM. Cross-VM resource scheduling is outside its scope.
     """
 
     def __init__(
@@ -141,6 +146,7 @@ class VmManager:
         self._instances: dict[str, VmInstance] = {}
         self._boot_epochs: dict[str, int] = {}
         self._lock = asyncio.Lock()
+        self._cleanup_waiters: set[asyncio.Task[Any]] = set()
         self._guest_tool_transport_factory = guest_tool_transport_factory
 
     # -- lookup ----------------------------------------------------------------------
@@ -189,11 +195,17 @@ class VmManager:
                 VmState.PAUSED,
             }:
                 raise PaletteError(ErrorCode.VM_ALREADY_RUNNING, f"VM {vm_id!r} is already running")
-            return await self._start_locked(vm_id, profile, overrides or LaunchOverrides())
+            try:
+                if existing is not None:
+                    await self._finish_cleanup(self._stop_locked(existing, force=True))
+                return await self._start_locked(vm_id, profile, overrides or LaunchOverrides())
+            finally:
+                self._apply_retention(vm_id, profile)
 
     async def _start_locked(
         self, vm_id: str, profile: Profile, overrides: LaunchOverrides
     ) -> VmInstance:
+        validate_target(profile)
         guard_root = PathGuard(self.config.runtime_root)
         policy = Policy(profile, guard_root)
         policy.require_network_supported()
@@ -223,6 +235,7 @@ class VmManager:
                 details={"installed": probe.version, "pinned": profile.qemu.version_pin},
             )
         accelerator = require_accelerator(profile, probe)
+        profile = resolve_firmware(profile, binary)
 
         images = ImageManager(
             guard_root,
@@ -259,26 +272,25 @@ class VmManager:
         self._instances[vm_id] = instance
 
         try:
-            await self._provision(instance, images, profile, binary, accelerator, overrides)
+            async with asyncio.timeout(profile.timeouts.startup_seconds):
+                await self._provision(instance, images, profile, binary, accelerator, overrides)
+        except asyncio.CancelledError:
+            await self._finish_cleanup(self._rollback_start(instance, images))
+            raise
+        except TimeoutError:
+            error = PaletteError(ErrorCode.TIMEOUT, "VM provisioning exceeded its startup budget")
+            view.last_error = ErrorPayload(**error.as_payload())
+            await self._finish_cleanup(self._rollback_start(instance, images))
+            raise error from None
         except PaletteError as exc:
             view.last_error = ErrorPayload(**exc.as_payload())
-            with contextlib.suppress(PaletteError):
-                instance.transition(VmState.FAILED)
-            await self._teardown(instance, force=True)
-            with contextlib.suppress(Exception):
-                images.delete_instance(vm_id, instance_id)
-            self._instances.pop(vm_id, None)
+            await self._finish_cleanup(self._rollback_start(instance, images))
             raise
         except Exception as exc:
             logger.exception("unexpected failure starting %s", vm_id)
             error = PaletteError(ErrorCode.STARTUP_FAILED, f"startup failed: {type(exc).__name__}")
             view.last_error = ErrorPayload(**error.as_payload())
-            with contextlib.suppress(PaletteError):
-                instance.transition(VmState.FAILED)
-            await self._teardown(instance, force=True)
-            with contextlib.suppress(Exception):
-                images.delete_instance(vm_id, instance_id)
-            self._instances.pop(vm_id, None)
+            await self._finish_cleanup(self._rollback_start(instance, images))
             raise error from exc
 
         if self.audit:
@@ -291,6 +303,36 @@ class VmManager:
                 boot_epoch=boot_epoch,
             )
         return instance
+
+    async def _finish_cleanup(self, operation: Coroutine[Any, Any, None]) -> None:
+        """Finish owned-resource cleanup even if the requesting task is cancelled again."""
+        waiter = asyncio.current_task()
+        if waiter is not None:
+            self._cleanup_waiters.add(waiter)
+        task = asyncio.create_task(operation, name="vm-cleanup")
+        cancelled = False
+        try:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            task.result()
+            if cancelled:
+                raise asyncio.CancelledError
+        finally:
+            if waiter is not None:
+                self._cleanup_waiters.discard(waiter)
+
+    async def _rollback_start(self, instance: VmInstance, images: ImageManager) -> None:
+        instance.stop_requested = True
+        instance.view.state = str(VmState.FAILED)
+        await self._teardown(instance, force=True)
+        images.update_manifest(instance.paths, {"state": "FAILED", "process_exited": True})
+        with contextlib.suppress(PaletteError, OSError):
+            images.delete_instance(instance.view.vm_id, instance.view.instance_id)
+        if self.find(instance.view.vm_id) is instance:
+            self._instances.pop(instance.view.vm_id)
 
     async def _provision(
         self,
@@ -306,15 +348,18 @@ class VmManager:
 
         # 0. register the instance before anything can fail, so the failure path below can
         #    clean up through the same manifest-verified route as any other deletion.
-        images.write_manifest(
+        images.update_manifest(
             paths,
             {
+                **execution_info(profile),
                 "base_image": str(overrides.image) if overrides.image else profile.images.base,
                 "base_from_caller": overrides.image is not None,
                 "overlay": str(paths.overlay),
                 "attached_volumes": [str(volume.path) for volume in overrides.volumes],
                 "state": str(VmState.STARTING),
                 "host_boot_epoch": instance.view.boot_epoch,
+                "firmware_code": profile.qemu.firmware.code,
+                "firmware_vars": profile.qemu.firmware.vars,
             },
         )
 
@@ -323,6 +368,23 @@ class VmManager:
         #    the writable layer is still ours, per-instance, and discarded by reset.
         await images.create_overlay(paths, base=overrides.image, base_format=overrides.image_format)
         images.stage_firmware_vars(paths)
+        volumes = []
+        volume_chain: list[str] = []
+        for volume in overrides.volumes:
+            info = await images.inspect_image(
+                Path(volume.path), image_format="raw" if volume.media == "cdrom" else None
+            )
+            volumes.append(replace(volume, format=info.format))
+            volume_chain.extend(str(path) for path in info.chain)
+        overrides = replace(overrides, volumes=tuple(volumes))
+        instance.overrides = overrides
+        images.update_manifest(
+            paths,
+            {
+                "volume_backing_chain": volume_chain,
+                "volume_formats": [volume.format for volume in volumes],
+            },
+        )
 
         # 2. command line, then the process itself, hidden and with a whitelisted env.
         plan = build_launch_plan(
@@ -339,24 +401,29 @@ class VmManager:
             caller_args=overrides.qemu_args,
         )
         instance.plan = plan
-        process = await spawn_qemu(plan)
+        process = await spawn_qemu(
+            plan, on_spawn=lambda process: setattr(instance, "process", process)
+        )
         instance.process = process
 
         # 3. orphan protection before anything else can fail.
-        guard = create_process_guard(
-            memory_limit_bytes=(
-                profile.resources.process_memory_limit_mib * 1024 * 1024
-                if profile.resources.process_memory_limit_mib
-                else None
+        guard = (
+            process
+            if isinstance(process, ProcessGuard)
+            else create_process_guard(
+                memory_limit_bytes=(
+                    profile.resources.process_memory_limit_mib * 1024 * 1024
+                    if profile.resources.process_memory_limit_mib
+                    else None
+                )
             )
         )
         instance.guard = guard
         if not guard.attach(process.pid):
-            logger.warning(
-                "no process guard is active for %s (%s); an orphaned QEMU would survive "
-                "the service exiting",
-                paths.vm_id,
-                guard.description,
+            raise PaletteError(
+                ErrorCode.STARTUP_FAILED,
+                "the required QEMU process guard could not be activated",
+                details={"guard": guard.description},
             )
 
         # 4. drain stderr continuously: an unread pipe eventually blocks the guest.
@@ -374,6 +441,7 @@ class VmManager:
         )
         instance.qmp = qmp
         qmp.on_disconnect(lambda failure: self._on_qmp_disconnect(instance, failure))
+        qmp.on_event(lambda name, data: self._on_qmp_event(instance, name, data))
         try:
             await qmp.start()
             await qmp.probe()
@@ -403,7 +471,8 @@ class VmManager:
 
         # 6. guest enhancement channel only for a hybrid profile, and never required by
         #    the visual baseline.
-        instance.guest_tools = await self._build_guest_tools(instance)
+        instance.guest_tools = DisabledGuestToolBackend()
+        self._refresh_guest_tools(instance)
 
         instance.tasks.append(
             asyncio.create_task(self._watch_process(instance), name=f"watch-{paths.vm_id}")
@@ -415,10 +484,9 @@ class VmManager:
 
         # 7. bounded readiness polling: report the levels reached, never invent a desktop.
         await self._poll_readiness(instance)
-        images.write_manifest(
+        images.update_manifest(
             paths,
             {
-                "base_image": profile.images.base,
                 "overlay": str(paths.overlay),
                 "state": str(VmState.RUNNING),
                 "host_boot_epoch": instance.view.boot_epoch,
@@ -445,7 +513,11 @@ class VmManager:
             instance_id=instance.view.instance_id,
             boot_epoch=instance.view.boot_epoch,
         )
-        capabilities = await bridge.connect()
+        try:
+            capabilities = await bridge.connect()
+        except BaseException:
+            await bridge.close()
+            raise
         if not capabilities.usable:
             logger.info(
                 "guest enhancement channel unavailable for %s: %s",
@@ -454,13 +526,49 @@ class VmManager:
             )
         return bridge
 
+    def _refresh_guest_tools(self, instance: VmInstance) -> None:
+        previous = instance.guest_tools
+        instance.guest_tools = DisabledGuestToolBackend()
+        if instance.guest_refresh is not None:
+            instance.guest_refresh.cancel()
+        task = asyncio.create_task(
+            self._reconnect_guest_tools(instance, previous, instance.view.boot_epoch),
+            name=f"guest-connect-{instance.view.vm_id}",
+        )
+        instance.guest_refresh = task
+        instance.tasks.append(task)
+
+    async def _reconnect_guest_tools(
+        self, instance: VmInstance, previous: GuestToolBackend | None, boot_epoch: int
+    ) -> None:
+        backend: GuestToolBackend | None = None
+        try:
+            if previous is not None:
+                await previous.close()
+            backend = await self._build_guest_tools(instance)
+            if (
+                self.find(instance.view.vm_id) is instance
+                and not instance.stop_requested
+                and instance.view.boot_epoch == boot_epoch
+            ):
+                instance.guest_tools = backend
+                backend = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "guest reconnect unavailable for %s: %s", instance.view.vm_id, type(exc).__name__
+            )
+        finally:
+            if backend is not None:
+                await backend.close()
+
     async def _poll_readiness(self, instance: VmInstance) -> None:
-        deadline = time.monotonic() + instance.profile.timeouts.startup_seconds
         interval = instance.profile.timeouts.boot_poll_seconds
         controller = instance.controller
         if controller is None:  # pragma: no cover - guaranteed by _provision
             raise PaletteError(ErrorCode.INTERNAL_ERROR, "this VM has no active session")
-        while time.monotonic() < deadline:
+        while True:
             try:
                 await controller.observe()
             except PaletteError as exc:
@@ -477,26 +585,44 @@ class VmManager:
                     details={"returncode": instance.process.returncode},
                 )
             await asyncio.sleep(interval)
-        logger.warning(
-            "no valid framebuffer within the startup budget for %s; the VM keeps running "
-            "but screen_ready stays false",
-            instance.view.vm_id,
-        )
 
     # -- stop ------------------------------------------------------------------------
-    async def stop(self, vm_id: str, *, force: bool = False, keep_instance: bool = True) -> None:
-        instance = self.get(vm_id)
+    @staticmethod
+    def _check_identity(
+        instance: VmInstance | None, expected_instance_id: str | None, expect_absent: bool = False
+    ) -> None:
+        if (expect_absent and instance is not None) or (
+            expected_instance_id is not None
+            and (instance is None or instance.view.instance_id != expected_instance_id)
+        ):
+            raise PaletteError(
+                ErrorCode.STATE_CONFLICT, "the VM changed during lifecycle authorization"
+            )
+
+    async def stop(
+        self,
+        vm_id: str,
+        *,
+        force: bool = False,
+        keep_instance: bool = True,
+        expected_instance_id: str | None = None,
+    ) -> VmInstance:
         async with self._lock:
-            await self._stop_locked(instance, force=force)
-        if not keep_instance:
-            self._instances.pop(vm_id, None)
+            instance = self.get(vm_id)
+            self._check_identity(instance, expected_instance_id)
+            try:
+                await self._finish_cleanup(self._stop_locked(instance, force=force))
+            finally:
+                self._apply_retention(vm_id, instance.profile)
+            if not keep_instance:
+                self._instances.pop(vm_id, None)
+            return instance
 
     async def _stop_locked(self, instance: VmInstance, *, force: bool) -> None:
         if instance.state in {VmState.STOPPED}:
             return
         instance.stop_requested = True
-        with contextlib.suppress(PaletteError):
-            instance.transition(VmState.STOPPING)
+        instance.view.state = str(VmState.STOPPING)
 
         # Revoke control first so nothing new can be submitted while we unwind.
         release = None
@@ -529,13 +655,22 @@ class VmManager:
                         exc.code,
                     )
             if process.returncode is None:
+                if force:
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
                 await self._await_exit(
                     instance, timeout=instance.profile.timeouts.force_kill_seconds, kill=True
                 )
 
-        await self._teardown(instance)
-        with contextlib.suppress(PaletteError):
-            instance.transition(VmState.STOPPED)
+        try:
+            await self._teardown(instance)
+        except BaseException:
+            instance.view.state = str(VmState.FAILED)
+            raise
+        instance.transition(VmState.STOPPED)
+        images = self._images(instance.profile)
+        if instance.paths.manifest.exists():
+            images.update_manifest(instance.paths, {"state": "STOPPED", "process_exited": True})
         if self.audit:
             self.audit.record(
                 "vm.stopped",
@@ -563,8 +698,13 @@ class VmManager:
         logger.warning("force-killing QEMU for %s", instance.view.vm_id)
         with contextlib.suppress(ProcessLookupError):
             process.kill()
-        with contextlib.suppress(TimeoutError):
+        try:
             await asyncio.wait_for(process.wait(), timeout=5.0)
+        except TimeoutError:
+            instance.view.state = str(VmState.FAILED)
+            raise PaletteError(
+                ErrorCode.TIMEOUT, "QEMU exit could not be confirmed after killing it"
+            ) from None
 
     async def _teardown(self, instance: VmInstance, *, force: bool = False) -> None:
         """Release every host resource attached to one instance.
@@ -572,13 +712,21 @@ class VmManager:
         Ordered from the outside in: stop consuming, close the channel, then the process,
         then the guard — so the guard is always the last thing holding the process.
         """
-        for task in instance.tasks:
+        tasks = [
+            task
+            for task in instance.tasks
+            if task is not asyncio.current_task() and task not in self._cleanup_waiters
+        ]
+        for task in tasks:
             task.cancel()
-        for task in instance.tasks:
+        for task in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         instance.tasks.clear()
 
+        if instance.controller is not None:
+            with contextlib.suppress(Exception):
+                await instance.controller.shutdown(release=False)
         if instance.guest_tools is not None:
             with contextlib.suppress(Exception):
                 await instance.guest_tools.close()
@@ -589,8 +737,13 @@ class VmManager:
         if process is not None and process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 process.kill()
-            with contextlib.suppress(TimeoutError):
+            try:
                 await asyncio.wait_for(process.wait(), timeout=5.0)
+            except TimeoutError:
+                instance.view.state = str(VmState.FAILED)
+                raise PaletteError(
+                    ErrorCode.TIMEOUT, "QEMU is still alive; its disk has been retained"
+                ) from None
         if instance.guard is not None:
             instance.guard.close()
         instance.view.qmp_ready = False
@@ -600,55 +753,92 @@ class VmManager:
             instance.view.state = str(VmState.FAILED)
 
     # -- reset -----------------------------------------------------------------------
-    async def reset(self, vm_id: str, profile_id: str | None = None) -> VmInstance:
+    async def reset(
+        self,
+        vm_id: str,
+        profile_id: str | None = None,
+        *,
+        expected_instance_id: str | None = None,
+        expect_absent: bool = False,
+    ) -> VmInstance:
         """Abandon current state and rebuild from the base image.
 
         Steps, in order: revoke control, cancel the running action and release inputs, stop
         the process, keep the old overlay under the retention policy (**never** commit it
         to the base), then start a fresh instance with a new identifier and boot epoch.
         """
-        instance = self.find(vm_id)
-        profile = instance.profile if instance is not None else self.config.profile(profile_id)
-        if instance is not None:
-            async with self._lock:
-                await self._stop_locked(instance, force=False)
-        images = ImageManager(
+        validate_identifier(vm_id, what="vm_id")
+        async with self._lock:
+            instance = self.find(vm_id)
+            self._check_identity(instance, expected_instance_id, expect_absent)
+            profile = instance.profile if instance is not None else self.config.profile(profile_id)
+            overrides = instance.overrides if instance is not None else LaunchOverrides()
+            try:
+                if instance is not None:
+                    await self._finish_cleanup(self._stop_locked(instance, force=False))
+                if self.audit:
+                    self.audit.record(
+                        "vm.reset",
+                        vm_id=vm_id,
+                        previous_instance=instance.view.instance_id if instance else None,
+                    )
+                return await self._start_locked(vm_id, profile, overrides)
+            finally:
+                self._apply_retention(vm_id, profile)
+
+    def _images(self, profile: Profile) -> ImageManager:
+        return ImageManager(
             PathGuard(self.config.runtime_root),
             profile,
             max_overlays=profile.retention.max_overlays,
             keep_overlays=profile.retention.keep_overlays,
         )
-        previous_instance = instance.view.instance_id if instance is not None else None
-        if previous_instance and not profile.retention.keep_overlays:
-            with contextlib.suppress(PaletteError):
-                images.delete_instance(vm_id, previous_instance)
-        if self.audit:
-            self.audit.record("vm.reset", vm_id=vm_id, previous_instance=previous_instance)
-        renewed = await self.start(
-            vm_id,
-            profile.profile_id,
-            overrides=instance.overrides if instance is not None else None,
-        )
-        # Pruning runs after the new instance exists, so the retention limit is applied to
-        # the *stopped* layers rather than to a set that is about to grow by one.
-        with contextlib.suppress(Exception):
-            self._prune(vm_id, profile, images)
-        return renewed
 
-    def _prune(self, vm_id: str, profile: Profile, images: ImageManager) -> None:
-        current = self._instances.get(vm_id)
-        keep = {current.view.instance_id} if current is not None else set()
-        images.prune_instances(vm_id, keep_instance_ids=keep)
+    def _apply_retention(self, vm_id: str, profile: Profile) -> None:
+        keep = {
+            instance.view.instance_id
+            for instance in self._instances.values()
+            if instance.view.vm_id == vm_id
+            and (
+                instance.state not in {VmState.STOPPED, VmState.FAILED}
+                or (instance.process is not None and instance.process.returncode is None)
+            )
+        }
+        protected: list[Path] = []
+        for instance in self._instances.values():
+            if instance.process is not None and instance.process.returncode is None:
+                protected.append(instance.paths.root)
+                protected.append(instance.overrides.image or Path(instance.profile.images.base))
+                protected.extend(Path(volume.path) for volume in instance.overrides.volumes)
+        try:
+            self._images(profile).prune_instances(
+                vm_id, keep_instance_ids=keep, protected_paths=tuple(protected)
+            )
+        except (PaletteError, OSError) as exc:
+            logger.warning("retention deferred for %s: %s", vm_id, type(exc).__name__)
+
+    async def take_control(self, vm_id: str, *, expected_instance_id: str | None = None) -> int:
+        async with self._lock:
+            instance = self.get(vm_id)
+            self._check_identity(instance, expected_instance_id)
+            instance.view.controller_epoch += 1
+            if instance.controller is not None:
+                instance.controller.invalidate(reason="control changed hands")
+                await self._finish_cleanup(self._release_controller(instance))
+            return instance.view.controller_epoch
+
+    @staticmethod
+    async def _release_controller(instance: VmInstance) -> None:
+        if instance.controller is not None:
+            with contextlib.suppress(PaletteError):
+                await instance.controller.emergency_release(invalidate=False)
 
     async def emergency_stop_all(self) -> list[str]:
         """Operator path: stop everything now, without waiting for a graceful guest."""
         stopped: list[str] = []
         for vm_id, instance in list(self._instances.items()):
-            if instance.controller is not None:
-                with contextlib.suppress(Exception):
-                    await instance.controller.emergency_release()
             try:
-                await self.stop(vm_id, force=True)
+                await self.stop(vm_id, force=True, expected_instance_id=instance.view.instance_id)
             except PaletteError as exc:
                 logger.error("emergency stop of %s failed: %s", vm_id, exc.code)
             else:
@@ -656,9 +846,18 @@ class VmManager:
         return stopped
 
     async def shutdown(self) -> None:
+        await self._finish_cleanup(self._shutdown_all())
+
+    async def _shutdown_all(self) -> None:
+        failure: Exception | None = None
         for vm_id in list(self._instances):
-            with contextlib.suppress(PaletteError):
+            try:
                 await self.stop(vm_id, force=False)
+            except Exception as exc:
+                failure = failure or exc
+                logger.error("shutdown of %s failed: %s", vm_id, type(exc).__name__)
+        if failure is not None:
+            raise failure
 
     # -- background tasks ------------------------------------------------------------
     async def _consume_stderr(self, instance: VmInstance) -> None:
@@ -711,14 +910,52 @@ class VmManager:
         await asyncio.sleep(limit)
         logger.warning("runtime limit reached for %s; stopping", instance.view.vm_id)
         with contextlib.suppress(PaletteError):
-            await self.stop(instance.view.vm_id, force=False)
+            await self.stop(
+                instance.view.vm_id, force=True, expected_instance_id=instance.view.instance_id
+            )
+
+    def _on_qmp_event(self, instance: VmInstance, name: str, data: dict[str, Any]) -> None:
+        if (
+            name != "RESET"
+            or instance.stop_requested
+            or self.find(instance.view.vm_id) is not instance
+        ):
+            return
+        epoch = self._boot_epochs.get(instance.view.vm_id, instance.view.boot_epoch) + 1
+        self._boot_epochs[instance.view.vm_id] = epoch
+        instance.view.boot_epoch = epoch
+        instance.view.screen_ready = False
+        instance.view.desktop_ready = None
+        if instance.controller is not None:
+            instance.controller.invalidate(reason="the guest rebooted")
+            instance.tasks.append(
+                asyncio.create_task(
+                    self._release_controller(instance), name=f"reset-release-{instance.view.vm_id}"
+                )
+            )
+        self._refresh_guest_tools(instance)
+        with contextlib.suppress(PaletteError, OSError):
+            self._images(instance.profile).update_manifest(
+                instance.paths, {"host_boot_epoch": epoch}
+            )
+        if self.audit:
+            self.audit.record(
+                "vm.guest_reset",
+                vm_id=instance.view.vm_id,
+                instance_id=instance.view.instance_id,
+                boot_epoch=epoch,
+            )
 
     def _on_qmp_disconnect(self, instance: VmInstance, failure: BaseException | None) -> None:
         if instance.stop_requested:
             return
         logger.warning("QMP channel for %s dropped: %s", instance.view.vm_id, failure)
         instance.view.qmp_ready = False
-        if instance.view.state == str(VmState.RUNNING):
+        instance.view.screen_ready = False
+        instance.view.desktop_ready = None
+        if instance.controller is not None:
+            instance.controller.invalidate(reason="the management channel disconnected")
+        if instance.state in {VmState.RUNNING, VmState.PAUSED}:
             # The guest may still be alive, but the service can no longer observe or
             # control it, so it must not be reported as usable.
             instance.view.state = str(VmState.FAILED)

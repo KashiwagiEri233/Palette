@@ -72,6 +72,11 @@ class QmpCaptureBackend:
                 logger.info("PNG screendump rejected by this build; falling back to PPM")
 
         if format_used == "ppm":
+            if self._config.prefer_format == "png" and not self._config.allow_ppm_fallback:
+                raise PaletteError(
+                    ErrorCode.UNSUPPORTED_CAPABILITY,
+                    "this QEMU build cannot write PNG screendumps and PPM fallback is disabled",
+                )
             try:
                 await self._screendump(sink, display_id, head, fmt=None)
             except QmpCommandError as exc:

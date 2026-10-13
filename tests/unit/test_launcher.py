@@ -311,16 +311,16 @@ class TestEnvironment:
 class TestAccelerator:
     def test_a_requested_accelerator_the_build_lacks_is_refused(self, profile) -> None:
         probe = probe_binary(sys.executable)  # not QEMU, so no accelerator list
-        probe.accelerators = ["tcg"]
+        probe.accelerators = ["whpx"]
         with pytest.raises(PaletteError) as info:
             require_accelerator(profile, probe)
         assert info.value.code is ErrorCode.ACCELERATION_UNAVAILABLE
-        assert info.value.details["available"] == ["tcg"]
+        assert info.value.details["available"] == ["whpx"]
 
     def test_a_requested_accelerator_the_build_offers_is_accepted(self, profile) -> None:
         probe = probe_binary(sys.executable)
         probe.accelerators = ["whpx", "tcg"]
-        assert require_accelerator(profile, probe) == "whpx"
+        assert require_accelerator(profile, probe) == "tcg"
 
     def test_tcg_is_usable_but_flagged(self, profile, caplog: pytest.LogCaptureFixture) -> None:
         trusted = profile.model_copy(
@@ -337,7 +337,7 @@ class TestAccelerator:
         this layer; the start itself is the real proof."""
         probe = probe_binary(sys.executable)
         probe.accelerators = []
-        assert require_accelerator(profile, probe) == "whpx"
+        assert require_accelerator(profile, probe) == "tcg"
 
 
 class TestProbe:

@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import time
 from pathlib import Path
 
 from palette.audit import AuditLog
 from palette.config import find_config_root, load_config
 from palette.errors import ErrorCode, PaletteError
+from palette.platforms import execution_info
 from palette.service import PaletteService
 
 NOT_READY = 3
@@ -47,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text", default=None, help="also type this text after the click")
     parser.add_argument("--out", type=Path, default=None, help="directory to write the frames to")
     parser.add_argument(
-        "--keep-running", action="store_true", help="leave the VM running afterwards"
+        "--keep-running", action="store_true", help="hold this probe open until interrupted"
     )
     return parser.parse_args()
 
@@ -55,6 +57,7 @@ def parse_args() -> argparse.Namespace:
 async def probe(args: argparse.Namespace) -> int:
     config = load_config(args.root or find_config_root())
     profile = config.profile(args.profile)
+    target = execution_info(profile)
     runtime = config.runtime_root
     audit = AuditLog(
         runtime / "audit" / "palette.jsonl",
@@ -65,12 +68,15 @@ async def probe(args: argparse.Namespace) -> int:
     service = PaletteService(config, audit=audit)
     await service.startup()
 
-    out_dir = args.out or (runtime / "probe")
+    out_dir = args.out or (runtime / "probe" / profile.profile_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         started = time.perf_counter()
         print(f"* starting {args.vm_id!r} from profile {profile.profile_id!r} ...")
+        print(
+            f"  target: {target['host_arch']} -> {target['guest_arch']} / {target['accelerator']}"
+        )
         instance = await service.manager.start(args.vm_id, profile.profile_id)
         so_far = time.perf_counter() - started
         print(
@@ -126,13 +132,15 @@ async def probe(args: argparse.Namespace) -> int:
             print(f"  error: {receipt.error.code}: {receipt.error.message}")
         if after is not None:
             (out_dir / "02-after-click.png").write_bytes(after)
+        if not receipt.ok:
+            return FAILED
 
         if args.text:
-            target = receipt.frame or frame
+            target_frame = receipt.frame or frame
             typed, typed_image = await service.act(
                 args.vm_id,
                 instance_id=instance.view.instance_id,
-                frame_id=target.frame_id,
+                frame_id=target_frame.frame_id,
                 request_id="p0-probe-text",
                 action={"type": "type_text", "text": args.text, "mode": "keyboard"},
             )
@@ -144,15 +152,33 @@ async def probe(args: argparse.Namespace) -> int:
                 print(f"  error: {typed.error.code}: {typed.error.message}")
             if typed_image is not None:
                 (out_dir / "03-after-text.png").write_bytes(typed_image)
+            if not typed.ok:
+                return FAILED
 
         status = await service.status(args.vm_id)
         if status.status is not None:
             held = status.status.input_ledger
             print(f"* input ledger: keys={held.keys} buttons={held.buttons}")
         print(f"* frames written to {out_dir}")
+        (out_dir / "timings.json").write_text(
+            json.dumps(
+                {
+                    "profile_id": profile.profile_id,
+                    **target,
+                    "start_ms": so_far * 1000,
+                    "observe_ms": observe_ms,
+                    "click_ms": click_ms,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         print("OK: the service saw the desktop and the input reached it")
         print("  This is not a desktop-readiness verdict: check the screenshots yourself.")
-        if not args.keep_running:
+        if args.keep_running:
+            print("* Probe owns the VM; interrupt this process to stop and clean up.")
+            await asyncio.Event().wait()
+        else:
             await service.manager.stop(args.vm_id)
             print("* VM stopped")
         return 0
@@ -176,8 +202,7 @@ async def probe(args: argparse.Namespace) -> int:
             print("  run `palette doctor` first")
         return code
     finally:
-        if not args.keep_running:
-            await service.shutdown()
+        await service.shutdown()
 
 
 def main() -> int:

@@ -14,9 +14,13 @@ import asyncio
 import contextlib
 import json
 import logging
-from typing import Any, Protocol, runtime_checkable
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from ..errors import QmpDisconnectedError
+
+if TYPE_CHECKING:
+    from ..vm.managed import ManagedProcess
 
 logger = logging.getLogger("palette.qmp.transport")
 
@@ -41,7 +45,7 @@ class QmpTransport:
         reader: asyncio.StreamReader,
         writer: AsyncWritable,
         *,
-        process: asyncio.subprocess.Process | None = None,
+        process: ManagedProcess | None = None,
         name: str = "qmp",
     ) -> None:
         self.reader = reader
@@ -50,12 +54,16 @@ class QmpTransport:
         self.name = name
         self._closed = False
 
-    async def send_json(self, payload: dict[str, Any]) -> None:
+    async def send_json(
+        self, payload: dict[str, Any], *, on_sending: Callable[[], None] | None = None
+    ) -> None:
         """Write one framed message, mapping pipe failures onto a Palette error."""
         if self._closed:
             raise QmpDisconnectedError("QMP transport is closed")
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
         try:
+            if on_sending is not None:
+                on_sending()
             self.writer.write(data)
             await self.writer.drain()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
@@ -93,7 +101,7 @@ class QmpTransport:
 class ProcessQmpTransport(QmpTransport):
     """QMP over an already-started QEMU child process's stdin/stdout pipes."""
 
-    def __init__(self, process: asyncio.subprocess.Process, *, name: str = "qmp") -> None:
+    def __init__(self, process: ManagedProcess, *, name: str = "qmp") -> None:
         if process.stdin is None or process.stdout is None:
             raise QmpDisconnectedError("QEMU was started without usable QMP pipes")
         super().__init__(process.stdout, process.stdin, process=process, name=name)

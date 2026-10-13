@@ -4,7 +4,7 @@
 
 [host]
 # The profile used by `palette serve` and by lifecycle commands that do not name one.
-default_profile = "default"
+default_profile = "auto"
 
 # Where instance overlays, frames, logs and the audit trail live. Everything Palette
 # deletes lives under this directory, and nothing outside it is ever touched.

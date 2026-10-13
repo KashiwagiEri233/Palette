@@ -11,6 +11,7 @@
 | [`../README.zh-CN.md`](../README.zh-CN.md) · [English](../README.md) | 想要一段话的总览和安全默认值 |
 | [`user-guide.zh-CN.md`](user-guide.zh-CN.md) · [English](user-guide.md) | 你是 Agent 或客户端作者：工具契约、工作循环、各种限制 |
 | [`operator.zh-CN.md`](operator.zh-CN.md) · [English](operator.md) | 你负责宿主机：安装、profile、生命周期、紧急停止、故障恢复 |
+| [`platforms.zh-CN.md`](platforms.zh-CN.md) · [English](platforms.md) | 你选择 Windows/macOS/Linux、原生客户机或显式 TCG、固件与资源限制 |
 | [`guest-template.zh-CN.md`](guest-template.zh-CN.md) · [English](guest-template.md) | 你正在构建 profile 指向的桌面镜像 |
 | [`threat-model.zh-CN.md`](threat-model.zh-CN.md) · [English](threat-model.md) | 你需要知道什么可信、什么有强制、什么不在范围内 |
 | [`benchmarks.zh-CN.md`](benchmarks.zh-CN.md) · [English](benchmarks.md) | 你要做性能测量，或想知道到底有没有测过 |

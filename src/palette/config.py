@@ -5,12 +5,13 @@ TOML files under ``profiles/`` and unknown keys are rejected, so a mistyped cont
 (for example ``allow_agent_reset`` spelled wrongly) fails loudly instead of leaving a
 default in place.
 
-Every safety-relevant default here matches the plan: offline, no TCG fallback, no
-guest enhancement channel, no agent lifecycle authority.
+Host material and enhancement defaults are configurable. Accelerator fallback remains
+disabled; software emulation is selected explicitly through a TCG profile.
 """
 
 from __future__ import annotations
 
+import ntpath
 import os
 import tomllib
 from pathlib import Path
@@ -19,10 +20,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .errors import ErrorCode, PaletteError
+from .platforms import native_profile_id
 
 
 class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
 
 class FirmwareConfig(_Strict):
@@ -33,6 +35,7 @@ class FirmwareConfig(_Strict):
 
 
 class QemuConfig(_Strict):
+    arch: Literal["x86_64", "aarch64"] = "x86_64"
     binary: str = "qemu-system-x86_64"
     argv_prefix: list[str] = Field(
         default_factory=list,
@@ -51,7 +54,7 @@ class QemuConfig(_Strict):
         description="Arguments placed before qemu-img's own; mirrors argv_prefix",
     )
     version_pin: str | None = None
-    accelerator: Literal["whpx", "kvm", "tcg"] = "whpx"
+    accelerator: Literal["whpx", "kvm", "hvf", "tcg"] = "whpx"
     allow_accelerator_fallback: bool = Field(
         default=False,
         description="Must stay false: a silent fallback to TCG changes the isolation story",
@@ -70,6 +73,21 @@ class QemuConfig(_Strict):
         ),
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _target_defaults(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        arch = data.get("arch", "x86_64")
+        data.setdefault("binary", f"qemu-system-{arch}")
+        data.setdefault("machine", "virt" if arch == "aarch64" else "q35")
+        if data.get("accelerator") == "tcg":
+            data.setdefault("cpu", "max")
+        elif arch == "aarch64" or data.get("accelerator") == "hvf":
+            data.setdefault("cpu", "host")
+        return data
+
     @model_validator(mode="after")
     def _no_silent_fallback(self) -> QemuConfig:
         if self.allow_accelerator_fallback:
@@ -77,6 +95,12 @@ class QemuConfig(_Strict):
                 "allow_accelerator_fallback must be false: missing acceleration is a diagnosed "
                 "failure, not a silent degradation"
             )
+        if self.accelerator == "tcg" and self.cpu == "host":
+            raise ValueError("TCG cannot use cpu=host; use max or an emulated CPU model")
+        if self.arch == "aarch64" and self.machine.split(",", 1)[0] != "virt":
+            raise ValueError("aarch64 profiles require the virt machine")
+        if self.arch == "x86_64" and self.machine.split(",", 1)[0] == "virt":
+            raise ValueError("the virt machine requires an aarch64 guest")
         return self
 
 
@@ -107,7 +131,7 @@ class ResourcesConfig(_Strict):
     max_action_seconds: float = Field(default=30.0, gt=0)
     #: Hard ceiling on the QEMU process itself; the guest RAM figure is not a host cap.
     process_memory_limit_mib: int | None = Field(default=8192, ge=256)
-    process_max_runtime_seconds: float | None = None
+    process_max_runtime_seconds: float | None = Field(default=None, gt=0)
     max_overlay_bytes: int | None = None
 
 
@@ -186,12 +210,12 @@ class TextConfig(_Strict):
 
 
 class TimeoutConfig(_Strict):
-    qmp_command_seconds: float = 10.0
-    qmp_handshake_seconds: float = 10.0
-    startup_seconds: float = 120.0
-    boot_poll_seconds: float = 1.0
-    shutdown_seconds: float = 60.0
-    force_kill_seconds: float = 10.0
+    qmp_command_seconds: float = Field(default=10.0, gt=0)
+    qmp_handshake_seconds: float = Field(default=10.0, gt=0)
+    startup_seconds: float = Field(default=120.0, gt=0)
+    boot_poll_seconds: float = Field(default=1.0, gt=0)
+    shutdown_seconds: float = Field(default=60.0, gt=0)
+    force_kill_seconds: float = Field(default=10.0, gt=0)
     settle_after_input_ms: int = Field(default=120, ge=0, le=5000)
     double_click_gap_ms: int = Field(default=90, ge=20, le=500)
     click_hold_ms: int = Field(default=40, ge=0, le=1000)
@@ -293,6 +317,25 @@ class Profile(_Strict):
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     frame_ttl_seconds: float = Field(default=30.0, gt=0, le=600)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _target_devices(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        qemu = value.get("qemu", {})
+        arch = (
+            qemu.arch
+            if isinstance(qemu, QemuConfig)
+            else (qemu.get("arch", "x86_64") if isinstance(qemu, dict) else None)
+        )
+        if arch == "aarch64" and isinstance(value.get("devices", {}), dict):
+            data = dict(value)
+            devices = dict(data.get("devices", {}))
+            devices.setdefault("display_model", "virtio-gpu-pci")
+            data["devices"] = devices
+            return data
+        return value
+
     @property
     def mode(self) -> Literal["visual_only", "hybrid"]:
         return "hybrid" if self.guest_tools.enabled else "visual_only"
@@ -335,6 +378,8 @@ class PaletteConfig(_Strict):
 
     def profile(self, profile_id: str | None) -> Profile:
         wanted = profile_id or self.host.default_profile
+        if wanted == "auto":
+            wanted = native_profile_id()
         try:
             return self.profiles[wanted]
         except KeyError:
@@ -397,6 +442,22 @@ def load_config(root: Path | None = None, *, profiles_dir: Path | None = None) -
                     ErrorCode.INVALID_ARGUMENT,
                     f"profile file {path.name} declares profile_id {profile.profile_id!r}",
                 )
+            image = profile.images.model_copy(
+                update={"base": _trusted_path(profile.images.base, config_root)}
+            )
+            firmware = profile.qemu.firmware.model_copy(
+                update={
+                    key: _trusted_path(value, config_root)
+                    for key, value in profile.qemu.firmware.model_dump().items()
+                    if value is not None
+                }
+            )
+            profile = profile.model_copy(
+                update={
+                    "images": image,
+                    "qemu": profile.qemu.model_copy(update={"firmware": firmware}),
+                }
+            )
             profiles[profile.profile_id] = profile
 
     try:
@@ -405,13 +466,26 @@ def load_config(root: Path | None = None, *, profiles_dir: Path | None = None) -
         raise PaletteError(ErrorCode.INVALID_ARGUMENT, f"palette.toml is invalid: {exc}") from exc
 
     config = PaletteConfig(host=host, profiles=profiles, config_root=config_root)
-    if config.profiles and config.host.default_profile not in config.profiles:
+    selected_default = (
+        native_profile_id()
+        if config.host.default_profile == "auto"
+        else config.host.default_profile
+    )
+    if config.profiles and selected_default not in config.profiles:
         raise PaletteError(
             ErrorCode.INVALID_ARGUMENT,
             f"default_profile {config.host.default_profile!r} is not defined",
             details={"known_profiles": config.profile_ids()},
         )
     return config
+
+
+def _trusted_path(value: str, root: Path) -> str:
+    # Preserve foreign absolute paths in profiles for other hosts; only the selected
+    # profile is used at runtime. Relative paths never depend on the launch directory.
+    if Path(value).is_absolute() or ntpath.isabs(value):
+        return value
+    return str((root / value).resolve())
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

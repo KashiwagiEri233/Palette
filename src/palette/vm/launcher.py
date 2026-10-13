@@ -22,13 +22,15 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 from ..config import HostConfig, Profile
 from ..errors import ErrorCode, PaletteError
+from ..platforms import validate_target
+from .managed import ManagedProcess, SupervisedProcess, finish_cleanup, terminate_process_group
 
 logger = logging.getLogger("palette.vm.launcher")
 
@@ -43,6 +45,7 @@ ENV_WHITELIST = (
     "WINDIR",
     "TEMP",
     "TMP",
+    "TMPDIR",
     "PATH",
     "NUMBER_OF_PROCESSORS",
     "PROCESSOR_ARCHITECTURE",
@@ -53,7 +56,6 @@ ENV_WHITELIST = (
 
 _VERSION_RE = re.compile(r"QEMU emulator version (\S+)")
 _DEVICE_RE = re.compile(r'^\s*name "([^"]+)"', re.MULTILINE)
-_BINARY_NAMES = ("qemu-system-x86_64", "qemu-system-x86_64.exe")
 
 
 @dataclass(slots=True)
@@ -93,6 +95,7 @@ def build_child_env() -> dict[str, str]:
 #: irrelevant one is ignored, so they can be passed unconditionally and type-check.
 CREATION_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 START_NEW_SESSION = sys.platform != "win32"
+IS_WINDOWS = sys.platform == "win32"
 
 
 def run_sync(
@@ -123,27 +126,34 @@ def locate_binary(profile: Profile, host: HostConfig) -> str | None:
     """Resolve the configured QEMU binary without executing anything."""
     configured = profile.qemu.binary
     candidate = Path(configured)
+    name = candidate.name.removesuffix(".exe")
+    if name.startswith("qemu-system-") and name != f"qemu-system-{profile.qemu.arch}":
+        raise PaletteError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"qemu.binary {candidate.name!r} does not match guest architecture {profile.qemu.arch}",
+        )
     if candidate.is_file():
         return str(candidate)
     found = shutil.which(configured)
     if found:
         return found
-    for name in _BINARY_NAMES:
-        found = shutil.which(name)
-        if found:
-            return found
+    # An explicit executable is authoritative. Never replace a missing binary with
+    # another architecture, or silently use a different installation than requested.
+    if candidate.is_absolute() or candidate.parent != Path("."):
+        return None
+    names = (configured, f"{configured}.exe") if not configured.endswith(".exe") else (configured,)
     for search in host.qemu_search_paths:
         directory = Path(search)
         if not directory.is_dir():
             continue
-        for name in _BINARY_NAMES:
+        for name in names:
             candidate = directory / name
             if candidate.is_file():
                 return str(candidate)
         # A qemu release directory nests its executables one level down.
         for nested in sorted(directory.glob("qemu-*")):
             if nested.is_dir():
-                for name in _BINARY_NAMES:
+                for name in names:
                     candidate = nested / name
                     if candidate.is_file():
                         return str(candidate)
@@ -212,6 +222,7 @@ def require_accelerator(profile: Profile, probe: QemuProbe) -> str:
             f"this QEMU build does not offer the {requested!r} accelerator",
             details={"requested": requested, "available": probe.accelerators},
         )
+    validate_target(profile)
     if requested == "tcg" and not profile.qemu.allow_accelerator_fallback:
         # Reaching here means the profile itself asked for TCG. That is allowed for
         # trusted-image debugging only, and never as a fallback from whpx/kvm.
@@ -221,6 +232,64 @@ def require_accelerator(profile: Profile, probe: QemuProbe) -> str:
             profile.profile_id,
         )
     return requested
+
+
+def resolve_firmware(profile: Profile, binary: str) -> Profile:
+    """Resolve architecture-specific firmware without changing trusted configuration."""
+    firmware = profile.qemu.firmware
+    for configured in (firmware.code, firmware.vars):
+        if configured is None:
+            continue
+        name = Path(configured).name.lower()
+        arm = "aavmf" in name or "aarch64" in name or name == "edk2-arm-vars.fd"
+        x86 = "ovmf" in name or "x86_64" in name or "i386" in name
+        if (profile.qemu.arch == "aarch64" and x86) or (profile.qemu.arch == "x86_64" and arm):
+            raise PaletteError(
+                ErrorCode.IMAGE_INVALID, "firmware does not match guest architecture"
+            )
+        if not Path(configured).is_file():
+            raise PaletteError(ErrorCode.IMAGE_MISSING, f"firmware file is missing: {configured}")
+    if profile.qemu.arch != "aarch64":
+        return profile
+    directories = [
+        Path(binary).resolve().parent.parent / "share" / "qemu",
+        Path(binary).resolve().parent / "share",
+        Path("/opt/homebrew/share/qemu"),
+        Path("/usr/local/share/qemu"),
+        Path("/usr/share/qemu"),
+        Path("/usr/share/AAVMF"),
+    ]
+    resolved: dict[str, str] = {}
+    for key, configured, names in (
+        ("code", firmware.code, ("edk2-aarch64-code.fd", "AAVMF_CODE.fd")),
+        ("vars", firmware.vars, ("edk2-arm-vars.fd", "AAVMF_VARS.fd")),
+    ):
+        path = (
+            Path(configured)
+            if configured
+            else next(
+                (
+                    directory / name
+                    for directory in directories
+                    for name in names
+                    if (directory / name).is_file()
+                ),
+                None,
+            )
+        )
+        if path is None or not path.is_file():
+            raise PaletteError(
+                ErrorCode.IMAGE_MISSING,
+                f"AArch64 UEFI {key} is missing; set qemu.firmware.{key} in the profile",
+            )
+        resolved[key] = str(path.resolve())
+    return profile.model_copy(
+        update={
+            "qemu": profile.qemu.model_copy(
+                update={"firmware": firmware.model_copy(update=resolved)}
+            )
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +350,8 @@ class LaunchPlan:
     cwd: Path
     accelerator: str
     notes: list[str] = field(default_factory=list)
+    memory_limit_bytes: int | None = None
+    max_runtime_seconds: float | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -394,7 +465,10 @@ def build_launch_plan(
     if qemu.cpu:
         argv += ["-cpu", qemu.cpu]
     argv += ["-nodefaults", "-display", "none"]
-    argv += ["-nic", network.qemu_nic_argument()]
+    nic = network.qemu_nic_argument()
+    if qemu.arch == "aarch64" and network.attaches_nic and "model=" not in nic:
+        nic += ",model=virtio-net-pci"
+    argv += ["-nic", nic]
     if network.mode == "offline":
         notes.append("no network device attached")
     elif network.mode == "restricted-lab":
@@ -451,6 +525,12 @@ def build_launch_plan(
         cwd=workdir,
         accelerator=accelerator or qemu.accelerator,
         notes=notes,
+        memory_limit_bytes=(
+            resources.process_memory_limit_mib * 1024 * 1024
+            if resources.process_memory_limit_mib
+            else None
+        ),
+        max_runtime_seconds=resources.process_max_runtime_seconds,
     )
 
 
@@ -473,7 +553,7 @@ def _block_args(*, overlay_path: Path, profile: Profile, notes: list[str]) -> li
     )
     format_node = json.dumps(
         {
-            "driver": profile.images.format,
+            "driver": "qcow2",
             "file": "disk-file",
             "node-name": "disk",
             "read-only": False,
@@ -490,15 +570,51 @@ def _block_args(*, overlay_path: Path, profile: Profile, notes: list[str]) -> li
     ]
 
 
-async def spawn_qemu(plan: LaunchPlan) -> asyncio.subprocess.Process:
+async def spawn_qemu(
+    plan: LaunchPlan, *, on_spawn: Callable[[ManagedProcess], None] | None = None
+) -> ManagedProcess:
     """Start QEMU detached from Palette's own standard streams.
 
     ``stdin``/``stdout`` are the QMP pipe; MCP's stdout must stay clean, so QEMU's
     diagnostics go to a separate ``stderr`` pipe that the manager consumes continuously
     (an unread stderr pipe would eventually block the guest).
     """
+    task = asyncio.create_task(_spawn_qemu(plan, on_spawn=on_spawn))
     try:
-        return await asyncio.create_subprocess_exec(
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        process = await finish_cleanup(task)
+        await finish_cleanup(asyncio.create_task(_dispose_spawned(process)))
+        raise
+
+
+async def _dispose_spawned(process: ManagedProcess) -> None:
+    """Before ownership reaches the manager, cleanup owns and drains every output pipe."""
+    if process.stdin is not None:
+        process.stdin.close()
+    process.kill()
+
+    async def drain(reader: asyncio.StreamReader | None) -> None:
+        if reader is not None:
+            while await reader.read(65536):
+                pass
+
+    try:
+        async with asyncio.timeout(10):
+            await asyncio.gather(process.wait(), drain(process.stdout), drain(process.stderr))
+    except TimeoutError as exc:
+        raise PaletteError(
+            ErrorCode.TIMEOUT, "spawned process cleanup could not be confirmed"
+        ) from exc
+
+
+async def _spawn_qemu(
+    plan: LaunchPlan, *, on_spawn: Callable[[ManagedProcess], None] | None = None
+) -> ManagedProcess:
+    try:
+        if not IS_WINDOWS:
+            return await _spawn_supervisor(plan, on_spawn=on_spawn)
+        process = await asyncio.create_subprocess_exec(
             *plan.argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -510,6 +626,9 @@ async def spawn_qemu(plan: LaunchPlan) -> asyncio.subprocess.Process:
             creationflags=CREATION_FLAGS,
             start_new_session=START_NEW_SESSION,
         )
+        if on_spawn is not None:
+            on_spawn(process)
+        return process
     except FileNotFoundError as exc:
         raise PaletteError(
             ErrorCode.QEMU_NOT_FOUND, "the configured QEMU executable could not be started"
@@ -520,6 +639,112 @@ async def spawn_qemu(plan: LaunchPlan) -> asyncio.subprocess.Process:
         ) from exc
 
 
+def spawn_supervised_child(argv: Sequence[str]) -> subprocess.Popen[bytes]:
+    """Called only by the POSIX supervisor; all child spawning stays in this module."""
+    return subprocess.Popen(  # noqa: S603
+        list(argv),
+        stdin=0,
+        stdout=1,
+        stderr=2,
+        env=build_child_env(),
+        close_fds=True,
+        start_new_session=True,
+    )
+
+
+async def _spawn_supervisor(
+    plan: LaunchPlan, *, on_spawn: Callable[[ManagedProcess], None] | None = None
+) -> SupervisedProcess:
+    live_read, live_write = os.pipe()
+    status_read, status_write = os.pipe()
+    supervisor: asyncio.subprocess.Process | None = None
+    handle: SupervisedProcess | None = None
+    transport: asyncio.ReadTransport | None = None
+    try:
+        reader = asyncio.StreamReader(limit=8192)
+        protocol = asyncio.StreamReaderProtocol(reader)
+        pipe = os.fdopen(status_read, "rb", buffering=0)
+        status_read = -1
+        try:
+            transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+                lambda: protocol, pipe
+            )
+        except BaseException:
+            pipe.close()
+            raise
+        supervisor = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            "-m",
+            "palette.vm.supervisor",
+            "--liveness-fd",
+            str(live_read),
+            "--status-fd",
+            str(status_write),
+            "--memory-limit",
+            str(plan.memory_limit_bytes or 0),
+            "--runtime-limit",
+            str(plan.max_runtime_seconds or 0),
+            "--",
+            *plan.argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(plan.cwd),
+            env=plan.env,
+            pass_fds=(live_read, status_write),
+            close_fds=True,
+            start_new_session=True,
+            limit=STREAM_LIMIT,
+        )
+        handle = SupervisedProcess(supervisor, reader, transport, live_write)
+        live_write = -1
+        if on_spawn is not None:
+            on_spawn(handle)
+        os.close(live_read)
+        live_read = -1
+        os.close(status_write)
+        status_write = -1
+        await asyncio.wait_for(handle.ready(), timeout=15)
+        return handle
+    except BaseException:
+        if handle is not None:
+            handle.close()
+            await finish_cleanup(asyncio.create_task(_dispose_spawned(handle)))
+        elif supervisor is not None:
+            if live_write >= 0:
+                os.close(live_write)
+                live_write = -1
+            communication = asyncio.create_task(supervisor.communicate())
+            await finish_cleanup(asyncio.create_task(_stop_tool(supervisor, communication)))
+        raise
+    finally:
+        if handle is None and transport is not None:
+            transport.close()
+        for fd in (live_read, live_write, status_read, status_write):
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+
+async def _stop_tool(
+    process: asyncio.subprocess.Process,
+    communication: asyncio.Task[tuple[bytes, bytes]],
+) -> None:
+    try:
+        if not await asyncio.to_thread(terminate_process_group, process.pid):
+            raise PaletteError(ErrorCode.TIMEOUT, "helper process tree exit could not be confirmed")
+        async with asyncio.timeout(5):
+            await asyncio.shield(communication)
+    except BaseException as exc:
+        communication.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await communication
+        if isinstance(exc, TimeoutError):
+            raise PaletteError(ErrorCode.TIMEOUT, "helper output pipe cleanup timed out") from exc
+        raise
+
+
 async def run_tool(
     argv: list[str],
     *,
@@ -527,8 +752,8 @@ async def run_tool(
     cwd: Path | None = None,
 ) -> tuple[int, str, str]:
     """Run a QEMU-family helper (``qemu-img``) with a fixed argument vector."""
-    try:
-        process = await asyncio.create_subprocess_exec(
+    spawn = asyncio.create_task(
+        asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -537,16 +762,25 @@ async def run_tool(
             creationflags=CREATION_FLAGS,
             start_new_session=START_NEW_SESSION,
         )
+    )
+    try:
+        process = await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        process = await finish_cleanup(spawn)
+        communication = asyncio.create_task(process.communicate())
+        await finish_cleanup(asyncio.create_task(_stop_tool(process, communication)))
+        raise
     except FileNotFoundError as exc:
         raise PaletteError(
             ErrorCode.QEMU_NOT_FOUND, f"helper executable {argv[0]!r} was not found"
         ) from exc
+    communication = asyncio.create_task(process.communicate())
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-    except TimeoutError:
-        process.kill()
-        with contextlib.suppress(Exception):
-            await process.wait()
+        stdout, stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=timeout)
+    except (TimeoutError, asyncio.CancelledError) as exc:
+        await finish_cleanup(asyncio.create_task(_stop_tool(process, communication)))
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         raise PaletteError(ErrorCode.TIMEOUT, "helper executable timed out") from None
     return (
         process.returncode or 0,

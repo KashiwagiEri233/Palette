@@ -175,6 +175,7 @@ class QmpClient:
         arguments: dict[str, Any] | None = None,
         *,
         timeout: float | None = None,
+        on_sending: Callable[[], None] | None = None,
     ) -> Any:
         """Send one command and await its matching response.
 
@@ -198,15 +199,11 @@ class QmpClient:
 
         future: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
         self._pending[message_id] = future
-        try:
-            await self._transport.send_json(payload)
-        except BaseException:
-            self._pending.pop(message_id, None)
-            raise
-
         effective = self._command_timeout if timeout is None else timeout
         try:
-            response = await asyncio.wait_for(future, timeout=effective)
+            async with asyncio.timeout(effective):
+                await self._transport.send_json(payload, on_sending=on_sending)
+                response = await future
         except TimeoutError:
             self._pending.pop(message_id, None)
             raise PaletteError(
@@ -214,9 +211,12 @@ class QmpClient:
                 f"QMP command {command!r} timed out; its effect is unknown",
                 details={"command": command, "timeout_seconds": effective},
             ) from None
-        except asyncio.CancelledError:
+        finally:
             self._pending.pop(message_id, None)
-            raise
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
 
         if "error" in response:
             error = response["error"]

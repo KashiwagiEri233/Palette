@@ -12,6 +12,7 @@ working on its own.
 | [`../README.md`](../README.md) · [中文](../README.zh-CN.md) | you want the one-paragraph summary and the safety defaults |
 | [`user-guide.md`](user-guide.md) · [中文](user-guide.zh-CN.md) | you are the agent or the client author: the tool contracts, the loop, the limits |
 | [`operator.md`](operator.md) · [中文](operator.zh-CN.md) | you run the host: install, profiles, lifecycle, emergency stop, recovery |
+| [`platforms.md`](platforms.md) · [中文](platforms.zh-CN.md) | you choose Windows/macOS/Linux, a native guest or explicit TCG, firmware and resource limits |
 | [`guest-template.md`](guest-template.md) · [中文](guest-template.zh-CN.md) | you are building the desktop image the profile points at |
 | [`threat-model.md`](threat-model.md) · [中文](threat-model.zh-CN.md) | you need to know what is trusted, what is enforced, and what is out of scope |
 | [`benchmarks.md`](benchmarks.md) · [中文](benchmarks.zh-CN.md) | you are measuring performance, or wondering whether anything has been measured |

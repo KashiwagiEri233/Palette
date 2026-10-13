@@ -54,6 +54,9 @@ def cmd_create(argv: list[str]) -> int:
         print("create needs an output filename", file=sys.stderr)
         return 1
     output = positional[-1]
+    if options["flags"].get("-f") == "raw" and "-b" in options["flags"]:
+        print("raw images do not support backing files", file=sys.stderr)
+        return 1
     chain = {
         "driver": options["flags"].get("-f", "qcow2"),
         "backing": options["flags"].get("-b"),
@@ -94,11 +97,28 @@ def cmd_info(argv: list[str]) -> int:
     }
     if chain.get("backing"):
         document["backing-filename"] = chain["backing"]
+        document["full-backing-filename"] = os.path.abspath(
+            os.path.join(os.path.dirname(target), chain["backing"])
+        )
         if chain.get("backing_format"):
             document["backing-filename-format"] = chain["backing_format"]
 
     if options["flags"].get("--output") == "json":
-        print(json.dumps(document))
+        if "--backing-chain" in options["flags"]:
+            documents = [document]
+            seen = {os.path.abspath(target)}
+            while chain.get("backing"):
+                target = os.path.abspath(os.path.join(os.path.dirname(target), chain["backing"]))
+                if target in seen:
+                    return 1
+                seen.add(target)
+                chain = _read_chain(target)
+                if chain is None:
+                    return 1
+                documents.append({"filename": target, "format": chain.get("driver", "qcow2")})
+            print(json.dumps(documents))
+        else:
+            print(json.dumps(document))
     else:
         for key, value in document.items():
             print(f"{key}: {value}")
@@ -110,7 +130,7 @@ def _read_chain(path: str) -> dict | None:
         with open(path, "rb") as handle:
             head = handle.read(4)
             if head != MAGIC:
-                return {}
+                return {"driver": "raw"}
             payload = handle.read()
         return json.loads(payload.decode("utf-8"))
     except FileNotFoundError:

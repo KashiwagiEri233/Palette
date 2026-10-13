@@ -11,13 +11,15 @@ the managed runtime root, so a mistaken identifier cannot turn into a recursive 
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import shutil
 import subprocess
-import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +56,12 @@ class InstancePaths:
             "logs": str(self.logs),
             "manifest": str(self.manifest),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ImageInfo:
+    format: str
+    chain: tuple[Path, ...]
 
 
 def sha256_file(path: Path, *, chunk_size: int = _HASH_CHUNK) -> str:
@@ -172,12 +180,27 @@ class ImageManager:
             info["ok"] = False
             info["reason"] = "missing"
             return info
-        expected_suffix = "." + self.profile.images.format
-        if base.suffix.lower() != expected_suffix and not (
-            self.profile.images.format == "qcow2" and base.suffix.lower() == ".qcow2"
-        ):
+        if not self.qemu_img_argv:
             info["ok"] = False
-            info["reason"] = f"extension does not match declared format {expected_suffix}"
+            info["reason"] = "qemu-img is required to verify the base image format"
+            return info
+        try:
+            result = run_sync(
+                [*self.qemu_img_argv, "info", "--output=json", str(base)], timeout=60.0
+            )
+            actual: Any = json.loads(result.stdout or "{}")
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            info["ok"] = False
+            info["reason"] = "qemu-img could not inspect the base image"
+            return info
+        if result.returncode != 0 or not isinstance(actual, dict):
+            info["ok"] = False
+            info["reason"] = "qemu-img could not inspect the base image"
+            return info
+        info["actual_format"] = actual.get("format")
+        if actual.get("format") != self.profile.images.format:
+            info["ok"] = False
+            info["reason"] = "actual disk format does not match the profile"
             return info
         info["size_bytes"] = base.stat().st_size
         info["ok"] = True
@@ -217,12 +240,11 @@ class ImageManager:
         disk_dir = root / "disk"
         frames = root / "frames"
         logs = root / "logs"
-        for directory in (root, disk_dir, frames, logs):
-            directory.mkdir(parents=True, exist_ok=True)
+        root.mkdir(parents=True, exist_ok=False)
         hardware_vars: Path | None = None
         if self.profile.qemu.firmware.vars:
             hardware_vars = disk_dir / "vars.fd"
-        return InstancePaths(
+        paths = InstancePaths(
             vm_id=vm_id,
             instance_id=instance_id,
             root=root,
@@ -233,6 +255,19 @@ class ImageManager:
             manifest=root / "manifest.json",
             hardware_vars=hardware_vars,
         )
+        try:
+            self.write_manifest(paths, {"state": "STARTING", "process_exited": False})
+            for directory in (disk_dir, frames, logs):
+                directory.mkdir()
+        except Exception:
+            if self.read_manifest(vm_id, instance_id) is not None:
+                self.delete_instance(vm_id, instance_id)
+            else:
+                # A failed manifest write never authorizes recursive deletion.
+                with contextlib.suppress(OSError):
+                    root.rmdir()
+            raise
+        return paths
 
     def stage_firmware_vars(self, paths: InstancePaths) -> None:
         """Copy the read-only variable template into the instance's writable store."""
@@ -262,10 +297,10 @@ class ImageManager:
         a different file has chosen to step outside that. The writable layer is still ours,
         still per-instance, and reset still throws it away.
         """
-        overlay_format = self.profile.images.format
+        overlay_format = "qcow2"
         backing_format: str
         if base is None:
-            backing = self.require_base_image()
+            backing = (await asyncio.to_thread(self.require_base_image)).resolve()
             backing_format = self.profile.images.format
         else:
             backing = _validate_caller_image(base)
@@ -280,6 +315,12 @@ class ImageManager:
             raise PaletteError(
                 ErrorCode.QEMU_NOT_FOUND,
                 "qemu-img was not found; it is required to create an instance overlay",
+            )
+        actual = await self.inspect_image(backing)
+        if actual.format != backing_format:
+            raise PaletteError(
+                ErrorCode.IMAGE_INVALID,
+                "the base image's actual format does not match its declaration",
             )
         overlay = self.guard.resolve("vms", paths.vm_id, paths.instance_id, "disk", "overlay.qcow2")
         if overlay.exists():
@@ -304,25 +345,74 @@ class ImageManager:
                 "qemu-img could not create the instance overlay",
                 details={"exit_code": code, "stderr_tail": stderr.strip()[-400:]},
             )
-        self._verify_backing_chain(overlay, backing)
+        info = await self._verify_backing_chain(overlay, backing, backing_format)
+        self.update_manifest(
+            paths,
+            {
+                "base_image": str(backing),
+                "base_format": backing_format,
+                "base_from_caller": base is not None,
+                "overlay_format": overlay_format,
+                "backing_chain": [str(path) for path in info.chain[1:]],
+            },
+        )
         return overlay
 
-    def _verify_backing_chain(self, overlay: Path, base: Path) -> None:
+    async def inspect_image(self, path: Path, *, image_format: str | None = None) -> ImageInfo:
+        """Inspect the actual format and full dependency chain before opening a disk."""
+        if not self.qemu_img_argv:
+            raise PaletteError(ErrorCode.QEMU_NOT_FOUND, "qemu-img is not configured")
+        argv = [*self.qemu_img_argv, "info", "--backing-chain", "--output=json"]
+        if image_format is not None:
+            argv += ["-f", image_format]
+        code, stdout, _stderr = await run_tool([*argv, str(path)], timeout=60.0)
+        if code != 0:
+            raise PaletteError(ErrorCode.IMAGE_INVALID, "qemu-img could not inspect the disk")
+        try:
+            parsed: Any = json.loads(stdout)
+        except json.JSONDecodeError:
+            raise PaletteError(
+                ErrorCode.IMAGE_INVALID, "qemu-img returned unreadable JSON"
+            ) from None
+        entries = parsed if isinstance(parsed, list) else [parsed]
+        if not entries or any(not isinstance(entry, dict) for entry in entries):
+            raise PaletteError(
+                ErrorCode.IMAGE_INVALID, "qemu-img returned an invalid backing chain"
+            )
+        image_format = entries[0].get("format")
+        if image_format not in {"raw", "qcow2"}:
+            raise PaletteError(ErrorCode.IMAGE_INVALID, "only raw and qcow2 disks are supported")
+        chain: list[Path] = []
+        previous = path.resolve()
+        for entry in entries:
+            filename = entry.get("filename")
+            if not isinstance(filename, str):
+                raise PaletteError(ErrorCode.IMAGE_INVALID, "the disk chain has no filename")
+            current = Path(filename)
+            if not current.is_absolute():
+                current = previous.parent / current
+            previous = current.resolve()
+            chain.append(previous)
+        return ImageInfo(format=str(image_format), chain=tuple(chain))
+
+    async def _verify_backing_chain(
+        self, overlay: Path, base: Path, backing_format: str
+    ) -> ImageInfo:
         """Fail unless the overlay's recorded backing file is exactly the trusted base."""
         if not self.qemu_img_argv:  # pragma: no cover - create_overlay checks first
             raise PaletteError(ErrorCode.QEMU_NOT_FOUND, "qemu-img is not configured")
         try:
-            result = run_sync(
+            code, stdout, _stderr = await run_tool(
                 [*self.qemu_img_argv, "info", "--output=json", str(overlay)], timeout=60.0
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise PaletteError(
                 ErrorCode.IMAGE_INVALID, "could not read back the overlay's backing chain"
             ) from exc
-        if result.returncode != 0:
+        if code != 0:
             raise PaletteError(ErrorCode.IMAGE_INVALID, "qemu-img info failed for the new overlay")
         try:
-            parsed: Any = json.loads(result.stdout or "{}")
+            parsed: Any = json.loads(stdout or "{}")
         except json.JSONDecodeError:
             raise PaletteError(
                 ErrorCode.IMAGE_INVALID, "qemu-img info returned unreadable JSON"
@@ -330,34 +420,43 @@ class ImageManager:
         if not isinstance(parsed, dict):
             raise PaletteError(ErrorCode.IMAGE_INVALID, "qemu-img info returned unreadable JSON")
         info: dict[str, Any] = parsed
-        backing = info.get("backing-filename")
-        if backing is None or Path(backing).resolve() != base.resolve():
+        backing = info.get("full-backing-filename", info.get("backing-filename"))
+        actual = Path(backing) if isinstance(backing, str) else None
+        if actual is not None and not actual.is_absolute():
+            actual = overlay.parent / actual
+        if actual is None or actual.resolve() != base.resolve():
             raise PaletteError(
                 ErrorCode.IMAGE_INVALID,
                 "the new overlay does not point at the trusted base image",
             )
-        backing_format = info.get("backing-filename-format")
-        if backing_format and backing_format != self.profile.images.format:
+        if info.get("format") != "qcow2" or info.get("backing-filename-format") != backing_format:
             raise PaletteError(
                 ErrorCode.IMAGE_INVALID,
-                "the overlay's declared backing format does not match the profile",
+                "the overlay's declared format or backing format is incorrect",
             )
+        return await self.inspect_image(overlay, image_format="qcow2")
 
     # -- manifests -------------------------------------------------------------------
     def write_manifest(self, paths: InstancePaths, payload: dict[str, Any]) -> None:
         import os
 
         document = {
+            "created_at": _iso_now(),
+            **payload,
             "vm_id": paths.vm_id,
             "instance_id": paths.instance_id,
             "profile_id": self.profile.profile_id,
-            "created_at": _iso_now(),
-            **payload,
         }
-        target = paths.manifest
-        temporary = target.with_suffix(".json.tmp")
+        target = self.guard.resolve("vms", paths.vm_id, paths.instance_id, "manifest.json")
+        temporary = self.guard.resolve("vms", paths.vm_id, paths.instance_id, "manifest.json.tmp")
         temporary.write_text(json.dumps(document, indent=2), encoding="utf-8")
         os.replace(temporary, target)
+
+    def update_manifest(self, paths: InstancePaths, changes: dict[str, Any]) -> None:
+        document = self.read_manifest(paths.vm_id, paths.instance_id)
+        if document is None:
+            raise PaletteError(ErrorCode.PATH_DENIED, "the instance manifest is missing or invalid")
+        self.write_manifest(paths, {**document, **changes, "updated_at": _iso_now()})
 
     def read_manifest(self, vm_id: str, instance_id: str) -> dict[str, Any] | None:
         try:
@@ -371,7 +470,11 @@ class ImageManager:
         except (OSError, json.JSONDecodeError):
             logger.warning("unreadable manifest for %s/%s", vm_id, instance_id)
             return None
-        return parsed if isinstance(parsed, dict) else None
+        if not isinstance(parsed, dict):
+            return None
+        if parsed.get("vm_id") != vm_id or parsed.get("instance_id") != instance_id:
+            return None
+        return parsed
 
     def list_instances(self, vm_id: str) -> list[dict[str, Any]]:
         validate_identifier(vm_id, what="vm_id")
@@ -383,16 +486,20 @@ class ImageManager:
             return []
         entries: list[dict[str, Any]] = []
         for child in sorted(root.iterdir()):
-            if not child.is_dir():
+            if not child.is_dir() or child.is_symlink():
                 continue
-            manifest = child / "manifest.json"
             record: dict[str, Any] = {"instance_id": child.name, "root": str(child)}
-            if manifest.is_file():
-                try:
-                    record.update(json.loads(manifest.read_text(encoding="utf-8")))
-                except (OSError, json.JSONDecodeError):
-                    record["manifest_error"] = True
-            record["overlay_bytes"] = _directory_bytes(child / "disk")
+            manifest = self.read_manifest(vm_id, child.name)
+            if manifest is None:
+                record["manifest_error"] = True
+            else:
+                record.update(manifest)
+            try:
+                record["overlay_bytes"] = _directory_bytes(
+                    self.guard.resolve("vms", vm_id, child.name, "disk")
+                )
+            except PaletteError:
+                record["manifest_error"] = True
             entries.append(record)
         return entries
 
@@ -420,35 +527,92 @@ class ImageManager:
         shutil.rmtree(root, ignore_errors=False)
         return True
 
-    def prune_instances(self, vm_id: str, *, keep_instance_ids: set[str]) -> list[str]:
+    def prune_instances(
+        self, vm_id: str, *, keep_instance_ids: set[str], protected_paths: tuple[Path, ...] = ()
+    ) -> list[str]:
         """Remove old instances beyond the retention limit, newest kept first."""
-        if self.keep_overlays is False:
-            keep_instance_ids = set(keep_instance_ids)
+        records: dict[Path, dict[str, Any]] = {}
+        vms = self.guard.resolve("vms")
+        if not vms.is_dir():
+            return []
+        for directory in vms.iterdir():
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            try:
+                for entry in self.list_instances(directory.name):
+                    records[Path(entry["root"])] = entry
+            except PaletteError:
+                continue
         candidates = [
             entry
-            for entry in self.list_instances(vm_id)
-            if entry.get("instance_id") not in keep_instance_ids
+            for entry in records.values()
+            if entry.get("vm_id") == vm_id
+            and entry.get("instance_id") not in keep_instance_ids
+            and entry.get("state") in {"STOPPED", "FAILED"}
+            and entry.get("process_exited") is True
+            and not entry.get("manifest_error")
         ]
         candidates.sort(key=lambda entry: str(entry.get("created_at", "")), reverse=True)
-        surplus = candidates[self.max_overlays :]
+        surplus = candidates[self.max_overlays if self.keep_overlays else 0 :]
+        pending = {Path(entry["root"]) for entry in surplus}
+
+        def owners(paths: list[str] | tuple[Path, ...]) -> set[Path]:
+            result: set[Path] = set()
+            for path in paths:
+                resolved = Path(path).resolve()
+                result.update(root for root in records if resolved.is_relative_to(root))
+            return result
+
+        dependencies: dict[Path, set[Path]] = {}
+        for root, entry in records.items():
+            paths = [
+                entry[key]
+                for key in ("base_image", "firmware_code", "firmware_vars")
+                if isinstance(entry.get(key), str)
+            ]
+            for key in ("backing_chain", "attached_volumes", "volume_backing_chain"):
+                value = entry.get(key, [])
+                if isinstance(value, list):
+                    paths.extend(item for item in value if isinstance(item, str))
+            dependencies[root] = owners(paths) - {root}
+
+        def protect(roots: set[Path]) -> None:
+            seen: set[Path] = set()
+            while roots:
+                root = roots.pop()
+                if root in seen:
+                    continue
+                seen.add(root)
+                pending.discard(root)
+                roots.update(dependencies.get(root, set()) - seen)
+
+        protect((set(records) - pending) | owners(protected_paths))
         removed: list[str] = []
-        for entry in surplus:
-            instance_id = str(entry.get("instance_id"))
+        while pending:
+            referenced = set().union(*(dependencies[root] for root in pending))
+            ready = pending - referenced
+            if not ready:
+                logger.warning("retention kept a cyclic disk dependency for %s", vm_id)
+                break
+            root = min(ready, key=lambda path: str(records[path].get("created_at", "")))
+            pending.remove(root)
+            instance_id = str(records[root]["instance_id"])
             try:
                 if self.delete_instance(vm_id, instance_id):
                     removed.append(instance_id)
-            except PaletteError as exc:
-                logger.warning("prune skipped %s/%s: %s", vm_id, instance_id, exc.code)
+            except (PaletteError, OSError) as exc:
+                protect(set(dependencies[root]))
+                logger.warning("prune skipped %s/%s: %s", vm_id, instance_id, type(exc).__name__)
         return removed
 
 
 def _directory_bytes(path: Path) -> int:
-    if not path.is_dir():
+    if not path.is_dir() or path.is_symlink():
         return 0
     total = 0
     for child in path.rglob("*"):
         try:
-            if child.is_file():
+            if child.is_file() and not child.is_symlink():
                 total += child.stat().st_size
         except OSError:
             continue
@@ -456,4 +620,4 @@ def _directory_bytes(path: Path) -> int:
 
 
 def _iso_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+    return datetime.now().astimezone().isoformat()

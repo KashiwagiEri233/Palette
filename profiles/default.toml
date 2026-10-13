@@ -30,7 +30,7 @@ machine = "q35"
 
 [images]
 # Absolute path to the read-only template disk. Replace this with the real artefact.
-base = "G:/Workspace/Palette/images/debian-13-xfce-desktop.qcow2"
+base = "images/debian-13-xfce-x86_64.qcow2"
 format = "qcow2"
 # Fill in after building the template; until then doctor reports the image as unverified.
 # sha256 = "<64 hex characters>"

@@ -197,6 +197,7 @@ class TestCommandLine:
                 f"qemu_img = '{sys.executable}'\n"
                 f"qemu_img_prefix = ['-I', '{(FAKE_QEMU.parent / 'fake_qemu_img.py').as_posix()}']\n"
                 'version_pin = "11.1"\n'
+                'accelerator = "tcg"\n'
                 "[images]\n"
                 f"base = '{base_image.as_posix()}'\n"
             ),

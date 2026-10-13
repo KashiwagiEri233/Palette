@@ -9,6 +9,7 @@ channel from quietly becoming a guest shell.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -69,9 +70,20 @@ class GuestToolOutcome:
 class GuestToolBackend(Protocol):
     async def capabilities(self) -> GuestCapabilities: ...
     async def input_text(
-        self, *, text: str, method: str, target: str = "focused"
+        self,
+        *,
+        text: str,
+        method: str,
+        target: str = "focused",
+        on_sending: Callable[[], None] | None = None,
     ) -> GuestToolOutcome: ...
-    async def launch_app(self, *, app_id: str, options: dict[str, object]) -> GuestToolOutcome: ...
+    async def launch_app(
+        self,
+        *,
+        app_id: str,
+        options: dict[str, object],
+        on_sending: Callable[[], None] | None = None,
+    ) -> GuestToolOutcome: ...
     async def close(self) -> None: ...
 
 
@@ -90,7 +102,12 @@ class DisabledGuestToolBackend:
         )
 
     async def input_text(
-        self, *, text: str, method: str, target: str = "focused"
+        self,
+        *,
+        text: str,
+        method: str,
+        target: str = "focused",
+        on_sending: Callable[[], None] | None = None,
     ) -> GuestToolOutcome:
         raise PaletteError(
             ErrorCode.GUEST_TOOL_UNAVAILABLE,
@@ -98,7 +115,13 @@ class DisabledGuestToolBackend:
             details={"hint": "use vm_act with type_text for US-ASCII keyboard input"},
         )
 
-    async def launch_app(self, *, app_id: str, options: dict[str, object]) -> GuestToolOutcome:
+    async def launch_app(
+        self,
+        *,
+        app_id: str,
+        options: dict[str, object],
+        on_sending: Callable[[], None] | None = None,
+    ) -> GuestToolOutcome:
         raise PaletteError(
             ErrorCode.GUEST_TOOL_UNAVAILABLE,
             "guest application launching is not enabled for this profile",
@@ -141,7 +164,12 @@ class MockGuestToolBackend:
         )
 
     async def input_text(
-        self, *, text: str, method: str, target: str = "focused"
+        self,
+        *,
+        text: str,
+        method: str,
+        target: str = "focused",
+        on_sending: Callable[[], None] | None = None,
     ) -> GuestToolOutcome:
         self.calls.append(("input_text", {"length": len(text), "method": method, "target": target}))
         if self.fail_with is not None:
@@ -162,6 +190,8 @@ class MockGuestToolBackend:
                 ErrorCode.INPUT_TARGET_UNSUPPORTED,
                 "only the currently focused control is supported",
             )
+        if on_sending is not None:
+            on_sending()
         return GuestToolOutcome(
             ok=True,
             effect_state=EffectState.SUBMITTED,
@@ -169,7 +199,13 @@ class MockGuestToolBackend:
             detail="the guest service accepted the text; the application may not have consumed it",
         )
 
-    async def launch_app(self, *, app_id: str, options: dict[str, object]) -> GuestToolOutcome:
+    async def launch_app(
+        self,
+        *,
+        app_id: str,
+        options: dict[str, object],
+        on_sending: Callable[[], None] | None = None,
+    ) -> GuestToolOutcome:
         self.calls.append(("launch_app", {"app_id": app_id, "option_keys": sorted(options)}))
         if self.fail_with is not None:
             raise self.fail_with
@@ -184,6 +220,8 @@ class MockGuestToolBackend:
                 f"application {app_id!r} is not registered in the guest",
                 details={"allowed_apps": sorted(self.apps)},
             )
+        if on_sending is not None:
+            on_sending()
         return GuestToolOutcome(
             ok=True,
             effect_state=EffectState.SUBMITTED,

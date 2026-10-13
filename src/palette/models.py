@@ -351,6 +351,13 @@ class VmStatus(BaseModel):
     profile_id: str | None = None
     instance_id: str | None = None
     state: str
+    host_arch: str | None = None
+    guest_arch: str | None = None
+    accelerator: str | None = None
+    cross_architecture: bool = False
+    process_protection: str | None = None
+    memory_enforcement: str | None = None
+    memory_sample_interval_ms: int | None = None
     boot_epoch: int = 0
     display_epoch: int = 0
     controller_epoch: int = 0

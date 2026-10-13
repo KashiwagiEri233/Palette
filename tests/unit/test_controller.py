@@ -8,9 +8,12 @@ become a silent retry, and a cancelled drag must not leave the mouse button down
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from palette.audit import NullAuditLog
 from palette.config import CaptureConfig, Profile, ResourcesConfig
@@ -759,13 +762,19 @@ class TestEffectStates:
             # Let the observation and the pre-action size check through; hold the post-action
             # capture, so the timeout lands *after* the input was sent.
             capture.hold_after(2)
-            with pytest.raises(PaletteError) as info:
-                await h.controller.act(
-                    request_id="r1",
-                    frame_id=frame.frame_id,
-                    action_payload={"type": "move", "x": 1, "y": 1},
-                )
-            assert info.value.code is ErrorCode.ACTION_OUTCOME_UNKNOWN
+            result, _ = await h.controller.act(
+                request_id="r1",
+                frame_id=frame.frame_id,
+                action_payload={"type": "move", "x": 1, "y": 1},
+            )
+            assert result.error.code == ErrorCode.ACTION_OUTCOME_UNKNOWN
+            assert result.effect_state == "submitted"
+            replay, png = await h.controller.act(
+                request_id="r1",
+                frame_id=frame.frame_id,
+                action_payload={"type": "move", "x": 1, "y": 1},
+            )
+            assert replay.deduplicated and png is None
             # The pointer really did move before the capture stalled, which is exactly why
             # the outcome is "unknown" rather than "nothing happened". Image pixel (1, 1)
             # of a 320x200 frame maps to round(1*32767/319)=103, round(1*32767/199)=165.
@@ -846,12 +855,180 @@ class TestLedgerAndRelease:
             assert result.ok is True
             # The click had already pressed the button, so the release must have undone it.
             assert ("left", False) in h.qmp.buttons()
-            task.cancel()
-            with pytest.raises((asyncio.CancelledError, PaletteError)):
-                await task
+            interrupted, _ = await task
+            assert not interrupted.ok
+            assert interrupted.frame is None
             # Nothing may be left held after a cancellation path.
             assert h.controller.ledger_snapshot() == {"keys": [], "buttons": []}
             capture.release()
+
+
+class TestTransactionRegressions:
+    @pytest.mark.parametrize("mode", ["changed", "stable"])
+    async def test_wait_success_returns_the_frame_png(self, harness_factory, mode):
+        async with harness_factory() as h:
+            frame, _ = await h.controller.observe()
+            if mode == "changed":
+                h.capture.colour = (1, 2, 3)
+            result, png = await h.controller.wait(
+                after_frame_id=frame.frame_id, mode=mode, timeout_ms=1500
+            )
+            assert result.reason == f"content_{mode}"
+            with Image.open(io.BytesIO(png)) as image:
+                image.verify()
+                assert image.size == (result.frame.image_size.width, result.frame.image_size.height)
+
+    async def test_first_send_timeout_is_unknown_and_fences_frame(self, harness_factory):
+        qmp = StubQmp()
+        qmp.failures["input-send-event"] = PaletteError(ErrorCode.TIMEOUT, "reply lost")
+        async with harness_factory(qmp=qmp) as h:
+            frame, _ = await h.controller.observe()
+            result, _ = await h.controller.act(
+                request_id="lost",
+                frame_id=frame.frame_id,
+                action_payload={"type": "key", "keys": ["ENTER"]},
+            )
+            assert result.effect_state == "unknown"
+            assert result.action_seq == 1
+            assert result.error.retryable is False
+            qmp.failures.clear()
+            rejected, _ = await h.controller.act(
+                request_id="old",
+                frame_id=frame.frame_id,
+                action_payload={"type": "key", "keys": ["ENTER"]},
+            )
+            assert rejected.error.code == ErrorCode.STALE_FRAME
+
+    async def test_cancelled_queued_action_never_reaches_qmp(self, harness_factory):
+        capture = BlockingCapture()
+        async with harness_factory(capture=capture) as h:
+            frame, _ = await h.controller.observe()
+            capture.hold()
+            blocker = asyncio.create_task(h.controller.observe())
+            await capture.entered.wait()
+            action = asyncio.create_task(
+                h.controller.act(
+                    request_id="cancel-queued",
+                    frame_id=frame.frame_id,
+                    action_payload={"type": "key", "keys": ["ENTER"]},
+                )
+            )
+            await asyncio.sleep(0)
+            action.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await action
+            capture.release()
+            await blocker
+            await h.controller.observe()
+            assert h.qmp.events() == []
+
+    async def test_cancelled_running_request_keeps_terminal_receipt(self, harness_factory):
+        pressed = asyncio.Event()
+
+        class NotifyingQmp(StubQmp):
+            async def execute(self, *args, **kwargs):
+                result = await super().execute(*args, **kwargs)
+                if self.qcodes():
+                    pressed.set()
+                return result
+
+        async with harness_factory(qmp=NotifyingQmp()) as h:
+            frame, _ = await h.controller.observe()
+            arguments = {
+                "request_id": "cancel-running",
+                "frame_id": frame.frame_id,
+                "action_payload": {"type": "key", "keys": ["ENTER"], "hold_ms": 500},
+            }
+            first = asyncio.create_task(h.controller.act(**arguments))
+            await pressed.wait()
+            duplicate = asyncio.create_task(h.controller.act(**arguments))
+            await asyncio.sleep(0)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            completed, _ = await duplicate
+            assert completed.deduplicated
+            assert completed.effect_state == "partial"
+            assert completed.error.code == ErrorCode.CANCELLED
+            replay, image = await h.controller.act(**arguments)
+            assert replay.deduplicated and image is None
+            assert h.qmp.qcodes() == [("ret", True), ("ret", False)]
+
+    async def test_cancelling_duplicate_does_not_cancel_owner(self, harness_factory):
+        capture = BlockingCapture()
+        async with harness_factory(capture=capture) as h:
+            frame, _ = await h.controller.observe()
+            capture.hold_after(2)
+            arguments = {
+                "request_id": "dup-cancel",
+                "frame_id": frame.frame_id,
+                "action_payload": {"type": "move", "x": 1, "y": 1},
+            }
+            owner = asyncio.create_task(h.controller.act(**arguments))
+            await capture.entered.wait()
+            duplicate = asyncio.create_task(h.controller.act(**arguments))
+            await asyncio.sleep(0)
+            duplicate.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await duplicate
+            capture.release()
+            result, _ = await owner
+            assert result.ok
+            assert len(h.qmp.events()) == 1
+
+    @pytest.mark.parametrize("epoch", ["boot_epoch", "controller_epoch"])
+    async def test_request_ids_are_scoped_to_epochs(self, harness_factory, epoch):
+        async with harness_factory() as h:
+            first_frame, _ = await h.controller.observe()
+            await h.controller.act(
+                request_id="reused",
+                frame_id=first_frame.frame_id,
+                action_payload={"type": "move", "x": 1, "y": 1},
+            )
+            setattr(h.view, epoch, getattr(h.view, epoch) + 1)
+            h.controller.invalidate(reason="epoch changed")
+            frame, _ = await h.controller.observe()
+            result, _ = await h.controller.act(
+                request_id="reused",
+                frame_id=frame.frame_id,
+                action_payload={"type": "move", "x": 2, "y": 2},
+            )
+            assert result.ok and not result.deduplicated
+            assert len(h.qmp.events()) == 2
+
+    async def test_capture_crossing_boot_is_not_registered(self, harness_factory):
+        capture = BlockingCapture()
+        async with harness_factory(capture=capture) as h:
+            capture.hold()
+            observation = asyncio.create_task(h.controller.observe())
+            await capture.entered.wait()
+            h.view.boot_epoch += 1
+            capture.release()
+            with pytest.raises(PaletteError) as error:
+                await observation
+            assert error.value.code == ErrorCode.STALE_FRAME
+            assert h.controller.latest_frame is None
+
+    async def test_guest_resize_is_rejected_before_backend_send(self, harness_factory):
+        async with harness_factory() as h:
+            frame, _ = await h.controller.observe()
+            h.capture.width = 640
+            sends = []
+
+            async def runner(on_sending):
+                sends.append(True)
+                pytest.fail("a resized frame must not reach the guest backend")
+
+            result, _ = await h.controller.run_guest_operation(
+                label="guest.input_text",
+                request_id="guest-resized",
+                frame_id=frame.frame_id,
+                parameters={"text": "hello", "method": "native_text"},
+                runner=runner,
+            )
+            assert result.error.code == ErrorCode.STALE_FRAME
+            assert result.effect_state == "not_sent"
+            assert sends == []
 
 
 class TestScheduling:

@@ -13,7 +13,7 @@ There are two paths, and only one of them is required to work:
 
 ```
 baseline     Agent → MCP server → controlled QMP → standard HID devices / framebuffer
-enhancement  Agent → same MCP server → Guest Tool Bridge → in-guest tools (off by default)
+enhancement  Agent → same MCP server → Guest Tool Bridge → in-guest tools (requires a guest service)
 ```
 
 The baseline must remain independently sufficient. The enhancement path shares the policy,
@@ -31,11 +31,11 @@ Two documentation conventions are enforced by hand, not by tooling:
 
 * **`docs/` is bilingual.** Every page exists as `X.md` and `X.zh-CN.md`. A change to one is
   incomplete until the other is updated; both open with a language switcher line.
-* **Never claim more than was verified.** This machine has no QEMU. Physical acceptance
-  (WHPX, real capture latency, click accuracy) is unverified, `palette doctor` reports that as
-  a blocking failure, and `tests/e2e` skips. Do not soften that in any doc, CLI output, or
-  summary. `docs/benchmarks.md` records that nothing has been measured; keep it that way until
-  a real measurement exists.
+* **Never claim more than was verified.** The Windows/WHPX, macOS/HVF, Linux/KVM and explicit
+  cross-architecture TCG matrix has not undergone physical guest acceptance in this change.
+  `doctor` checks prerequisites, and `tests/e2e` skips without an explicit emulator/image.
+  Fake-process tests do not prove guest compatibility, capture latency or click accuracy.
+  Keep `docs/benchmarks.md` free of claimed results until a real measurement exists.
 
 ## Commands
 
@@ -43,7 +43,7 @@ Two documentation conventions are enforced by hand, not by tooling:
 uv sync                                     # install; the venv lives in .venv
 uv run palette doctor                       # host/QEMU/profile probe; exits 3 when not ready
 uv run palette serve                        # MCP server on stdio (logs go to stderr)
-uv run palette vm start|stop|reset|status   # operator lifecycle
+uv run palette vm start|stop|reset|status   # second terminal; contacts the running serve
 uv run palette vm emergency-stop|take-control|list
 uv run palette config show
 
@@ -58,13 +58,12 @@ uv run mypy                                 # strict, covers src/palette and scr
 uv run python scripts/check_docs.py         # bilingual pairing, links, fences, UTF-8
 uv run mypy --platform linux                # see the platform note below
 uv run mypy --platform win32
+uv run mypy --platform darwin
 ```
 
-`.github/workflows/ci.yml` runs that lint set on every push and pull request. Its test job —
-the suite, `scripts/mcp_stdio_smoke.py` and a `palette doctor` smoke check, on Ubuntu and
-Windows against Python 3.12 and 3.13 — is **parked behind a manual `workflow_dispatch` input**
-and does not run by default. Windows belongs in that matrix because the job object guard,
-`CREATE_NO_WINDOW` and the reparse-point checks only execute there.
+`.github/workflows/ci.yml` is the source of truth for the OS/Python matrix and dispatch
+conditions. The suite, stdio smoke and doctor smoke exercise platform-specific implementations:
+Windows Job Objects/named pipes and POSIX supervisors/Unix sockets need their respective hosts.
 
 Whichever jobs run, the physical-acceptance tests need a real QEMU and a guest image, so they
 **skip**; that is not coverage of them, and nothing in the workflow or the docs should imply it
@@ -82,8 +81,7 @@ the same reason.
 against whatever profile you point it at, and prints the timings. `scripts/mcp_stdio_smoke.py`
 drives `palette serve` over real stdio the way a client would.
 
-Keep CLI and script output **ASCII-only**: this console uses a GBK code page and non-ASCII
-markers crash `print`.
+Keep CLI and script output **ASCII-only** so supported Windows GBK consoles can print it.
 
 ## Architecture
 
@@ -102,9 +100,15 @@ MCP client → server.py → service.py → policy.py → input/controller.py �
 * `input/controller.py` — the bounded action transaction; the single writer per VM.
 * `qmp/client.py` — the private management channel. Knows nothing about JSON-RPC or tools.
 
-`CaptureBackend`, `ProcessGuard`, `GuestToolBackend` and `GuestToolTransport` are the deliberate
-extension seams — each is a `Protocol`, so a VNC capture backend or a KVM process guard can be
-swapped in without touching the tool contracts.
+`CaptureBackend`, `ManagedProcess`, `ProcessGuard`, `GuestToolBackend` and `GuestToolTransport`
+are the extension seams. Windows uses a direct managed process and Job Object; POSIX uses a
+supervisor with the same process/guard interface, while QMP still uses direct private pipes.
+
+`host.default_profile = "auto"` selects `default` on Windows x86_64, `macos-x86_64` or
+`macos-aarch64` on macOS, and `linux-x86_64` or `linux-aarch64` on Linux. `qemu.arch` is the
+guest ISA. `tcg-x86_64` and `tcg-aarch64` are explicit software-emulation choices with
+`cpu=max`, never automatic fallbacks; Apple Silicon does not need Rosetta for an x86 guest.
+Firmware, boot mode and guest drivers must match the guest target. See `docs/platforms.md`.
 
 `docs/` explains the design from the outside; `.references/qemu` is a pinned QEMU checkout for
 research. Verify qcodes, QAPI unions and event shapes against it rather than from memory — that
@@ -151,13 +155,34 @@ validates `structuredContent`; plain `-> CallToolResult` publishes the wrong sch
 models require their payload, failure bodies require an `ErrorPayload`. `Frame.monotonic_stamp`
 is excluded from the wire and defaults to `0.0` so a dumped-and-reparsed frame still validates.
 
-**Process spawning has one site.** `launcher.run_sync` and `launcher.spawn_qemu` use
-`CREATION_FLAGS` / `START_NEW_SESSION` and `build_child_env()`'s whitelist. Starting a process
-anywhere else would leak the operator's environment into QEMU or flash a console window.
+**Process spawning stays in `vm/launcher.py`.** Helpers, the POSIX supervisor and its QEMU
+child use the same environment whitelist and appropriate process/session flags. Never use
+`preexec_fn`. A supervisor's liveness reader must not leak into QEMU. POSIX memory limits are
+250 ms RSS sampling, not a Job Object equivalent hard cap; report the enforcement method.
+
+**One runtime has one service owner.** Lifecycle CLI commands use authenticated local IPC to
+the existing `serve`; only `vm list` reads manifests offline. Do not reintroduce a temporary
+`PaletteService` into CLI lifecycle commands or automatically replay an uncertain IPC request.
+
+**Cancellation does not abandon owned resources.** Startup rolls back partial instances;
+stop/reset/shutdown finish their cleanup before propagating cancellation. A failed instance
+is not replaced until its old process exits. Identity checks and lookup happen under the
+lifecycle lock, so authorization for one instance cannot operate on its replacement.
 
 **Deletion requires a manifest.** The manifest is written *before* the overlay is created, so the
 failure path can clean up through the same manifest-verified route. Every managed path goes
 through `PathGuard`, which checks lexically *and* refuses to follow a junction or reparse point.
+Manifest IDs must match the directory; updates preserve the actual base, formats, backing
+chain and attached volumes. Stop and reset share retention. Exit must be confirmed before
+deletion, and dependency protection takes priority over the stopped-layer count limit.
+
+**A guest RESET is a new boot boundary.** Advance `boot_epoch` and invalidate controller work
+and frames synchronously. Replace the guest-tool session and reconnect it asynchronously;
+the visual baseline must remain usable. A guest reset does not discard the writable disk.
+
+**Base format is not overlay format.** Independently inspect the actual base format before
+creating an overlay, then use `-f qcow2 -F <actual declared base format>`. The guest's writable
+block node is always qcow2. Extra disks use their inspected format, not an assumed raw driver.
 
 **Profiles are frozen and `extra="forbid"`.** A misspelled safety switch must fail loudly.
 One control deliberately cannot be relaxed: `allow_accelerator_fallback`. Everything else —

@@ -15,11 +15,9 @@ must hold no matter which tool was called:
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import time
-from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -27,10 +25,9 @@ from .audit import AuditLog, NullAuditLog
 from .config import PaletteConfig
 from .errors import ErrorCode, PaletteError
 from .guest_tools.base import GuestToolOutcome
-from .input.controller import ActionController, RequestDeduplicator
+from .input.controller import ActionController
 from .models import (
     DisplayInfo,
-    EffectState,
     ErrorPayload,
     Frame,
     GuestToolResult,
@@ -73,10 +70,6 @@ class PaletteService:
             audit=self.audit,
             guest_tool_transport_factory=guest_tool_transport_factory,
         )
-        self._guest_results: OrderedDict[tuple[str, str], tuple[str, GuestToolResult]] = (
-            OrderedDict()
-        )
-        self._guest_dedupe = RequestDeduplicator(max_entries=128)
 
     # -- lifecycle --------------------------------------------------------------------
     async def startup(self) -> None:
@@ -117,6 +110,8 @@ class PaletteService:
 
     # -- observation ------------------------------------------------------------------
     async def status(self, vm_id: str, *, actor: Actor = "agent") -> StatusResult:
+        from .platforms import execution_info
+
         instance = self.manager.find(vm_id)
         if instance is None:
             return StatusResult(
@@ -140,6 +135,7 @@ class PaletteService:
         guest = instance.guest_tools
         guest_status = await guest.capabilities() if guest is not None else None
         status = VmStatus(
+            **execution_info(instance.profile),
             vm_id=vm_id,
             profile_id=instance.profile.profile_id,
             instance_id=instance.view.instance_id,
@@ -348,22 +344,11 @@ class PaletteService:
         target: str = "focused",
     ) -> tuple[GuestToolResult, bytes | None]:
         validate_identifier(request_id, what="request_id")
-        fingerprint = f"text:{method}:{target}:{len(text)}:{hash(text) & 0xFFFFFFFF}"
-        cached = self._cached_guest(vm_id, request_id, fingerprint)
-        if cached is not None:
-            return cached, None
-
         instance = await self.manager.require_running(vm_id)
         self._require_instance_id(instance, instance_id)
         policy = instance.policy
         policy.require_capability("guest.input_text")
         self._require_boot_epoch(instance, boot_epoch)
-        if frame_id is not None:
-            # A frame is required by the tool contract for text that depends on what is on
-            # screen; the frame itself cannot promise focus, so the service still checks
-            # that it belongs to this VM and has not been fenced.
-            self._check_frame_registered(instance, frame_id)
-
         backend = instance.guest_tools
         if backend is None:
             raise PaletteError(
@@ -371,21 +356,19 @@ class PaletteService:
             )
         controller = self._controller(instance)
 
-        async def runner() -> GuestToolOutcome:
-            return await backend.input_text(text=text, method=method, target=target)
+        async def runner(on_sending: Callable[[], None]) -> GuestToolOutcome:
+            policy.require_capability("guest.input_text")
+            return await backend.input_text(
+                text=text, method=method, target=target, on_sending=on_sending
+            )
 
-        result, frame, png, error = await controller.run_guest_operation(
-            label="guest.input_text", runner=runner
-        )
-        payload = self._guest_result(
+        return await controller.run_guest_operation(
+            label="guest.input_text",
+            runner=runner,
             request_id=request_id,
-            outcome=result,
-            frame=frame,
-            action_seq=instance.view.action_seq,
-            error=error,
+            frame_id=frame_id,
+            parameters={"text": text, "method": method, "target": target},
         )
-        self._store_guest(vm_id, request_id, fingerprint, payload)
-        return payload, png
 
     async def guest_launch_app(
         self,
@@ -399,11 +382,6 @@ class PaletteService:
     ) -> tuple[GuestToolResult, bytes | None]:
         validate_identifier(request_id, what="request_id")
         validate_identifier(app_id, what="app_id")
-        fingerprint = f"launch:{app_id}:{sorted(options)}"
-        cached = self._cached_guest(vm_id, request_id, fingerprint)
-        if cached is not None:
-            return cached, None
-
         instance = await self.manager.require_running(vm_id)
         self._require_instance_id(instance, instance_id)
         policy = instance.policy
@@ -418,21 +396,18 @@ class PaletteService:
             )
         controller = self._controller(instance)
 
-        async def runner() -> GuestToolOutcome:
-            return await backend.launch_app(app_id=app_id, options=options)
+        async def runner(on_sending: Callable[[], None]) -> GuestToolOutcome:
+            policy.require_capability("guest.launch_app")
+            policy.require_app(app_id)
+            return await backend.launch_app(app_id=app_id, options=options, on_sending=on_sending)
 
-        result, frame, png, error = await controller.run_guest_operation(
-            label="guest.launch_app", runner=runner
-        )
-        payload = self._guest_result(
+        return await controller.run_guest_operation(
+            label="guest.launch_app",
+            runner=runner,
             request_id=request_id,
-            outcome=result,
-            frame=frame,
-            action_seq=instance.view.action_seq,
-            error=error,
+            frame_id=None,
+            parameters={"app_id": app_id, "options": options},
         )
-        self._store_guest(vm_id, request_id, fingerprint, payload)
-        return payload, png
 
     def _require_boot_epoch(self, instance: VmInstance, boot_epoch: int) -> None:
         if instance.view.boot_epoch != boot_epoch:
@@ -441,87 +416,6 @@ class PaletteService:
                 "the guest rebooted after this request was prepared",
                 details={"expected_boot_epoch": instance.view.boot_epoch},
             )
-
-    def _check_frame_registered(self, instance: VmInstance, frame_id: str) -> Frame:
-        controller = self._controller(instance)
-        frame: Frame = controller.frame_by_id(frame_id)
-        if frame.vm_id != instance.view.vm_id or frame.instance_id != instance.view.instance_id:
-            raise PaletteError(
-                ErrorCode.STALE_FRAME, "this frame belongs to a different VM instance"
-            )
-        if frame.boot_epoch != instance.view.boot_epoch:
-            raise PaletteError(
-                ErrorCode.STALE_FRAME, "the guest rebooted after this frame was captured"
-            )
-        return frame
-
-    def _guest_result(
-        self,
-        *,
-        request_id: str,
-        outcome: GuestToolOutcome | None,
-        frame: Frame | None,
-        action_seq: int,
-        error: PaletteError | None,
-    ) -> GuestToolResult:
-        if error is not None or outcome is None:
-            failure = error or PaletteError(
-                ErrorCode.INTERNAL_ERROR, "the guest operation produced no result"
-            )
-            return GuestToolResult(
-                ok=False,
-                error=ErrorPayload(**failure.as_payload()),
-                effect_state=EffectState.NOT_SENT
-                if failure.code is ErrorCode.GUEST_TOOL_UNAVAILABLE
-                else EffectState.UNKNOWN,
-                request_id=request_id,
-                action_seq=action_seq,
-                detail=failure.message,
-            )
-        if outcome.error is not None:
-            return GuestToolResult(
-                ok=False,
-                error=ErrorPayload(**outcome.error.as_payload()),
-                effect_state=outcome.effect_state,
-                method=outcome.method,
-                launch_id=outcome.launch_id,
-                request_id=request_id,
-                action_seq=action_seq,
-                frame=frame,
-                detail=outcome.detail,
-            )
-        return GuestToolResult(
-            ok=outcome.ok,
-            effect_state=outcome.effect_state,
-            method=outcome.method,
-            launch_id=outcome.launch_id,
-            request_id=request_id,
-            action_seq=action_seq,
-            frame=frame,
-            detail=outcome.detail,
-        )
-
-    def _cached_guest(
-        self, vm_id: str, request_id: str, fingerprint: str
-    ) -> GuestToolResult | None:
-        record = self._guest_results.get((vm_id, request_id))
-        if record is None:
-            return None
-        stored, result = record
-        if stored != fingerprint:
-            raise PaletteError(
-                ErrorCode.REQUEST_ID_CONFLICT,
-                "this request_id was already used with different parameters",
-                details={"request_id": request_id},
-            )
-        return result.model_copy(update={"deduplicated": True})
-
-    def _store_guest(
-        self, vm_id: str, request_id: str, fingerprint: str, result: GuestToolResult
-    ) -> None:
-        self._guest_results[(vm_id, request_id)] = (fingerprint, result)
-        while len(self._guest_results) > 128:
-            self._guest_results.popitem(last=False)
 
     # -- lifecycle --------------------------------------------------------------------
     async def start(
@@ -602,6 +496,10 @@ class PaletteService:
                 ErrorCode.INVALID_ARGUMENT,
                 "image_format only means something together with image",
             )
+        if image_format is not None:
+            image_format = image_format.lower()
+            if image_format not in {"raw", "qcow2"}:
+                raise PaletteError(ErrorCode.IMAGE_INVALID, "image_format must be raw or qcow2")
 
         volumes: list[ExtraVolume] = []
         optical = list(iso or ())
@@ -634,8 +532,9 @@ class PaletteService:
     ) -> LifecycleResult:
         instance = self.manager.get(vm_id)
         instance.policy.require_lifecycle("force_stop" if force else "stop", actor=actor)
-        await self.manager.stop(vm_id, force=force)
-        stopped = self.manager.get(vm_id)
+        stopped = await self.manager.stop(
+            vm_id, force=force, expected_instance_id=instance.view.instance_id
+        )
         return LifecycleResult(
             ok=True,
             vm_id=vm_id,
@@ -650,7 +549,12 @@ class PaletteService:
         profile = instance.profile if instance is not None else self.config.profile(profile_id)
         gate = Policy(profile, _runtime_guard(self.config))
         gate.require_lifecycle("reset", actor=actor)
-        new_instance = await self.manager.reset(vm_id, profile.profile_id)
+        new_instance = await self.manager.reset(
+            vm_id,
+            profile.profile_id,
+            expected_instance_id=instance.view.instance_id if instance is not None else None,
+            expect_absent=instance is None,
+        )
         return LifecycleResult(
             ok=True,
             vm_id=vm_id,
@@ -658,7 +562,7 @@ class PaletteService:
             instance_id=new_instance.view.instance_id,
             profile_id=profile.profile_id,
             note=(
-                "the previous writable layer was kept per the retention policy; "
+                "the previous writable layer was handled by the retention policy; "
                 "the base image is untouched"
             ),
         )
@@ -667,10 +571,9 @@ class PaletteService:
         """Operator escape hatch: release inputs and stop, without a graceful guest."""
         if vm_id is not None:
             instance = self.manager.get(vm_id)
-            if instance.controller is not None:
-                with contextlib.suppress(Exception):
-                    await instance.controller.emergency_release()
-            await self.manager.stop(vm_id, force=True)
+            await self.manager.stop(
+                vm_id, force=True, expected_instance_id=instance.view.instance_id
+            )
             return [vm_id]
         return await self.manager.emergency_stop_all()
 
@@ -681,14 +584,11 @@ class PaletteService:
         previous controller cannot be used to drive input afterwards.
         """
         instance = self.manager.get(vm_id)
-        controller = instance.controller
-        if controller is not None:
-            with contextlib.suppress(Exception):
-                await controller.emergency_release()
-            controller.clear_frames()
-        instance.view.controller_epoch += 1
-        self._audit("control.handover", vm_id, epoch=instance.view.controller_epoch, reason=reason)
-        return instance.view.controller_epoch
+        epoch = await self.manager.take_control(
+            vm_id, expected_instance_id=instance.view.instance_id
+        )
+        self._audit("control.handover", vm_id, epoch=epoch, reason=reason)
+        return epoch
 
     # -- audit ------------------------------------------------------------------------
     def _audit(self, event: str, vm_id: str, **fields: Any) -> None:

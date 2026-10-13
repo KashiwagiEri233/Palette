@@ -48,6 +48,8 @@ ACCEL_HELP = """\
 Accelerators supported in QEMU binary:
 tcg
 whpx
+hvf
+kvm
 """
 
 COMMANDS = [
@@ -65,6 +67,7 @@ COMMANDS = [
     "cont",
     "stop",
     "system_powerdown",
+    "system_reset",
     "quit",
 ]
 
@@ -192,6 +195,9 @@ class FakeQemu:
             self.paused = True
             self.reply(message_id, {})
             self.send_event("STOP")
+        elif command == "system_reset":
+            self.reply(message_id, {})
+            self.send_event("RESET", {"guest": False, "reason": "host-qmp-system-reset"})
         elif command == "system_powerdown":
             self.reply(message_id, {})
             self.send_event("POWERDOWN")

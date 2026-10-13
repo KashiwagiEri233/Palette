@@ -26,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       run_tests:
-        description: Also run the test matrix (Ubuntu + Windows, Python 3.12 and 3.13)
+        description: Also run the test matrix (Ubuntu + Windows + macOS, Python 3.12 and 3.13)
         type: boolean
         default: false
 
@@ -46,12 +46,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both platforms, because mypy type-checks platform branches too and narrows
+        # All platforms, because mypy type-checks platform branches too and narrows
         # `sys.platform` to the machine it runs on: a Linux-only check reports
         # `ctypes.WinDLL` as missing, a Windows-only check never sees `os.geteuid`. The
         # first run of this file failed in exactly that blind spot, from the other side.
-        # The job costs seconds, so checking both is cheaper than reasoning about it.
-        os: [ubuntu-latest, windows-latest]
+        # macOS also exercises the HVF/native architecture selection and POSIX supervisor.
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -78,10 +78,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Two operating systems because the code has real platform branches: the Windows job
-        # object guard, CREATE_NO_WINDOW, reparse-point checks and the console code page only
-        # execute on Windows, and the process plumbing differs underneath.
-        os: [ubuntu-latest, windows-latest]
+        # Job Objects/named pipes on Windows and supervisor/Unix sockets on POSIX
+        # need real process tests on their respective operating systems.
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

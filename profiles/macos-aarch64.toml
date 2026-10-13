@@ -1,0 +1,25 @@
+# Target architecture is the guest architecture, independent of the host executable.
+profile_id = "macos-aarch64"
+description = "aarch64 desktop using hvf; supply a matching guest image."
+
+[qemu]
+arch = "aarch64"
+binary = "qemu-system-aarch64"
+accelerator = "hvf"
+machine = "virt"
+cpu = "host"
+
+[images]
+base = "images/debian-13-xfce-aarch64.qcow2"
+format = "qcow2"
+
+[devices]
+display_model = "virtio-gpu-pci"
+
+[guest_tools.allowed_apps.text-editor]
+executable = "/usr/bin/mousepad"
+allowed_options = ["file"]
+
+[guest_tools.allowed_apps.file-manager]
+executable = "/usr/bin/thunar"
+allowed_options = ["directory"]

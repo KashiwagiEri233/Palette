@@ -39,6 +39,7 @@ from ..audit import AuditLog
 from ..capture.base import CaptureBackend, CapturedImage
 from ..config import Profile
 from ..errors import ErrorCode, PaletteError
+from ..guest_tools.base import GuestToolOutcome
 from ..models import (
     Action,
     ActionSource,
@@ -47,6 +48,7 @@ from ..models import (
     EffectState,
     ErrorPayload,
     Frame,
+    GuestToolResult,
     KeyAction,
     MoveAction,
     ObservationState,
@@ -77,6 +79,8 @@ _THUMBNAIL_SIZE = (64, 64)
 #: How the service describes where the pointer is. It never claims to have observed the
 #: real cursor: a QMP screendump does not include the hardware cursor.
 CursorPositionSource = Literal["not_observed", "last_command"]
+RequestKey = tuple[str, int, int, str]
+ActionResult = Receipt | GuestToolResult
 
 
 class JobKind(StrEnum):
@@ -228,11 +232,11 @@ class RequestDeduplicator:
     """
 
     def __init__(self, *, max_entries: int = 256) -> None:
-        self._records: OrderedDict[str, tuple[str, Receipt]] = OrderedDict()
-        self._inflight: dict[str, tuple[str, asyncio.Future[Receipt]]] = {}
+        self._records: OrderedDict[RequestKey, tuple[str, ActionResult]] = OrderedDict()
+        self._inflight: dict[RequestKey, tuple[str, asyncio.Future[Any]]] = {}
         self._max_entries = max_entries
 
-    def lookup(self, request_id: str, fingerprint: str) -> Receipt | None:
+    def lookup(self, request_id: RequestKey, fingerprint: str) -> ActionResult | None:
         record = self._records.get(request_id)
         if record is None:
             return None
@@ -245,7 +249,7 @@ class RequestDeduplicator:
             )
         return receipt.model_copy(update={"deduplicated": True})
 
-    def begin(self, request_id: str, fingerprint: str) -> asyncio.Future[Receipt] | None:
+    def begin(self, request_id: RequestKey, fingerprint: str) -> asyncio.Future[Any] | None:
         """Return an existing in-flight future for an identical concurrent request."""
         existing = self._inflight.get(request_id)
         if existing is None:
@@ -259,16 +263,16 @@ class RequestDeduplicator:
             )
         return future
 
-    def attach(self, request_id: str, fingerprint: str, future: asyncio.Future[Receipt]) -> None:
+    def attach(self, request_id: RequestKey, fingerprint: str, future: asyncio.Future[Any]) -> None:
         self._inflight[request_id] = (fingerprint, future)
 
-    def complete(self, request_id: str, fingerprint: str, receipt: Receipt) -> None:
+    def complete(self, request_id: RequestKey, fingerprint: str, receipt: ActionResult) -> None:
         self._inflight.pop(request_id, None)
         self._records[request_id] = (fingerprint, receipt)
         while len(self._records) > self._max_entries:
             self._records.popitem(last=False)
 
-    def abandon(self, request_id: str) -> None:
+    def abandon(self, request_id: RequestKey) -> None:
         self._inflight.pop(request_id, None)
 
 
@@ -281,6 +285,37 @@ class _Job:
     started: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[Any] | None = None
     cancelled: bool = False
+    abort_reason: PaletteError | None = None
+    abort_result: Callable[[PaletteError], Any] | None = None
+    completed: Callable[[Any], None] | None = None
+
+
+@dataclass(slots=True)
+class _InputProgress:
+    """Evidence for one transaction, retained even if its caller disappears."""
+
+    view: InstanceView
+    sequence: int
+    attempted: bool = False
+    in_flight: bool = False
+    accepted: int = 0
+    complete: bool = False
+
+    def sending(self) -> None:
+        # Reserve once at the first possible delivery, including a write whose reply is lost.
+        if not self.attempted:
+            self.view.action_seq += 1
+            self.sequence = self.view.action_seq
+        self.attempted = True
+        self.in_flight = True
+
+    @property
+    def effect(self) -> EffectState:
+        if self.complete:
+            return EffectState.SUBMITTED
+        if self.in_flight:
+            return EffectState.UNKNOWN
+        return EffectState.PARTIAL if self.accepted else EffectState.NOT_SENT
 
 
 # --------------------------------------------------------------------------------------
@@ -315,6 +350,7 @@ class ActionController:
         self._worker: asyncio.Task[None] | None = None
         self._current: _Job | None = None
         self._closing = False
+        self._generation = 0
         self._last_capture_at: float = 0.0
 
     # -- lifecycle -------------------------------------------------------------------
@@ -327,38 +363,15 @@ class ActionController:
     async def shutdown(self, *, release: bool = True) -> ReleaseResult | None:
         """Stop accepting work, drop queued jobs, and try to leave the guest unheld.
 
-        The release runs before ``_closing`` blocks new submissions, because refusing to
-        submit is not a reason to leave a mouse button pressed inside the guest.
+        The worker finishes its independent cleanup before the final release and shutdown.
         """
-        result: ReleaseResult | None = None
-        if release:
-            try:
-                result = await self._release_all()
-            except PaletteError as exc:
-                result = ReleaseResult(
-                    ok=False,
-                    release_confirmed=False,
-                    note=f"release before shutdown failed: {exc.code}",
-                    released_keys=list(self._ledger.keys),
-                    released_buttons=list(self._ledger.buttons),
-                )
-
         self._closing = True
-        for job in list(self._jobs):
-            job.cancelled = True
-            if not job.future.done():
-                job.future.set_exception(
-                    PaletteError(ErrorCode.CANCELLED, "the VM is shutting down")
-                )
-                with contextlib.suppress(BaseException):
-                    job.future.exception()
-        self._jobs.clear()
-        self._wake.set()
-
-        if self._current is not None and self._current.task is not None:
-            self._current.task.cancel()
-            with contextlib.suppress(BaseException):
-                await self._current.task
+        self.invalidate(reason="the VM is shutting down")
+        current = self._current
+        if current is not None:
+            with contextlib.suppress(PaletteError):
+                await asyncio.shield(current.future)
+        result = await self._bounded_release() if release else None
         if self._worker is not None:
             self._worker.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -366,6 +379,17 @@ class ActionController:
             self._worker = None
         self._frames.clear(reason="the VM is shutting down")
         return result
+
+    def invalidate(self, *, reason: str) -> None:
+        """Fence in-flight captures and cancel old work before yielding to the event loop."""
+        self._generation += 1
+        self._frames.clear(reason=reason)
+        error = PaletteError(ErrorCode.STALE_FRAME, reason, retryable=False)
+        for job in list(self._jobs):
+            self._cancel_job(job, error)
+        if self._current is not None:
+            self._cancel_job(self._current, error)
+        self._wake.set()
 
     # -- public API ------------------------------------------------------------------
     async def observe(
@@ -398,33 +422,39 @@ class ActionController:
         action = parse_action(action_payload)
         fingerprint = _fingerprint(action_payload, frame_id)
 
-        cached = self._dedupe.lookup(request_id, fingerprint)
-        if cached is not None:
-            if self._audit:
-                self._audit.record(
-                    "action.deduplicated",
-                    vm_id=self.view.vm_id,
-                    request_id=request_id,
-                    action_type=action.type,
-                )
-            return cached, None
-        inflight = self._dedupe.begin(request_id, fingerprint)
-        if inflight is not None:
-            return cast("tuple[Receipt, bytes | None]", await asyncio.shield(inflight))
-
+        progress = _InputProgress(self.view, self.view.action_seq)
         job = self._make_job(
             JobKind.ACTION,
             f"action:{action.type}",
-            lambda: self._run_action(request_id=request_id, frame_id=frame_id, action=action),
+            lambda: self._run_action(
+                request_id=request_id, frame_id=frame_id, action=action, progress=progress
+            ),
         )
-        self._dedupe.attach(request_id, fingerprint, job.future)
-        try:
-            receipt, png = cast("tuple[Receipt, bytes | None]", await self._submit(job))
-        except BaseException:
-            self._dedupe.abandon(request_id)
-            raise
-        self._dedupe.complete(request_id, fingerprint, receipt)
-        return receipt, png
+
+        def interrupted(error: PaletteError) -> tuple[Receipt, None]:
+            self._record_action(
+                "action.interrupted", action, request_id, error.code, progress.accepted
+            )
+            return _receipt(
+                ok=False,
+                request_id=request_id,
+                action=action,
+                effect_state=progress.effect,
+                action_seq=progress.sequence,
+                error=error,
+                input_submitted=progress.accepted > 0,
+                observation=ObservationState.FAILED
+                if progress.complete
+                else ObservationState.SKIPPED,
+                frame_observation_required=progress.attempted,
+                backend=self._backend_label(action),
+            ), None
+
+        job.abort_result = interrupted
+        return cast(
+            "tuple[Receipt, bytes | None]",
+            await self._submit_action(request_id, fingerprint, job),
+        )
 
     async def wait(
         self,
@@ -477,7 +507,7 @@ class ActionController:
             # always be no for a change that happened in between.
             baseline = self._frames.thumbnail(after_frame_id)
         if baseline is None:
-            _frame, captured_baseline = await self._capture_frame()
+            _frame, captured_baseline = await self.observe()
             baseline = image_thumbnail(captured_baseline.png_bytes)
             samples += 1
         previous = baseline
@@ -506,7 +536,7 @@ class ActionController:
                     changed_ratio=ratio,
                     frame=frame,
                     note="pixel change detected; it does not prove the application finished",
-                ), current
+                ), captured.png_bytes
             if mode == "stable":
                 pair_ratio = thumbnail_difference(previous, current)
                 stable_streak = stable_streak + 1 if pair_ratio <= threshold else 0
@@ -519,7 +549,7 @@ class ActionController:
                         changed_ratio=pair_ratio,
                         frame=frame,
                         note="the screen stopped changing; clocks and blinking cursors can defeat this",
-                    ), current
+                    ), captured.png_bytes
             previous = current
 
         if last_frame is None:
@@ -542,27 +572,42 @@ class ActionController:
         self,
         *,
         label: str,
-        runner: Callable[[], Awaitable[Any]],
-    ) -> tuple[Any | None, Frame | None, bytes | None, PaletteError | None]:
-        """Run a guest-side operation inside the same single-writer slot.
+        request_id: str,
+        frame_id: str | None,
+        parameters: dict[str, Any],
+        runner: Callable[[Callable[[], None]], Awaitable[GuestToolOutcome]],
+    ) -> tuple[GuestToolResult, bytes | None]:
+        """Run and retain guest receipts using the same queue and identity as visual input."""
+        identity = self._identity()
+        progress = _InputProgress(self.view, self.view.action_seq)
 
-        The plan requires guest text input and app launching to share the per-VM scheduler,
-        control ownership, de-duplication and audit with QMP clicks. Routing them through
-        the same job queue is what makes that true: a guest launch and a click can never
-        interleave halfway through each other.
+        def failure(error: PaletteError) -> tuple[GuestToolResult, None]:
+            self._record_guest(label, None, error.code)
+            return GuestToolResult(
+                ok=False,
+                error=ErrorPayload(**error.as_payload()),
+                effect_state=progress.effect,
+                request_id=request_id,
+                action_seq=progress.sequence,
+                detail=error.message,
+            ), None
 
-        A guest operation that changes the desktop advances ``action_seq`` exactly like a
-        QMP action, so frames captured before it are fenced by the ordinary mechanism
-        rather than by a special case.
-        """
-
-        async def _job() -> tuple[Any | None, Frame | None, bytes | None, PaletteError | None]:
+        async def _job() -> tuple[GuestToolResult, bytes | None]:
             try:
-                result = await runner()
+                self._require_identity(identity)
+                if frame_id is not None:
+                    self._validate_frame_for_action(self._frames.get(frame_id))
+                    await self._ensure_size_is_current()
+                    self._validate_frame_for_action(self._requeue_or_stale(frame_id))
+                result = await runner(progress.sending)
+                self._require_identity(identity)
             except PaletteError as exc:
-                self._record_guest(label, None, exc.code)
-                return None, None, None, exc
-            self.view.action_seq += 1
+                return failure(exc)
+            progress.in_flight = result.effect_state is EffectState.UNKNOWN
+            progress.complete = result.effect_state is EffectState.SUBMITTED
+            progress.accepted = int(
+                result.effect_state in {EffectState.SUBMITTED, EffectState.PARTIAL}
+            )
             settle = self.profile.timeouts.settle_after_input_ms / 1000.0
             if settle:
                 await asyncio.sleep(settle)
@@ -574,13 +619,33 @@ class ActionController:
                 self.view.screen_ready = True
             except PaletteError as exc:
                 logger.info("post-guest-operation capture failed: %s", exc.code)
-            self._record_guest(label, frame is not None, None)
-            return result, frame, png, None
+            error = result.error
+            if not result.ok and error is None:
+                error = PaletteError(
+                    ErrorCode.GUEST_TOOL_UNAVAILABLE,
+                    result.detail or "the guest operation failed",
+                    retryable=False,
+                )
+            self._record_guest(label, frame is not None, error.code if error else None)
+            return GuestToolResult(
+                ok=result.ok,
+                error=ErrorPayload(**error.as_payload()) if error else None,
+                effect_state=result.effect_state,
+                method=result.method,
+                launch_id=result.launch_id,
+                request_id=request_id,
+                action_seq=progress.sequence,
+                frame=frame,
+                detail=result.detail,
+            ), png
 
         job = self._make_job(JobKind.ACTION, label, _job)
+        job.abort_result = failure
         return cast(
-            "tuple[Any | None, Frame | None, bytes | None, PaletteError | None]",
-            await self._submit(job),
+            "tuple[GuestToolResult, bytes | None]",
+            await self._submit_action(
+                request_id, _fingerprint({"operation": label, **parameters}, frame_id), job
+            ),
         )
 
     def _record_guest(self, label: str, observed: bool | None, code: ErrorCode | None) -> None:
@@ -615,31 +680,19 @@ class ActionController:
             released_buttons=list(self._ledger.buttons),
         )
 
-    async def emergency_release(self) -> ReleaseResult:
+    async def emergency_release(self, *, invalidate: bool = True) -> ReleaseResult:
         """Cancel whatever is running, then release. Used by stop/reset and by the CLI.
 
         The cleanup runs as its own task so that cancelling the action cannot cancel the
         very coroutine responsible for letting go of the mouse button.
         """
-        if self._current is not None and self._current.task is not None:
-            self._current.cancelled = True
-            self._current.task.cancel()
-        task = asyncio.create_task(self._release_all(), name=f"emergency-release-{self.view.vm_id}")
-        try:
-            return await task
-        except asyncio.CancelledError:
-            # Keep waiting for the release: it is the point of this method.
-            with contextlib.suppress(Exception):
-                await asyncio.shield(task)
-            raise
-        except PaletteError as exc:
-            return ReleaseResult(
-                ok=False,
-                release_confirmed=False,
-                note=f"release failed: {exc.code}",
-                released_keys=list(self._ledger.keys),
-                released_buttons=list(self._ledger.buttons),
-            )
+        if invalidate:
+            self.invalidate(reason="input was interrupted for recovery")
+        current = self._current
+        if current is not None:
+            with contextlib.suppress(PaletteError):
+                await asyncio.shield(current.future)
+        return await self.release_inputs()
 
     # -- introspection ---------------------------------------------------------------
     def ledger_snapshot(self) -> dict[str, list[str]]:
@@ -666,6 +719,67 @@ class ActionController:
         return self.profile.frame_ttl_seconds
 
     # -- scheduler -------------------------------------------------------------------
+    def _identity(self) -> tuple[str, int, int, int]:
+        return (
+            self.view.instance_id,
+            self.view.boot_epoch,
+            self.view.controller_epoch,
+            self._generation,
+        )
+
+    def _require_identity(self, identity: tuple[str, int, int, int]) -> None:
+        if identity != self._identity():
+            raise PaletteError(ErrorCode.STALE_FRAME, "the VM changed during this operation")
+
+    async def _submit_action(
+        self, request_id: str, fingerprint: str, job: _Job
+    ) -> tuple[ActionResult, bytes | None]:
+        key = (self.view.instance_id, self.view.boot_epoch, self.view.controller_epoch, request_id)
+        cached = self._dedupe.lookup(key, fingerprint)
+        if cached is not None:
+            return cached, None
+        inflight = self._dedupe.begin(key, fingerprint)
+        if inflight is not None:
+            result, _png = await asyncio.shield(inflight)
+            return result.model_copy(update={"deduplicated": True}), None
+        self._dedupe.attach(key, fingerprint, job.future)
+        job.completed = lambda result: self._dedupe.complete(key, fingerprint, result[0])
+        try:
+            return cast("tuple[ActionResult, bytes | None]", await self._submit(job))
+        except PaletteError:
+            if not job.future.done():
+                self._dedupe.abandon(key)
+            raise
+
+    def _finish_job(
+        self, job: _Job, *, result: Any = None, error: PaletteError | None = None
+    ) -> None:
+        if job.future.done():
+            return
+        if error is not None and job.abort_result is not None:
+            result = job.abort_result(error)
+            error = None
+        if error is not None:
+            job.future.set_exception(error)
+            job.future.exception()
+        else:
+            if job.completed is not None:
+                job.completed(result)
+            job.future.set_result(result)
+
+    def _cancel_job(self, job: _Job, error: PaletteError) -> None:
+        if job.cancelled or job.future.done():
+            return
+        job.cancelled = True
+        job.abort_reason = error
+        if job.task is not None:
+            job.task.cancel()
+        else:
+            with contextlib.suppress(ValueError):
+                self._jobs.remove(job)
+            job.started.set()
+            self._finish_job(job, error=error)
+
     def _make_job(
         self, kind: JobKind, label: str, runner: Callable[[], Coroutine[Any, Any, Any]]
     ) -> _Job:
@@ -701,45 +815,19 @@ class ActionController:
             await asyncio.wait_for(job.started.wait(), timeout=wait_limit)
         except TimeoutError:
             if not job.started.is_set():
-                job.cancelled = True
-                with contextlib.suppress(ValueError):
-                    self._jobs.remove(job)
-                raise PaletteError(
+                error = PaletteError(
                     ErrorCode.BUSY,
                     "the VM stayed busy longer than this request is allowed to queue",
                     details={"queued_seconds": wait_limit},
-                ) from None
-
-        try:
-            return await asyncio.wait_for(
-                job.future, timeout=self.profile.resources.max_action_seconds
-            )
-        except TimeoutError:
-            if job.task is not None:
-                job.cancelled = True
-                job.task.cancel()
-            # An observation or a release that timed out has no ambiguous side effect;
-            # an action does, and saying so is the difference between a safe retry and a
-            # duplicated click.
-            code = (
-                ErrorCode.ACTION_OUTCOME_UNKNOWN
-                if job.kind is JobKind.ACTION
-                else ErrorCode.TIMEOUT
-            )
-            message = (
-                "the action did not finish in time and may already have taken effect"
-                if job.kind is JobKind.ACTION
-                else f"{job.label} did not finish in time"
-            )
-            raise PaletteError(
-                code,
-                message,
-                details={"timeout_seconds": self.profile.resources.max_action_seconds},
-            ) from None
+                )
+                self._cancel_job(job, error)
         except asyncio.CancelledError:
-            if job.task is not None:
-                job.cancelled = True
-                job.task.cancel()
+            self._cancel_job(job, PaletteError(ErrorCode.CANCELLED, "the request was cancelled"))
+            raise
+        try:
+            return await asyncio.shield(job.future)
+        except asyncio.CancelledError:
+            self._cancel_job(job, PaletteError(ErrorCode.CANCELLED, "the request was cancelled"))
             raise
 
     async def _run_worker(self) -> None:
@@ -758,42 +846,39 @@ class ActionController:
             job.started.set()
             task = asyncio.create_task(job.runner(), name=f"job-{job.label}")
             job.task = task
+            timer = asyncio.get_running_loop().call_later(
+                self.profile.resources.max_action_seconds,
+                self._cancel_job,
+                job,
+                PaletteError(
+                    ErrorCode.ACTION_OUTCOME_UNKNOWN
+                    if job.kind is JobKind.ACTION
+                    else ErrorCode.TIMEOUT,
+                    f"{job.label} exceeded its execution deadline",
+                    retryable=False,
+                ),
+            )
+            result: Any = None
+            error: PaletteError | None = None
             try:
                 result = await task
             except asyncio.CancelledError:
-                # Two cases: the caller cancelled this specific job, or the worker is
-                # being shut down. In the first case keep serving; in the second, stop.
-                if self._closing:
-                    raise
-                if not job.future.done():
-                    job.future.set_exception(
-                        PaletteError(
-                            ErrorCode.CANCELLED,
-                            "the action was cancelled before it completed",
-                        )
-                    )
-                    with contextlib.suppress(BaseException):
-                        job.future.exception()
+                error = job.abort_reason or PaletteError(
+                    ErrorCode.CANCELLED, "the action was cancelled"
+                )
             except PaletteError as exc:
-                if not job.future.done():
-                    job.future.set_exception(exc)
-                    with contextlib.suppress(BaseException):
-                        job.future.exception()
+                error = exc
             except Exception as exc:
                 logger.exception("action job %s failed", job.label)
-                if not job.future.done():
-                    job.future.set_exception(
-                        PaletteError(
-                            ErrorCode.INTERNAL_ERROR,
-                            f"internal error while running {job.label}: {type(exc).__name__}",
-                        )
-                    )
-                    with contextlib.suppress(BaseException):
-                        job.future.exception()
-            else:
-                if not job.future.done():
-                    job.future.set_result(result)
+                error = PaletteError(
+                    ErrorCode.INTERNAL_ERROR,
+                    f"internal error while running {job.label}: {type(exc).__name__}",
+                )
             finally:
+                timer.cancel()
+                if job.kind is JobKind.ACTION and not self._ledger.is_clean:
+                    await self._bounded_release()
+                self._finish_job(job, result=result, error=error)
                 self._current = None
                 job.task = None
 
@@ -804,10 +889,12 @@ class ActionController:
         max_long_edge: int | None = None,
         cursor_position_source: CursorPositionSource = "not_observed",
     ) -> tuple[Frame, CapturedImage]:
+        identity = self._identity()
         sink = self._frame_path()
         captured = await self._capture.capture(
             display_id=self.view.display_id, head=self.view.head, sink=sink
         )
+        self._require_identity(identity)
         if max_long_edge is not None and max_long_edge != self.profile.capture.max_long_edge:
             captured = _rescale(captured, max_long_edge, self.profile.capture.max_bytes)
         frame = self._build_frame(captured, cursor_position_source=cursor_position_source)
@@ -990,13 +1077,21 @@ class ActionController:
             "events": [],
         }
 
-    async def _send_events(self, events: list[dict[str, Any]], *, timeout: float) -> None:
+    async def _send_events(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        timeout: float,
+        on_sending: Callable[[], None] | None = None,
+    ) -> None:
         arguments = self._event_prefix()
         arguments["events"] = events
-        await self._qmp.execute("input-send-event", arguments, timeout=timeout)
+        await self._qmp.execute(
+            "input-send-event", arguments, timeout=timeout, on_sending=on_sending
+        )
 
     async def _run_action(
-        self, *, request_id: str, frame_id: str, action: Action
+        self, *, request_id: str, frame_id: str, action: Action, progress: _InputProgress
     ) -> tuple[Receipt, bytes | None]:
         started = time.monotonic()
         settle = self.profile.timeouts.settle_after_input_ms / 1000.0
@@ -1029,37 +1124,37 @@ class ActionController:
                 # succeeds, because a release that did not go out leaves the key or button
                 # exactly where it was.
                 self._note_presses(events)
-                await self._send_events(events, timeout=command_timeout)
+                await self._send_events(
+                    events, timeout=command_timeout, on_sending=progress.sending
+                )
                 self._note_releases(events)
                 sent += 1
+                progress.accepted = sent
+                progress.in_flight = False
                 if any(event["type"] == "abs" for event in events):
                     pointer_moved = True
                 if delay_ms:
                     await asyncio.sleep(delay_ms / 1000.0)
         except PaletteError as exc:
-            state = EffectState.NOT_SENT if sent == 0 else EffectState.PARTIAL
-            if exc.code is ErrorCode.TIMEOUT or exc.code is ErrorCode.QMP_UNAVAILABLE:
-                state = EffectState.UNKNOWN if sent else EffectState.NOT_SENT
+            if exc.code not in {ErrorCode.TIMEOUT, ErrorCode.QMP_UNAVAILABLE}:
+                progress.in_flight = False
+            if progress.attempted:
+                exc = PaletteError(exc.code, exc.message, details=exc.details, retryable=False)
             self._record_action("action.failed", action, request_id, exc.code, sent)
             return _receipt(
                 ok=False,
                 request_id=request_id,
                 action=action,
-                effect_state=state,
-                action_seq=self.view.action_seq,
+                effect_state=progress.effect,
+                action_seq=progress.sequence,
                 error=exc,
                 elapsed_ms=_elapsed_ms(started),
                 input_submitted=sent > 0,
                 backend=self._backend_label(action),
             ), None
-        except asyncio.CancelledError:
-            await self._cleanup_after_cancel(request_id, action, sent)
-            raise
 
-        # The input is out. From here on the transaction is committed: the action
-        # sequence advances and every earlier frame is fenced, whether or not the
-        # post-action capture succeeds.
-        self.view.action_seq += 1
+        # Every batch was acknowledged; a later observation failure cannot undo the input.
+        progress.complete = True
         if settle:
             await asyncio.sleep(settle)
 
@@ -1100,7 +1195,7 @@ class ActionController:
             request_id=request_id,
             action=action,
             effect_state=EffectState.SUBMITTED,
-            action_seq=self.view.action_seq,
+            action_seq=progress.sequence,
             frame=frame_out,
             error=error,
             elapsed_ms=_elapsed_ms(started),
@@ -1109,16 +1204,6 @@ class ActionController:
             observation=observation,
             frame_observation_required=not ok,
         ), png_after
-
-    async def _cleanup_after_cancel(self, request_id: str, action: Action, sent: int) -> None:
-        """A cancelled action still has to let go of anything it pressed."""
-        logger.info("action %s cancelled after %d batch(es); releasing inputs", request_id, sent)
-        release = asyncio.create_task(self._release_all(), name="cancel-release")
-        try:
-            await release
-        except Exception:
-            logger.warning("release after cancellation failed", exc_info=True)
-        self._record_action("action.cancelled", action, request_id, ErrorCode.CANCELLED, sent)
 
     def _note_presses(self, events: list[dict[str, Any]]) -> None:
         """Record a press before it is sent.
@@ -1232,6 +1317,20 @@ class ActionController:
         return batches
 
     # -- release ---------------------------------------------------------------------
+    async def _bounded_release(self) -> ReleaseResult:
+        """Cleanup has its own total budget and is never owned by an MCP waiter."""
+        try:
+            async with asyncio.timeout(max(0.01, self.profile.timeouts.qmp_command_seconds)):
+                return await self._release_all()
+        except (TimeoutError, PaletteError):
+            return ReleaseResult(
+                ok=False,
+                release_confirmed=False,
+                note="input cleanup exceeded its budget or lost the management channel",
+                released_keys=[],
+                released_buttons=[],
+            )
+
     async def _release_all(self) -> ReleaseResult:
         keys = list(self._ledger.keys)
         buttons = list(self._ledger.buttons)
@@ -1346,7 +1445,7 @@ def _key_plan_batches(
     return batches
 
 
-def _fingerprint(action_payload: dict[str, Any], frame_id: str) -> str:
+def _fingerprint(action_payload: dict[str, Any], frame_id: str | None) -> str:
     import hashlib
     import json
 

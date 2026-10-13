@@ -8,6 +8,7 @@ actions, and it must never become a substitute for them.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -277,6 +278,105 @@ class TestGuestOperations:
         # Not "not_sent": the guest may well have executed it, and the caller must not
         # simply try again.
         assert result.effect_state == "unknown"
+
+
+class TestSharedTransactions:
+    async def test_concurrent_guest_duplicates_send_once(self, hybrid):
+        service, instance = hybrid
+        arguments = {
+            "instance_id": instance.view.instance_id,
+            "boot_epoch": instance.view.boot_epoch,
+            "frame_id": None,
+            "request_id": "concurrent",
+            "text": "hello",
+            "method": "native_text",
+        }
+        first, second = await asyncio.gather(
+            service.guest_input_text("desktop", **arguments),
+            service.guest_input_text("desktop", **arguments),
+        )
+        assert first[0].ok and second[0].deduplicated
+        assert first[0].action_seq == second[0].action_seq == 1
+        requests = [
+            message
+            for message in instance.guest_tools.transport.sent
+            if message["kind"] == "request"
+        ]
+        assert len(requests) == 1
+
+    async def test_guest_fingerprint_includes_option_values(self, hybrid):
+        service, instance = hybrid
+        arguments = {
+            "instance_id": instance.view.instance_id,
+            "boot_epoch": instance.view.boot_epoch,
+            "request_id": "options",
+            "app_id": "text-editor",
+        }
+        await service.guest_launch_app("desktop", **arguments, options={"document": "a"})
+        with pytest.raises(PaletteError) as error:
+            await service.guest_launch_app("desktop", **arguments, options={"document": "b"})
+        assert error.value.code == ErrorCode.REQUEST_ID_CONFLICT
+
+    async def test_guest_checks_frame_after_earlier_queued_action(self, hybrid):
+        service, instance = hybrid
+        frame, _ = await instance.controller.observe()
+        visual = asyncio.create_task(
+            service.act(
+                "desktop",
+                instance_id=instance.view.instance_id,
+                frame_id=frame.frame_id,
+                request_id="visual-first",
+                action={"type": "key", "keys": ["TAB"], "hold_ms": 150},
+            )
+        )
+        await asyncio.sleep(0)
+        guest = asyncio.create_task(
+            service.guest_input_text(
+                "desktop",
+                instance_id=instance.view.instance_id,
+                boot_epoch=instance.view.boot_epoch,
+                frame_id=frame.frame_id,
+                request_id="guest-second",
+                text="hello",
+                method="native_text",
+            )
+        )
+        assert (await visual)[0].ok
+        result, _ = await guest
+        assert result.error.code == ErrorCode.STALE_FRAME
+        assert result.effect_state == "not_sent"
+        requests = [
+            message
+            for message in instance.guest_tools.transport.sent
+            if message["kind"] == "request"
+        ]
+        assert requests == []
+
+    async def test_guest_timeout_is_cached_and_fences_visual_frame(self, hybrid_factory):
+        service, instance = await hybrid_factory(
+            responder=guest_service(ignore_requests=True), timeout_seconds=0.05
+        )
+        frame, _ = await instance.controller.observe()
+        arguments = {
+            "instance_id": instance.view.instance_id,
+            "boot_epoch": instance.view.boot_epoch,
+            "frame_id": frame.frame_id,
+            "request_id": "timeout",
+            "text": "hello",
+            "method": "native_text",
+        }
+        first, _ = await service.guest_input_text("desktop", **arguments)
+        repeated, _ = await service.guest_input_text("desktop", **arguments)
+        assert first.effect_state == "unknown" and first.action_seq == 1
+        assert repeated.deduplicated
+        visual, _ = await service.act(
+            "desktop",
+            instance_id=instance.view.instance_id,
+            frame_id=frame.frame_id,
+            request_id="old-visual",
+            action={"type": "move", "x": 1, "y": 1},
+        )
+        assert visual.error.code == ErrorCode.STALE_FRAME
 
 
 class TestConfiguration:

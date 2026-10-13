@@ -12,18 +12,11 @@ uv sync
 uv run palette doctor
 ```
 
-`doctor` is the gate. It reports a hard failure for anything it cannot verify — most
-commonly a missing QEMU binary. It never offers a degraded mode as an alternative:
-
-```
-palette 0.1.0 doctor
-  host      : Windows-11-10.0.26200-SP0 (AMD64)
-  python    : 3.12.13
-  profile   : default (visual_only)
-  checks    :
-    [FAIL] qemu_binary: not found on PATH or in the search paths
-  result    : NOT READY
-```
+`doctor` checks the selected host/guest target, QEMU, firmware and image prerequisites.
+Missing required components are blocking failures. A listed accelerator still needs a real
+start to prove that the host can use it. The default selector is `auto`; see the
+[platform matrix](platforms.md) for native macOS/HVF, Linux/KVM and Windows/WHPX profiles,
+plus explicitly selected TCG.
 
 Prerequisites on Windows:
 
@@ -36,7 +29,7 @@ Prerequisites on Windows:
 ## The first thing to run on a new host
 
 ```bash
-uv run python scripts/p0_probe.py --profile default
+uv run python scripts/p0_probe.py
 ```
 
 Start, screenshot, one click, screenshot again — the plan's P0 milestone, with the timings
@@ -60,6 +53,11 @@ Everything trusted lives in `palette.toml` and `profiles/*.toml`. A profile carr
 QEMU path and version pin, the accelerator, the base image and its digest, the device set,
 resource quotas, the network mode, capture and text limits, lifecycle permissions, the
 retention policy and the guest-enhancement settings.
+
+`qemu.arch` is the guest ISA, independent of the host executable. `tcg-x86_64` can run an
+x86_64 guest on Apple Silicon without Rosetta; `tcg-aarch64` provides the inverse target.
+These profiles use `cpu = "max"` and bounded software-emulation timeouts. Images must
+already match the target ISA, BIOS/UEFI mode and devices; see [platforms](platforms.md).
 
 Nothing there comes from the agent. Unknown keys are rejected, so a misspelled control
 fails loudly rather than silently leaving a default in place:
@@ -101,8 +99,12 @@ because it undoes part of what `restrict=on` provides.
 
 ## Lifecycle
 
+First run `uv run palette serve`, or use the instance already launched by the MCP client.
+Keep its stdin open. In another terminal, use the same configuration root (`--root` if
+specified). The CLI connects to that owner; it does not construct an independent manager.
+
 ```bash
-uv run palette vm start  --vm-id desktop --profile default
+uv run palette vm start  --vm-id desktop
 uv run palette vm status --vm-id desktop
 uv run palette vm stop   --vm-id desktop
 uv run palette vm reset  --vm-id desktop
@@ -120,7 +122,9 @@ uv run palette vm start --vm-id scratch \
 ```
 
 `--image` replaces the read-only backing store for this instance; the writable layer is still
-created under `.runtime/` and is still what a reset throws away. `--qemu-arg` is appended last
+created as qcow2 under `.runtime/`, including when `--image-format raw` selects a raw base.
+Extra disks are inspected as raw or qcow2 and attached read-only using their actual format.
+The manifest preserves the actual backing chain and attached files. `--qemu-arg` is appended last
 and is exactly as powerful as it sounds — read `threat-model.md` first. Operators may always
 use these; a caller acting as an agent needs the matching `allow_agent_*` switch.
 
@@ -136,6 +140,13 @@ use these; a caller acting as an agent needs the matching `allow_agent_*` switch
 
 State moves `STOPPED → STARTING → RUNNING → STOPPING → STOPPED`, with `PAUSED` and `FAILED`
 as the plan defines. An illegal transition is reported rather than smoothed over.
+
+Concurrent lifecycle commands serialize. Starting over a failed management channel first
+reaps the old QEMU; an unconfirmed exit keeps the failed instance and its disk. Cancelling
+startup rolls back its resources; cancelling a stop finishes stopping before returning.
+The startup timeout covers overlay creation, launch, QMP negotiation and first-frame polling.
+A guest's own `RESET` event advances `boot_epoch`, retires frames and reconnects guest tools
+asynchronously. It does not discard the writable disk as a clean `vm reset` does.
 
 ## Emergency stop
 
@@ -170,6 +181,17 @@ uv run palette serve --profile other # a different default profile
 Logs go to **stderr**. On stdio, stdout belongs to the MCP protocol, and a stray log line
 there corrupts the session.
 
+The operator control endpoint starts before MCP initialization, so a terminal can keep
+`serve` running while another terminal uses the CLI. Closing the CLI leaves the VM alive;
+EOF or exit of `serve` ends its ownership and stops its VMs. One owner is allowed per runtime
+root. `vm list` reads manifests offline and does not require a live owner.
+
+Operator control uses a Unix socket on POSIX and a local, current-user protected named pipe
+on Windows. `.operator/endpoint.json` under the runtime root holds endpoint discovery,
+service generation and an authentication token; `.operator/owner.lock` prevents duplicate
+owners. Keep this directory private. It is not a remote API, and operator authority is
+never supplied by an MCP tool argument.
+
 ## Where everything lives
 
 ```
@@ -198,8 +220,11 @@ and that is not something the log can undo.
 
 ## Retention
 
-Stopped instances are kept so their results can be retrieved, up to `max_overlays` besides
-the running one. Lower it if disk growth matters more than keeping recent work. Screenshots
+Both stop and reset apply retention. `keep_overlays = false` removes unused stopped layers;
+otherwise `max_overlays` limits retained stopped layers besides active instances. A layer
+that is still a backing dependency of another active or retained layer is protected, even
+if this exceeds the count limit. Unconfirmed process exits and unknown historical manifests
+are also preserved. Deletion happens only after process exit is confirmed. Screenshots
 are not kept at all unless `capture.keep_frames` is set and `retention.persist_screenshots`
 is enabled deliberately.
 
@@ -212,7 +237,12 @@ is enabled deliberately.
 | `screen_ready: false` | no valid framebuffer | the guest may still be booting; check `vm_stop`/`vm_start` if it persists |
 | `desktop_ready: null` | never verified | expected: the service does not infer readiness. Look at a screenshot |
 | A stuck key | a press was not released | `vm_release_inputs`, or `emergency-stop` if the channel is unhealthy |
-| The service died | orphaned QEMU | on Windows the job object kills it; otherwise `palette vm emergency-stop` |
+| `PRECONDITION_FAILED` from a lifecycle CLI | no running owner for this runtime | start `palette serve` with the same `--root`; `vm list` can inspect retained files offline |
+| `STATE_CONFLICT` while starting `serve` | another service owns the runtime | use that service or select a distinct runtime root |
+| `ACTION_OUTCOME_UNKNOWN` from the CLI | the connection failed after sending the command | inspect status before deciding what to do; the CLI never retries automatically |
+| The service died | its private QMP pipes cannot be adopted | Windows Job Object or POSIX supervisor cleans up; restart `serve` and create a new instance |
+| `ACCELERATION_UNAVAILABLE` | wrong ISA/host or unavailable hypervisor | fix the native prerequisites, or explicitly select a matching `tcg-*` target |
+| AArch64 firmware is missing | no matching code/vars pair was found | install EDK2/AAVMF or set both firmware paths; see [platforms](platforms.md) |
 
 ## Testing
 
@@ -228,16 +258,16 @@ The integration suite starts a real child process that speaks QMP over real pipe
 covers framing, teardown and lifecycle behaviour without needing a hypervisor. The docs check
 enforces the two-language pairing and that every relative link resolves.
 
-CI (`.github/workflows/ci.yml`) runs the **lint job** — ruff, ruff format, mypy and the
-documentation check — on every push and pull request. The **test matrix** (Ubuntu and Windows,
-Python 3.12 and 3.13, plus a real stdio MCP session and a `palette doctor` smoke check) is
-parked behind a manual `workflow_dispatch` input: it costs nothing until someone asks for it
-from the Actions tab, and putting it back on pushes is a one-line change. Both jobs run on
-Windows as well as Linux: the test matrix needs it because the job object guard,
-`CREATE_NO_WINDOW` and the reparse-point checks only run there, and the lint job needs it
-because mypy type-checks platform branches and would judge them against the wrong stubs.
+The workflow in `.github/workflows/ci.yml` defines the current OS/Python matrix and dispatch
+conditions. Platform-specific branches need their own tests: Windows Job Objects/named pipes
+and POSIX supervisors/Unix sockets are different implementations. Type-check all three targets.
 
-**Neither job can run the physical-acceptance suite**, because that needs a real QEMU and a
-guest image. Those tests skip. A green badge means the code and its documentation hold
-together — not that a virtual machine works. That second claim needs the P0 probe on a real
-host.
+To opt into E2E, set `PALETTE_E2E=1` and `PALETTE_E2E_PROFILE` to the intended configured
+profile, such as `tcg-x86_64`. `PALETTE_E2E_QEMU`, `PALETTE_E2E_IMAGE` and
+`PALETTE_E2E_ACCEL` optionally override its executable, base image and accelerator. Without
+`PALETTE_E2E_PROFILE`, the QEMU/image overrides use the configured default profile's guest
+architecture; selecting a different binary alone does not change the target ISA.
+
+**This change did not run physical acceptance.** E2E tests require an explicitly configured
+QEMU and matching guest image; otherwise they skip. Fake-process CI results do not establish
+hypervisor availability, cross-architecture boot compatibility or real desktop latency.

@@ -5,20 +5,23 @@
 Two things to be clear about before reading further.
 
 **Nothing here has been measured yet.** The numbers below are the plan's targets, kept as
-targets. This machine has no QEMU installation, so no real capture, input or boot timing
-has been taken, and no benchmark report exists.
+targets. This change adds no real capture, input or boot timing measurements for the
+expanded platform matrix, and this page contains no benchmark results.
 
 **A mock is not a measurement.** The test doubles in this repository (a fake QEMU process,
 an in-process QMP server) are fast because they do no virtualisation, rendering or guest
 scheduling at all. Timings taken against them say something about Python overhead and
 nothing about whether a real desktop meets a latency target. Any report must label its
-rows as `mock`, `TCG` or `WHPX` accordingly.
+rows as `mock`, `TCG`, `WHPX`, `HVF` or `KVM`, including host and guest architectures.
 
 ## How to measure
 
 ```bash
-PALETTE_E2E=1 PALETTE_E2E_QEMU=... PALETTE_E2E_IMAGE=... uv run pytest tests/e2e -v
+PALETTE_E2E=1 PALETTE_E2E_PROFILE=tcg-x86_64 uv run pytest tests/e2e -v
 ```
+
+Choose a configured profile for the guest ISA and accelerator being measured. Optional
+QEMU/image/accelerator overrides are described in the [operator guide](operator.md).
 
 On a fixed host — one VM, 1280×800, 2 vCPU, 4 GiB, no heavy load in the guest — record host
 CPU, memory and disk alongside each figure.
@@ -63,5 +66,5 @@ Some acceptance criteria are physical and have no useful mock equivalent:
   growth.
 
 A CI machine without hardware acceleration can run the unit suite and a TCG smoke test
-against a trusted image. That is not evidence that WHPX or the isolation properties hold,
+against a trusted image. That is not evidence that WHPX/HVF/KVM or the isolation properties hold,
 and the report must not present it as such.

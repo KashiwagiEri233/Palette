@@ -13,7 +13,7 @@ QEMU 客户机，而不是宿主机桌面。
 Agent → MCP 服务器 → 受控 QMP 接口 → QEMU 标准 HID 设备 / 显示缓冲区
 ```
 
-保留的增强路线（共用同一套权限、调度与审计，默认关闭）：
+保留的增强路线（共用同一套权限、调度与审计，需要客户机内服务）：
 
 ```
 Agent → 同一 MCP 服务器 → Guest Tool Bridge → 客户机内增强工具（原生文本、启动程序）
@@ -26,19 +26,29 @@ QEMU 参数只能通过下面那些**显式开关**到达，绝不会作为其�
 ## 状态
 
 按已文档化的 MVP 范围实现。服务本体、MCP 工具契约、QMP 客户端、截图、输入、生命周期、权限策略
-与客户机增强工具契约均已实现，并有针对 fake QMP 服务的测试覆盖。
-
-**未声称**完成实机验收（WHPX + 真实 Debian 桌面镜像）：本机没有 QEMU 可执行文件，因此
-`palette doctor` 会明确报告缺失，而不会静默回退到 TCG。
+与客户机增强工具契约均已实现，并有 fake QMP 与真实受监督子进程测试覆盖。Profile 支持原生
+Windows/WHPX、macOS/HVF、Linux/KVM，以及显式选择的 x86_64、aarch64 TCG 模拟。
+本次变更**没有执行这些平台的真实客户机验收**；模拟器替身测试不能证明桌面兼容性或真实延迟。
 
 ## 快速开始
 
 ```bash
 uv sync
 uv run palette doctor                 # 探测宿主、QEMU、加速器与 profile
-uv run palette vm start --profile default
-uv run palette serve                  # 在 stdio 上运行 MCP 服务器
+uv run palette serve                  # 保持运行，或由 MCP 客户端启动它
 ```
+
+在另一个终端使用相同配置根目录：
+
+```bash
+uv run palette vm start               # 使用宿主原生 profile
+uv run palette vm status
+uv run palette vm stop
+```
+
+VM 由 `serve` 持续管理。生命周期 CLI 命令连接正在运行的服务，不会创建临时服务。请先配置匹配的
+客户机镜像。默认 profile 选择器是 `auto`；前提条件与完整 profile 名称见[平台指南](docs/platforms.zh-CN.md)。
+Apple Silicon 上使用 `--profile tcg-x86_64` 即可模拟 x86_64 客户机，无需 Rosetta。
 
 用户指南、运维手册、客户机模板构建说明与威胁模型见 `docs/`——其中每一页都提供中英两份。**运行前
 请先读 `docs/threat-model.zh-CN.md`**：下表有三项会把服务此后无法再约束的边界交给调用方。
@@ -59,4 +69,5 @@ uv run palette serve                  # 在 stdio 上运行 MCP 服务器
 | 客户机增强工具 | 启用 | 在客户机内服务完成握手之前不产生任何效果；对着没有服务的客户机调用会如实报“不可用”，而不是变成键盘模拟 |
 | Agent 生命周期 | 仅可启动 | 启动开放；停止、强制停止与重置仍属运维 |
 | TCG 回退 | 关闭 | 缺少硬件加速是可诊断的失败。但调用方显式传 `-accel tcg` 依然会生效——参数一旦开放，参数级防护就不再是保证 |
+| 进程寿命与内存 | 依宿主平台实现 | Windows 使用 Job Object；macOS/Linux 使用 supervisor 和 250 ms RSS 采样。POSIX 内存预算允许短暂超调 |
 | 审计 | 只记动作类型、长度、时序与结果 | 绝不记录输入正文或持久化截图；调用方提供的路径进实例 manifest，不进日志 |

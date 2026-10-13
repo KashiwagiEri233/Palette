@@ -124,6 +124,10 @@ class TestFallback:
         with pytest.raises(PaletteError) as info:
             await capture.capture(display_id="video0", head=0, sink=tmp_path / "f.png")
         assert info.value.code is ErrorCode.UNSUPPORTED_CAPABILITY
+        with pytest.raises(PaletteError) as repeated:
+            await capture.capture(display_id="video0", head=0, sink=tmp_path / "again.png")
+        assert repeated.value.code is ErrorCode.UNSUPPORTED_CAPABILITY
+        assert [call.get("format") for call in client.calls] == ["png"]
 
     async def test_a_disk_error_is_not_mistaken_for_a_format_problem(self, tmp_path: Path) -> None:
         """Only a format rejection may trigger the PPM retry. A missing file or a dead VM

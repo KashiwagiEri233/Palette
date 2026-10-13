@@ -26,7 +26,7 @@ accelerator = "tcg"
 machine = "q35"
 
 [images]
-base = "G:/Workspace/Palette/images/live-scratch.qcow2"
+base = "images/live-scratch.qcow2"
 format = "qcow2"
 size_gib = 32
 

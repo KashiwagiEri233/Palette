@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
+from anyio import CancelScope
 from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 
@@ -35,6 +36,7 @@ from .models import (
     StatusResult,
     WaitResult,
 )
+from .operator import OperatorServer
 from .service import PaletteService
 
 logger = logging.getLogger("palette.server")
@@ -71,11 +73,21 @@ def build_server(service: PaletteService) -> MCPServer:
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[dict[str, Any]]:
-        await service.startup()
+        operator = OperatorServer(service)
+        operator.acquire()
         try:
+            await service.startup()
+            await operator.start()
             yield {}
         finally:
-            await service.shutdown()
+            with CancelScope(shield=True):
+                try:
+                    try:
+                        await operator.stop()
+                    finally:
+                        await service.shutdown()
+                finally:
+                    operator.release()
 
     server: MCPServer = MCPServer(
         name="palette",

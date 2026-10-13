@@ -5,9 +5,8 @@ handle is owned by the service, so if the service dies for any reason — clean 
 or being killed — the kernel tears the whole job down and no orphaned QEMU keeps running
 against the base image.
 
-The Linux implementation is a documented no-op for now; the plan defers it to the KVM
-port, where a supervising parent process is the equivalent mechanism. The interface is
-already here so the manager code does not change when that lands.
+On POSIX, the launcher supplies a SupervisedProcess that also implements this protocol.
+The no-op remains an explicit unsupported-platform result, never a claimed guarantee.
 """
 
 from __future__ import annotations
@@ -110,6 +109,20 @@ if IS_WINDOWS:
 
         def __init__(self, *, memory_limit_bytes: int | None = None) -> None:
             self._kernel32 = _WinDLL("kernel32", use_last_error=True)
+            for name, arguments, result in (
+                ("CreateJobObjectW", [ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+                ("OpenProcess", [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+                (
+                    "SetInformationJobObject",
+                    [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD],
+                    wintypes.BOOL,
+                ),
+                ("AssignProcessToJobObject", [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+                ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
+            ):
+                function = getattr(self._kernel32, name)
+                function.argtypes = arguments
+                function.restype = result
             self._handle: int | None = None
             self._memory_limit_bytes = memory_limit_bytes
             self._closed = False
@@ -122,7 +135,7 @@ if IS_WINDOWS:
             """Create the job on first use and return its handle."""
             if self._handle is not None:
                 return self._handle
-            handle = int(self._kernel32.CreateJobObjectW(None, None))
+            handle = self._kernel32.CreateJobObjectW(None, None)
             if not handle:
                 logger.error("CreateJobObject failed: %s", _get_last_error())
                 return None
@@ -146,8 +159,8 @@ if IS_WINDOWS:
                 logger.error("SetInformationJobObject failed: %s", _get_last_error())
                 self._kernel32.CloseHandle(handle)
                 return None
-            self._handle = handle
-            return handle
+            self._handle = int(handle)
+            return self._handle
 
         def attach(self, pid: int) -> bool:
             if self._closed:

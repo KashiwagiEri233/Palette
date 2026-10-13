@@ -30,6 +30,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..errors import ErrorCode, PaletteError
+from ..models import EffectState
 
 #: The version this build speaks.
 PROTOCOL_VERSION = "1.0"
@@ -138,7 +139,7 @@ class ResponsePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    effect_state: str = "submitted"
+    effect_state: EffectState = EffectState.SUBMITTED
     method: str | None = None
     launch_id: str | None = None
     detail: str | None = None

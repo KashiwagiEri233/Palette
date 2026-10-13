@@ -25,7 +25,7 @@ accelerator = "whpx"
 machine = "q35"
 
 [images]
-base = "G:/Workspace/Palette/images/debian-13-xfce-desktop.qcow2"
+base = "images/debian-13-xfce-x86_64.qcow2"
 format = "qcow2"
 size_gib = 24
 

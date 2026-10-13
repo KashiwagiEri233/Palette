@@ -28,11 +28,12 @@ from . import __version__
 from .audit import AuditLog
 from .config import PaletteConfig, find_config_root, load_config
 from .errors import ErrorCode, PaletteError
-from .models import LifecycleResult
+from .operator import OperatorClient
+from .platforms import execution_info, validate_target
 from .policy import PathGuard
 from .server import build_server
 from .service import PaletteService
-from .vm.launcher import locate_binary, probe_binary, run_sync
+from .vm.launcher import locate_binary, probe_binary, resolve_firmware, run_sync
 
 logger = logging.getLogger("palette.cli")
 
@@ -226,7 +227,15 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     service = PaletteService(config, audit=audit)
     server = build_server(service)
     logger.info("palette %s serving MCP on stdio", __version__)
-    server.run("stdio")
+    try:
+        server.run("stdio")
+    except ExceptionGroup as group:
+        error: BaseException = group
+        while isinstance(error, BaseExceptionGroup) and len(error.exceptions) == 1:
+            error = error.exceptions[0]
+        if isinstance(error, PaletteError):
+            raise error from None
+        raise
     return EXIT_OK
 
 
@@ -251,56 +260,43 @@ def _cmd_config_show(args: argparse.Namespace) -> int:
 
 
 def _cmd_vm_start(args: argparse.Namespace) -> int:
-    service = _service(args)
-    result = asyncio.run(
-        _run_start(
-            service,
-            args.vm_id,
-            args.profile,
-            image=args.image,
-            image_format=args.image_format,
-            iso=args.iso,
-            extra_disks=args.disk,
-            qemu_args=args.qemu_arg,
-        )
+    return _operator_command(
+        args,
+        "start",
+        vm_id=args.vm_id,
+        profile_id=args.profile,
+        image=args.image,
+        image_format=args.image_format,
+        iso=args.iso,
+        extra_disks=args.disk,
+        qemu_args=args.qemu_arg,
     )
-    print(json.dumps(result.model_dump(mode="json"), indent=2, default=str))
-    return EXIT_OK if result.ok else EXIT_RUNTIME
 
 
 def _cmd_vm_stop(args: argparse.Namespace) -> int:
-    service = _service(args)
-    result = asyncio.run(_run_stop(service, args.vm_id, args.force))
-    print(json.dumps(result.model_dump(mode="json"), indent=2, default=str))
-    return EXIT_OK if result.ok else EXIT_RUNTIME
+    return _operator_command(args, "stop", vm_id=args.vm_id, force=args.force)
 
 
 def _cmd_vm_reset(args: argparse.Namespace) -> int:
-    service = _service(args)
-    result = asyncio.run(_run_reset(service, args.vm_id, args.profile))
-    print(json.dumps(result.model_dump(mode="json"), indent=2, default=str))
-    return EXIT_OK if result.ok else EXIT_RUNTIME
+    return _operator_command(args, "reset", vm_id=args.vm_id, profile_id=args.profile)
 
 
 def _cmd_vm_status(args: argparse.Namespace) -> int:
-    service = _service(args)
-    result = asyncio.run(service.status(args.vm_id, actor="operator"))
-    print(json.dumps(result.model_dump(mode="json"), indent=2, default=str))
-    return EXIT_OK if result.ok else EXIT_RUNTIME
+    return _operator_command(args, "status", vm_id=args.vm_id)
 
 
 def _cmd_vm_emergency_stop(args: argparse.Namespace) -> int:
-    service = _service(args)
-    stopped = asyncio.run(_run_emergency(service, args.vm_id))
-    print(json.dumps({"stopped": stopped}, indent=2))
-    return EXIT_OK
+    return _operator_command(args, "emergency_stop", vm_id=args.vm_id)
 
 
 def _cmd_vm_take_control(args: argparse.Namespace) -> int:
-    service = _service(args)
-    epoch = asyncio.run(_run_take_control(service, args.vm_id, args.reason))
-    print(json.dumps({"vm_id": args.vm_id, "controller_epoch": epoch}, indent=2))
-    return EXIT_OK
+    return _operator_command(args, "take_control", vm_id=args.vm_id, reason=args.reason)
+
+
+def _operator_command(args: argparse.Namespace, method: str, **parameters: Any) -> int:
+    result = asyncio.run(_service(args).call(method, **parameters))
+    print(json.dumps(result, indent=2, default=str))
+    return EXIT_OK if result.get("ok", True) else EXIT_RUNTIME
 
 
 def _cmd_vm_list(args: argparse.Namespace) -> int:
@@ -323,61 +319,6 @@ def _cmd_vm_list(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-async def _run_start(
-    service: PaletteService,
-    vm_id: str,
-    profile_id: str | None,
-    *,
-    image: str | None = None,
-    image_format: str | None = None,
-    iso: list[str] | None = None,
-    extra_disks: list[str] | None = None,
-    qemu_args: list[str] | None = None,
-) -> LifecycleResult:
-    await service.startup()
-    try:
-        return await service.start(
-            vm_id,
-            profile_id=profile_id,
-            actor="operator",
-            image=image,
-            image_format=image_format,
-            iso=iso,
-            extra_disks=extra_disks,
-            qemu_args=qemu_args,
-        )
-    finally:
-        await service.shutdown()
-
-
-async def _run_stop(service: PaletteService, vm_id: str, force: bool) -> LifecycleResult:
-    await service.startup()
-    try:
-        return await service.stop(vm_id, force=force, actor="operator")
-    finally:
-        await service.shutdown()
-
-
-async def _run_reset(
-    service: PaletteService, vm_id: str, profile_id: str | None
-) -> LifecycleResult:
-    await service.startup()
-    try:
-        return await service.reset(vm_id, profile_id=profile_id, actor="operator")
-    finally:
-        await service.shutdown()
-
-
-async def _run_emergency(service: PaletteService, vm_id: str | None) -> list[str]:
-    await service.startup()
-    return await service.emergency_stop(vm_id)
-
-
-async def _run_take_control(service: PaletteService, vm_id: str, reason: str) -> int:
-    await service.startup()
-    return await service.take_control(vm_id, reason=reason)
-
-
 # --------------------------------------------------------------------------------------
 # doctor
 # --------------------------------------------------------------------------------------
@@ -395,6 +336,7 @@ def build_doctor_report(
     profile = config.profile(profile_id)
     report: dict[str, Any] = {
         "palette_version": __version__,
+        "execution": execution_info(profile),
         "ok": True,
         "host": {
             "platform": platform.platform(),
@@ -432,7 +374,16 @@ def build_doctor_report(
         if blocking and not ok:
             report["ok"] = False
 
-    binary = locate_binary(profile, config.host)
+    try:
+        validate_target(profile)
+        check("target_compatibility", True, execution_info(profile))
+    except PaletteError as exc:
+        check("target_compatibility", False, exc.message)
+    try:
+        binary = locate_binary(profile, config.host)
+    except PaletteError as exc:
+        check("qemu_architecture", False, exc.message)
+        binary = None
     check("qemu_binary", binary is not None, binary or "not found on PATH or in the search paths")
     if binary is None:
         report["acceleration"] = {"available": [], "note": "no QEMU binary to probe"}
@@ -441,6 +392,11 @@ def build_doctor_report(
         return report
 
     probe = probe_binary(binary, with_devices=True, prefix=profile.qemu.argv_prefix)
+    try:
+        profile = resolve_firmware(profile, binary)
+        check("firmware", True, profile.qemu.firmware.model_dump())
+    except PaletteError as exc:
+        check("firmware", False, exc.message)
     report["qemu"] = probe.as_dict()
     check("qemu_version", probe.found, probe.version or probe.error)
     if profile.qemu.version_pin and probe.version:
@@ -569,7 +525,7 @@ def _is_admin() -> bool:
         except Exception:
             return False
     geteuid = getattr(os, "geteuid", None)
-    return bool(geteuid()) if geteuid is not None else False
+    return geteuid() == 0 if geteuid is not None else False
 
 
 def _is_writable(path: Path) -> bool:
@@ -597,6 +553,13 @@ def _print_report(report: dict[str, Any]) -> None:
     print(f"  root      : {report['config']['root']}")
     print(f"  runtime   : {report['config']['runtime_root']}")
     print(f"  profile   : {report['profile']['profile_id']} ({report['profile']['mode']})")
+    target = report["execution"]
+    print(
+        f"  target    : {target['host_arch']} -> {target['guest_arch']} / {target['accelerator']}"
+    )
+    print(
+        f"  memory cap: {target['memory_enforcement']} (sample interval: {target['memory_sample_interval_ms']} ms)"
+    )
     checked = report.get("checks", [])
     print("  checks    :")
     for entry in checked:
@@ -619,13 +582,8 @@ def _load(args: argparse.Namespace) -> PaletteConfig:
     return load_config(root)
 
 
-def _service(args: argparse.Namespace) -> PaletteService:
-    config = _load(args)
-    audit = AuditLog(
-        config.runtime_root / "audit" / "palette.jsonl",
-        enabled=config.host.audit_enabled,
-    )
-    return PaletteService(config, audit=audit)
+def _service(args: argparse.Namespace) -> OperatorClient:
+    return OperatorClient(_load(args).runtime_root)
 
 
 def _print_error(exc: PaletteError) -> None:

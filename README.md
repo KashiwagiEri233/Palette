@@ -13,7 +13,7 @@ Baseline path:
 Agent → MCP Server → controlled QMP interface → QEMU standard HID / framebuffer
 ```
 
-Retained enhancement path (same policy, scheduling and audit, off by default):
+Retained enhancement path (same policy, scheduling and audit; requires a guest-side service):
 
 ```
 Agent → same MCP Server → Guest Tool Bridge → in-guest tools (native text, launch app)
@@ -28,18 +28,31 @@ reachable only through the explicit switches below, and never as a side effect o
 
 Implementation of the documented MVP scope. The service, the MCP tool surface, the QMP
 client, capture, input, lifecycle, policy and the guest-tool contract are implemented and
-covered by tests against a fake QMP server. Physical acceptance (WHPX + a real Debian desktop
-image) is **not** claimed: this machine has no QEMU binary, so `palette doctor` reports it as
-missing rather than degrading to TCG.
+covered by tests against a fake QMP server and real supervised child processes. Profiles support
+native Windows/WHPX, macOS/HVF and Linux/KVM, plus explicitly selected x86_64 or aarch64 TCG.
+This change has **not** undergone physical guest acceptance on that platform matrix. Tests
+against the fake emulator do not establish desktop compatibility or latency.
 
 ## Quick start
 
 ```bash
 uv sync
 uv run palette doctor                 # probe host, QEMU, acceleration, profile
-uv run palette vm start --profile default
-uv run palette serve                  # MCP server on stdio
+uv run palette serve                  # leave running, or let the MCP client launch it
 ```
+
+In another terminal, using the same configuration root:
+
+```bash
+uv run palette vm start               # uses the host's native profile
+uv run palette vm status
+uv run palette vm stop
+```
+
+`serve` owns the VMs. Lifecycle CLI commands contact that running process; they do not start
+a temporary service. Configure a matching guest image first. The default profile selector is
+`auto`; see the [platform guide](docs/platforms.md) for prerequisites and explicit profile IDs.
+On Apple Silicon, `--profile tcg-x86_64` emulates an x86_64 guest without requiring Rosetta.
 
 See `docs/` for the user guide, operator runbook, guest template build notes and the threat
 model. Read `docs/threat-model.md` before operating this: three of the defaults below hand the
@@ -62,4 +75,5 @@ same machine otherwise.
 | Guest enhancement tools | enabled | Costs nothing until a guest-side service answers the handshake; a call against a guest with no service fails as unavailable rather than becoming keystrokes |
 | Agent lifecycle | start only | Start is open; stop, force-stop and reset stay with the operator |
 | TCG fallback | disabled | Missing acceleration is a diagnosed failure. A caller passing `-accel tcg` explicitly would still get it — argument-level guards stop being guarantees once arguments are open |
+| Process lifetime and memory | host-specific | Windows uses a Job Object; macOS/Linux use a supervisor and 250 ms RSS sampling. The POSIX memory budget permits transient overshoot |
 | Audit | action type, length, timing, result | Never input text or persistent screenshots; caller-supplied paths go into the instance manifest, not the log |

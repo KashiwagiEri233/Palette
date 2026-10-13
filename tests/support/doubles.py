@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -90,9 +91,16 @@ class StubQmp:
         self.connected = True
 
     async def execute(
-        self, command: str, arguments: dict[str, Any] | None = None, *, timeout: float | None = None
+        self,
+        command: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+        on_sending: Callable[[], None] | None = None,
     ):
         del timeout
+        if on_sending is not None:
+            on_sending()
         self.counts[command] = self.counts.get(command, 0) + 1
         self.calls.append((command, json.loads(json.dumps(arguments)) if arguments else arguments))
         limit = self.fail_after.get(command)
