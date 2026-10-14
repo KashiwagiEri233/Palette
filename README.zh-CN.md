@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-[CI](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml)
+[![CI](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml/badge.svg)](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml)
 
 **Palette** 为视觉 AI Agent 提供一个**可观察、可操作、可重置的 QEMU 虚拟桌面**，并配套提供 **Palette Desktop（Electron 桌面工作台）**，支持持久虚拟机管理、实时画面查看与独占式人工键鼠接管。
 

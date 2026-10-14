@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-[CI](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml)
+[![CI](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml/badge.svg)](https://github.com/KashiwagiEri233/Palette/actions/workflows/ci.yml)
 
 **Palette** gives visual AI agents an **observable, operable, resettable QEMU virtual desktop** alongside **Palette Desktop**, an Electron workbench for persistent VM management, live screen viewing, and exclusive human takeover.
 
