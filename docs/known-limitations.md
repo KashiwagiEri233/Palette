@@ -1,89 +1,39 @@
-# Known limitations
+# Known Limitations & Scope Boundaries
 
 **English** | [简体中文](known-limitations.zh-CN.md)
 
-An honest list. Everything here is a deliberate scope boundary or a real constraint, not an
-oversight, and none of it is hidden behind a friendlier message at runtime.
+Every item on this page is either a **deliberate architectural boundary** or a **real technical constraint** in the current release. Palette reports these boundaries honestly at runtime — unsupported operations fail with explicit error codes rather than silently degrading or faking success.
 
-## Environment
+## 1. Host Environment & Platform Constraints
 
-* **The expanded platform matrix has not had physical acceptance in this change.** Fake
-  QMP and subprocess tests do not prove real guest boot, capture latency or click accuracy.
-  E2E skips unless a real QEMU and matching image are configured.
-* **Platform support is explicit.** Native Windows x86_64/WHPX, macOS Intel/Apple Silicon
-  with HVF, and Linux x86_64/aarch64 with KVM have profiles and process protection. Explicit
-  `tcg-x86_64`/`tcg-aarch64` profiles provide software emulation; no fallback occurs. See
-  [platforms](platforms.md) for prerequisites and the unverified physical matrix.
-* **POSIX memory limits are sampled.** RSS is checked every 250 ms; temporary overshoot is
-  possible. This is not a Windows Job Object equivalent hard cap. The supervisor controls
-  the QEMU process group, not processes deliberately escaping it with a new session.
-* **No guest image ships.** The base image is an operator artefact with a recorded origin
-  and digest.
+* **No Bundled Guest OS Images**: The repository ships trusted profile templates (`profiles/*.toml`), while read-only base images and installer ISOs are built or supplied by the operator and pinned by SHA-256 digest (see the [guest template guide](guest-template.md)).
+* **No Silent TCG Fallback**: Native profiles support Windows (`WHPX`), macOS Intel / Apple Silicon (`HVF`), and Linux x86_64 / aarch64 (`KVM`); cross-ISA software emulation requires explicitly selecting `tcg-x86_64` or `tcg-aarch64`. Missing hardware acceleration fails loudly with `ACCELERATION_UNAVAILABLE`.
+* **Sampled Memory Limit on POSIX**: Windows enforces `process_memory_limit_mib` as a hard kernel ceiling via a Job Object. On macOS and Linux, the POSIX supervisor samples total process-tree RSS every **250 ms** and kills the process group when exceeded, permitting brief transient overshoot. Process-group cleanup also cannot contain a host program that deliberately calls `setsid` to escape its session (which QEMU itself does not do when `allow_agent_qemu_args = false`).
+* **Physical Guest Acceptance Is Host-Specific**: Default CI suites run against supervised fake QEMU child processes and local pipes/RFB sockets to verify framing, policy, and UI state machines; physical guest compatibility must be verified on each target host and image (see the [acceptance test guide](acceptance-test.md)).
 
-## Capability
+## 2. Desktop Interaction & Device Limitations
 
-* **Unicode text is not supported in visual mode.** Strict keyboard mode covers US-layout
-  printable ASCII. Chinese, emoji and multi-line text need the guest enhancement channel,
-  which this build defines but does not implement.
-* **`type_text` is slow by design.** One input message per key phase, rate limited, so a
-  256-character string is hundreds of round trips. It does not share the click latency
-  budget.
-* **No cross-VM scheduling.** A service can own several VMs, each with its own action queue,
-  but does not balance their resources or schedule work across them.
-* **Vertical scrolling only.** Horizontal scrolling is expressible in QAPI and deliberately
-  not exposed: it is untested, and offering it "because the enum exists" would be a claim
-  without evidence.
-* **No touch, gesture or pressure input.** No multi-touch, no relative pointer lock.
-* **`vm_wait` change and stability are pixel heuristics.** A blinking cursor, a clock or an
-  animation defeats both. Neither means "the application is idle".
-* **No clipboard.** Not the host's, and not by default the guest's either.
-* **No audio, no video, no USB passthrough, no shared folders.**
+* **No Direct Unicode / CJK Text in Visual Baseline Mode**: Baseline `vm_act` `type_text` (`mode: "keyboard"`) emits **US-layout printable ASCII** key scancodes only. Control characters (`
+`, `	`) and non-ASCII characters fail pre-validation with `UNSUPPORTED_TEXT` before any key is pressed. Similarly, live human typing in the Palette Desktop console sends physical key scancodes rather than host IME composition strings.
+* **In-Guest Enhancement Daemon (`guest/agent/`) Is a Contract Only**: The host-side protocol framing, version negotiation, policy switches, and `GuestToolBridge` are fully implemented and covered by mock contract tests, but no in-guest `virtio-serial` binary is bundled yet. Calling `vm_guest_input_text` or `vm_guest_launch_app` against a guest without a running service fails cleanly as `GUEST_TOOL_UNAVAILABLE`.
+* **`type_text` Is Paced Per Keystroke**: Typing sends discrete key-down/key-up events paced by `char_interval_ms` (12 ms by default), so 256 characters require hundreds of round-trips and use a dedicated timeout budget (`max_total_ms = 15000`).
+* **Vertical Scroll Only (`up` / `down`)**: Horizontal scroll is intentionally omitted from `vm_act` because it is not part of the verified guest device baseline.
+* **No Touch, Gestures, or Relative Pointer Lock**: Pointer positioning uses absolute coordinates via `usb-tablet`; multi-touch gestures, stylus pressure, and relative pointer lock are not supported.
+* **No Host Clipboard Sharing**: Neither Palette Desktop nor MCP bridges the host clipboard into the guest.
+* **Output-Only Audio; No Microphone, Passthrough, or Shared Folders**: Palette Desktop supports **Intel HDA audio output** to the host's default audio device (when supported by the local QEMU build and guest drivers), but **never captures the host microphone** and never exposes webcam passthrough, USB/PCI passthrough, multi-monitor setups, or `9p`/`virtiofs`/SMB shared directories.
+* **`vm_wait` Change & Stability Modes Are Pixel Heuristics**: `changed` and `stable` compare 64×64 thumbnails; blinking cursors, clocks, or spinners can trigger or defeat them, and neither proves an application is logically idle.
 
-## Correctness boundaries
+## 3. State, Protocol & Correctness Boundaries
 
-* **Nothing the service does survives an open `allow_agent_qemu_args`.** That is not a bug to
-  be fixed later; it is what the switch means. See `threat-model.md`.
-* **Pixel comparison cannot detect semantic change.** Two identical-looking screenshots can
-  hide a moved button. Payment, deletion and submission still need the caller's own
-  confirmation policy.
-* **Exactly-once is in-process only.** De-duplication is bounded memory inside one service
-  lifetime. Across a crash, the honest answer is `unknown`, and the service says so instead
-  of replaying.
-* **A private anonymous pipe cannot be re-adopted.** When the service dies, the Windows Job
-  Object or POSIX supervisor cleans up QEMU. A new service must start a new instance.
-* **Frames are not archived.** Only a 64×64 thumbnail per frame is retained, and only to
-  answer "has the screen changed?".
-* **The pointer's real position is unknown.** `cursor_position_source` is `not_observed`
-  unless the service moved it, and it never claims to have observed the cursor.
-* **`screendump` is not an atomic desktop snapshot.** Updates during the write can produce a
-  torn image. It is not presented as a transactional view.
+* **`allow_agent_qemu_args = true` Removes the Host Boundary**: Allowing callers to append raw QEMU flags permits host file read/write and secondary control channels (see the [threat model](threat-model.md)). Set it to `false` (as in `profiles/strict-example.toml`) whenever the caller is untrusted.
+* **Pixel Checks Do Not Detect Semantic UI Shifts**: Frame validation guarantees that a click lands on the exact pixel coordinate of the image you observed, but a web page can move a button between two identical-looking captures. Gate payments, deletions, and submissions behind your own confirmation policy.
+* **In-Process Deduplication Only**: `request_id` deduplication lives in bounded memory for the lifetime of the service process. Across a service crash or pipe disconnect, the honest outcome is `unknown` (`ACTION_OUTCOME_UNKNOWN`), and Palette reports that rather than replaying input.
+* **Private Anonymous QMP Pipes Cannot Be Reattached Across Service Restarts**: When `daemon` or `serve` exits, the Windows Job Object or POSIX supervisor reaps its QEMU child processes. Restarting the service requires starting a new VM instance (persistent Desktop VMs keep their writable disk and UEFI variables across restarts).
+* **Hardware Cursor Position Is Not Observed**: Unless Palette moved the pointer during the current instance, `cursor_position_source` is reported as `not_observed`.
+* **`screendump` Is Not an Atomic Framebuffer Transaction**: Rapid guest screen updates during a dump can occasionally produce a torn frame.
 
-## Operations
+## 4. Networking & Operational Boundaries
 
-* **No remote MCP transport.** MCP uses stdio; the authenticated local operator socket/pipe
-  serves the CLI only. Streamable HTTP would need TLS, authentication,
-  per-VM authorization, strict `Origin`/`Host` validation, limits and audit.
-* **No multi-tenant isolation.** One operator, one host user. See the threat model for what
-  that does and does not buy.
-* **No scheduling platform.** Clients address VMs by `vm_id`; coordinating tasks across them
-  remains the caller's responsibility.
-* **Guest enhancement tools are enabled by default and still unimplemented.** The contract,
-  the policy gates, the bridge and the mock exist; the guest-side service and its transport do
-  not. Enabling the channel costs nothing and delivers nothing until such a service answers
-  the handshake, so `vm_status` reports transport and service separately and every call
-  against a service-less guest fails as unavailable.
-* **An enforced egress allowlist is not implemented.** `offline`, `restricted-lab` and `nat`
-  work; `internet-allowlist` is refused at start rather than approximated with user-mode NAT,
-  which is not an allowlist.
-* **No IPv6, DNS-rebinding or redirect handling.** The `nat` mode gives the guest the host's
-  outbound reach as-is, including whatever the host can resolve and reach.
-
-## What is implemented and tested
-
-So the list above is not read as "nothing works": the MCP tool surface, the QMP client
-(framing, correlation, events, timeouts, disconnects), capture with the PNG/PPM fallback,
-coordinate transforms, the keymap and text pre-validation, the bounded single-writer action
-transaction with frame fencing and request de-duplication, the input ledger and its cleanup,
-overlay creation and reset, path confinement, the audit trail, the lifecycle state machine,
-the guest-tool bridge and its policy gates, and the `doctor` report — all covered by tests
-that run without a hypervisor, including a real child process for the lifecycle paths.
+* **Local-Only Transports; No Multi-Tenant Remote API**: MCP runs over `stdio`, operator/desktop IPC binds to a local Unix Socket or current-user Named Pipe, and the display gateway binds strictly to `127.0.0.1`. There is no multi-tenant isolation or remote HTTP transport.
+* **No Cross-VM Job Scheduler**: A single runtime owner can manage multiple VMs concurrently (each with its own serialized queue and control lease), but cross-VM task scheduling stays with the caller.
+* **No Enforced Egress Allowlist Under User-Mode NAT**: `offline`, `restricted-lab` (`restrict=on`), and `nat` (with localhost-only port forwards) are supported. `internet-allowlist` is refused at start rather than approximated with slirp user-mode NAT.

@@ -1,104 +1,78 @@
-# Guest template
+# Guest Template Build Guide
 
 **English** | [简体中文](guest-template.zh-CN.md)
 
-How to build the read-only desktop image that `profiles/*.toml` points at. This build
-ships no image: an image is a large, licensed, host-specific artefact, and the plan
-requires the operator to record where it came from and what is in it.
+This guide explains how to build and pin the **read-only desktop base image** referenced by `profiles/*.toml`. Palette does not distribute guest OS images: disk images are large, carry OS distribution licensing obligations, and depend on the target ISA and boot firmware. Operators build or import their own template and pin its SHA-256 digest in the profile.
 
-## What the template must be
+## 1. Template Baseline Requirements
 
-| Property | Value | Why it is fixed |
+| Attribute | Target Value | Why It Is Fixed |
 | --- | --- | --- |
-| Distribution | Debian 13 (trixie), x86_64 or aarch64 matching `qemu.arch` | The original P0 uses x86_64; ARM targets need a separate image |
-| Desktop | XFCE on X11 | Predictable keyboard/pointer handling; Wayland compositors vary |
-| Resolution | 1280×800 at 100% scale | Configured *inside* the guest, not by a kernel argument |
-| Keyboard | US layout | Strict text mode assumes US; a different layout silently mistypes |
-| User | ordinary, non-root, auto-login only for a controlled development template | The plan forbids host accounts and production credentials in a shareable template |
-| Network | none needed for the fixture | The template should work with the `offline` profile network mode |
-| Fixture | `guest/fixtures/offline-workbench.html` | Gives clicks, drags, scrolls and typing a visible result |
+| **Distribution** | Debian 13 (`trixie`), `x86_64` or `aarch64` matching `qemu.arch` | Keeps environments reproducible; `x86_64` and `aarch64` require separate native installs |
+| **Desktop Session** | **XFCE** on X11 | Predictable focus and pointer behavior; Wayland compositors vary widely across virtual GPUs |
+| **Resolution & Scale** | `1280 × 800` at `100%` scale | Configured **inside** the guest desktop session to match `[display]` in the profile |
+| **Keyboard Layout** | Standard **US** layout | Visual `type_text` emits US hardware key scancodes; another layout will silently mistype punctuation |
+| **User Account** | Normal non-`root` user (auto-login only in controlled dev templates) | Shared or reusable templates must never contain host credentials, SSH keys, or production cookies |
+| **Network Dependency** | Self-contained offline (`offline` / `restricted-lab` ready) | The desktop and acceptance fixture must boot and function without internet access |
+| **Acceptance Fixture** | `guest/fixtures/offline-workbench.html` pre-installed | Gives clicks, double-clicks, drags, wheel scrolls, and keystrokes visible, deterministic feedback |
 
-## Build sketch
+## 2. Step-by-Step Build Process
 
-Choose the guest ISA and BIOS/UEFI boot mode before installing. `virt`/aarch64 uses matching
-AArch64 UEFI and virtio display/storage drivers; x86 `q35` images must match the configured
-BIOS or x86 UEFI. Switching to TCG does not convert the installed system. The complete
-host/guest combinations and firmware setup are in [platforms](platforms.md).
+Before installing, confirm your guest ISA and firmware mode in the [platform guide](platforms.md):
 
-The example below builds an x86_64 image from the configuration root. For AArch64, install
-the matching guest and use `images/debian-13-xfce-aarch64.qcow2` instead; renaming or converting
-an x86_64 disk does not change its architecture.
+* **`aarch64` (`virt` machine)**: Use matching AArch64 UEFI (EDK2/AAVMF) firmware and `virtio-gpu-pci` / `virtio-blk-pci` drivers, saving to `images/debian-13-xfce-aarch64.qcow2`.
+* **`x86_64` (`q35` machine)**: Match your configured BIOS or x86 OVMF UEFI and `VGA` / `virtio-blk-pci` drivers, saving to `images/debian-13-xfce-x86_64.qcow2`.
 
-1. Install from trusted media, recording the exact version and the media's SHA-256.
-2. Install the desktop, a browser, a text editor and the fixture above (for example at
-   `~/palette-fixture/index.html`).
-3. Pin the display to 1280×800, scale 100%, US layout. Verify with `xrandr` inside the
-   guest, not from the host.
-4. Turn off anything that changes the screen on its own: screen blanking, lock screen,
-   notification popups, first-run tours, automatic updates.
-5. Work as an ordinary user. Do **not** place host credentials, cookies, SSH keys or real
-   documents in the template.
-6. Update the system during the build, then stop automatic upgrades: a mid-task package
-   upgrade makes the desktop change underneath the agent.
-7. Shut down cleanly so the image has a consistent filesystem, then convert and hash it:
+> **Note**: Selecting `tcg-x86_64` or `tcg-aarch64` does not convert an installed guest OS, and `qemu-img convert` only changes the disk container format.
 
-   ```sh
-   qemu-img convert -O qcow2 template.raw images/debian-13-xfce-x86_64.qcow2
-   qemu-img info images/debian-13-xfce-x86_64.qcow2
-   sha256sum images/debian-13-xfce-x86_64.qcow2
-   ```
-
-8. Put the digest into the profile:
-
-   ```toml
-   [images]
-   base = "images/debian-13-xfce-x86_64.qcow2"
-   format = "qcow2"
-   sha256 = "<the digest printed above>"
-   ```
-
-Relative paths resolve from the configuration root. A pinned digest is what turns "whatever
-file is at that path" into "the image this profile is allowed to run". Without it,
-`palette doctor` reports the image as unverified. It checks the actual format using
-`qemu-img info`, independently of the filename extension.
-
-## Verifying the template
+1. **Install from Verified Media**: Record the exact OS version and SHA-256 digest of the installer ISO.
+2. **Install Desktop & Acceptance Fixture**: Install XFCE (X11), a web browser, a text editor (e.g., `mousepad`), and a file manager (e.g., `thunar`). Copy `guest/fixtures/offline-workbench.html` into the guest user's home directory (e.g., `~/palette-fixture/index.html`).
+3. **Lock Display & Keyboard**: Configure `1280 × 800` resolution, `100%` scaling, and the `us` keyboard layout inside the guest session. Verify with `xrandr` inside the guest.
+4. **Disable Autonomous Screen Changes**: Turn off screen blanking, lock screens, notification pop-ups, first-run welcome dialogs, and background unattended upgrades so the desktop never changes on its own mid-task.
+5. **Sanitize the Image**: Operate as a standard user and ensure no host credentials, cookies, SSH keys, or sensitive documents exist on the disk.
+6. **Shut Down Cleanly & Convert to Read-Only `qcow2`**: Shut the guest down gracefully so the filesystem is clean, then convert and hash the image on the host:
 
 ```bash
-uv run palette doctor --json                      # selected native profile
+qemu-img convert -O qcow2 template.raw images/debian-13-xfce-x86_64.qcow2
+qemu-img info images/debian-13-xfce-x86_64.qcow2
+sha256sum images/debian-13-xfce-x86_64.qcow2
 ```
 
-Start `uv run palette serve` (or let the MCP client start it) and keep it running. In another
-terminal with the same configuration root:
+7. **Pin the Digest in the Profile**: Add the relative path (resolved from the config root) and 64-character hex SHA-256 digest to `profiles/*.toml`:
+
+```toml
+[images]
+base = "images/debian-13-xfce-x86_64.qcow2"
+format = "qcow2"
+sha256 = "<64-hex-character sha256 digest>"
+size_gib = 24
+```
+
+Pinning `sha256` turns "whatever file happens to sit at that path" into "the exact immutable image this profile is authorized to boot." `palette doctor` inspects the actual image container via `qemu-img info` rather than trusting file extensions.
+
+## 3. Verifying the Template
+
+### Step 1: Doctor Probe & Boot Check
 
 ```bash
+uv run palette doctor --hash-base
+uv run palette daemon start
 uv run palette vm start --vm-id desktop
 uv run palette vm status --vm-id desktop
 ```
 
-`desktop_ready` is deliberately reported as `null`: a valid framebuffer may be firmware or
-a login prompt, and the service will not guess. Confirm the desktop yourself in the first
-screenshot.
+When `screen_ready` reports `true`, QEMU has produced a valid framebuffer. `desktop_ready` intentionally remains `null` unless an in-guest enhancement service completes its handshake. Open the **Palette Desktop Console** or call `vm_observe` to visually confirm the XFCE desktop has booted.
 
-## Automated acceptance
+### Step 2: Automated Hardware E2E Suite
 
-Set `PALETTE_E2E=1` and `PALETTE_E2E_PROFILE` to the matching configured profile. Optional
-QEMU/image/accelerator overrides are described in the [operator guide](operator.md). Then run:
+With a real QEMU binary and template image configured, run the hardware E2E test suite:
 
 ```bash
-uv run pytest tests/e2e -v
+PALETTE_E2E=1 PALETTE_E2E_PROFILE=default uv run pytest tests/e2e -v
 ```
 
-That suite is the plan's physical gate: 20 start/stop cycles, base-image digest unchanged,
-a click that reaches the guest, and a stale frame refused on real hardware. It is skipped
-by default, and a skipped test is not evidence of anything.
+`tests/e2e` verifies repeated start/stop cycles, byte-for-byte immutability of the base image, real clicks landing in the guest, and stale-frame rejection on real hardware.
 
-The native and cross-architecture platform matrix has not undergone physical acceptance in
-this change. Record guest ISA, accelerator, firmware and image digest with each real result.
+## 4. Optional: In-Guest Enhancement Service
 
-## The guest enhancement service
-
-`guest/agent/` is where an in-guest tool service would live. Nothing is implemented there
-yet, on purpose: the plan keeps the enhancement path as a defined contract with a disabled
-backend, so enabling it later is a transport implementation rather than an architecture
-change. See `guest/agent/README.md` for the contract the service must satisfy.
+To enable `vm_guest_input_text` (native Unicode/CJK text injection) and `vm_guest_launch_app` (launching registered allowlisted apps), install a guest daemon inside the interactive desktop session speaking the `org.palette.tools.0` (`virtio-serial`) protocol. See the [in-guest agent contract](../guest/agent/README.md) for the specification.

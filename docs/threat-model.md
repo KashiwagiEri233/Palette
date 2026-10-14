@@ -1,115 +1,65 @@
-# Threat model
+# Security Threat Model
 
 **English** | [简体中文](threat-model.zh-CN.md)
 
-What Palette defends against, what it assumes, and what it deliberately does not do.
+This document defines what Palette trusts, which boundaries are controlled by explicit profile switches, what invariants the service enforces, and what lies outside its scope.
 
-## Trust
+## 1. Trust Boundaries
 
-**Untrusted, always:**
+### Always Untrusted
 
-* anything the agent sends — arguments, coordinates, text, `request_id`s, and any claim it
-  makes about permission;
-* the guest operating system and every application inside it, including a guest that
-  attempts to attack the host;
-* web pages, documents and any text visible on screen;
-* a future remote client.
+* **Everything sent by an Agent or MCP Client**: tool arguments, coordinates, text strings, `request_id`, `frame_id`, and any claim about permissions or identity.
+* **The Guest OS and Every Application Inside It**: including a compromised guest attempting to attack the host.
+* **Everything Visible on the Guest Screen**: web pages, documents, pop-ups, terminal output, or images. **Screen content is strictly data, never instructions from the operator.**
+* **Future remote clients**.
 
-**Trusted:**
+### Trusted
 
-* the profile the operator wrote, the permission policy, this service;
-* the QEMU build the operator installed, and the host OS.
+* **Operator-Authored Configuration**: `palette.toml`, `profiles/*.toml`, policy rules, and the Palette service code.
+* **The Host Environment**: the operator-installed QEMU build, firmware files, and the host OS kernel.
 
-Screen content is **data**. An instruction that appears on screen is not an instruction
-from the operator, and nothing in the service treats it as one.
+## 2. Boundaries Controlled by Profile Switches
 
-## Boundaries a caller can open
+Three switches under `[lifecycle]` hand host material to the caller. All three are **closed** in `profiles/strict-example.toml` and **open** in `profiles/default.toml` for local experimentation. Their security consequences differ sharply:
 
-Three profile switches hand a caller material that the profile would otherwise have pinned.
-They are off in `profiles/strict-example.toml` and on in `profiles/default.toml`, and the
-consequences are not equivalent — the third one is a different category of thing.
-
-| Switch | What it grants | What the service can still do about it |
+| Profile Switch | What It Grants the Caller | What the Service Can Still Enforce |
 | --- | --- | --- |
-| `allow_agent_images` | A caller names the base image, so the disk QEMU boots is not the one the profile pinned | Nothing about the file's contents. The writable layer is still per-instance, still ours, and still discarded by reset — but the guest may be anything |
-| `allow_agent_iso` | A caller attaches a CD-ROM or extra disk from any host path | Nothing. The file is opened read-only and its path is recorded in the instance manifest |
-| `allow_agent_qemu_args` | A caller appends raw QEMU arguments | **Nothing.** `-chardev`, `-device` and `-blockdev` can read and write host files; `-mon`, `-vnc` and `-chardev socket` add a second way to drive the guest, and the single-writer guarantee silently stops holding |
+| `allow_agent_images` | Caller may pass a custom base image path to `vm_start`, bypassing the profile's pinned path and SHA-256 digest | Writable overlays (`overlay.qcow2`) remain per-instance inside `.runtime/` and are discarded on reset, but the guest OS contents are whatever resides in that file |
+| `allow_agent_iso` | Caller may attach read-only CD-ROMs (`iso`) or `extra_disks` from arbitrary host paths | Files are opened read-only and recorded in the instance `manifest.json` (never deleted on cleanup), but the guest can read whatever host files were attached |
+| `allow_agent_qemu_args` | Caller may append raw QEMU command-line flags (`qemu_args`) | **None.** `-chardev`, `-device`, and `-blockdev` can read and write arbitrary host files; `-mon`, `-vnc`, and `-chardev socket` open a second control channel that silently bypasses the single-writer guarantee |
 
-With `allow_agent_qemu_args` on, **every argument-level control in this document becomes
-advisory**: the accelerator is whatever the caller appends last, `-display none` can be
-joined by a VNC server, and the whitelisted environment protects a process that now runs
-whatever it was told to. A service that cannot read the caller's intent cannot filter for it,
-and pretending otherwise — a blocklist of "dangerous" flags — would be worse than saying so,
-because it would be bypassed by the first flag nobody thought to list.
+> **Why Not a Blacklist for `qemu_args`?**
+> Once a caller can pass raw flags to QEMU, every argument-level guard in this document becomes advisory. Maintaining a blocklist of "dangerous flags" is worse than stating the boundary plainly, because the first unblocked flag alias bypasses it. Instead, Palette makes `allow_agent_qemu_args` an explicit switch: turn it `false` to restore the host boundary. Even when open, Palette inspects appended flags and logs any extra monitor or display channels in the startup plan and audit trail so boundary changes are never invisible.
 
-The service still adds one thing the caller cannot take away: a monitor or display channel
-introduced through extra arguments is detected and recorded in the plan notes and the log, so
-a broken single-writer guarantee is visible rather than silent.
+## 3. Enforced Controls & Mitigations
 
-## Boundaries and what enforces them
+When `allow_agent_qemu_args = false`, Palette enforces the following controls:
 
-| Risk | Control |
+| Risk | Enforced Mitigation |
 | --- | --- |
-| An agent using the management interface to reach the host | no `qmp_execute`, no HMP, no generic monitor passthrough. The command allow-list is a reviewed constant, and an unknown command is refused locally without being sent. A caller can still reach QEMU's own argument surface if `allow_agent_qemu_args` is on — see above |
-| The management channel being reachable from elsewhere | QMP runs over private pipes to a child process the service started. There is no TCP listener, no VNC, no SPICE, no display window — unless a caller appends one |
-| Host files being read or written | No *managed* path is ever caller-supplied: images, frames, logs and the audit trail are composed from trusted configuration and generated identifiers, then confined to `runtime_root` with both a lexical and a link-aware check. Caller-supplied images, CD-ROMs and QEMU arguments are a deliberate exception and are outside that confinement by construction |
-| A guest attacking the host | QEMU runs unelevated with a minimal device set, no shared folders, no passthrough, and a whitelisted environment. Keep it updated; pinning a version is not a reason to skip security patches. A caller-supplied device or chardev is outside this |
-| Data leaking through a shared channel | none of 9p, virtiofs, SMB, two-way clipboard or host device passthrough is configured by Palette. A caller passing the matching arguments is their decision |
-| Reaching the host or the internal network | `restricted-lab` keeps the guest inside the slirp sandbox and `offline` attaches no NIC at all. `nat` gives the guest the host's outbound reach with no egress policy, and a configured `hostfwd` punches through the sandbox in the other direction. An enforced allowlist is refused rather than approximated |
-| Resource exhaustion | bounded action/text/capture/audit budgets and argument sizes; Windows Job Object memory limits or POSIX aggregate RSS sampling every 250 ms. POSIX permits temporary overshoot; see [platforms](platforms.md) |
-| QEMU surviving its service | Windows kill-on-close Job Object or a POSIX supervisor watching a private liveness pipe, with process-group cleanup |
-| Two writers fighting over one desktop | one action queue per VM, one controller epoch, no additional writable input path. Extra arguments that add one are logged, not prevented |
-| Logs leaking secrets | the audit trail records action type, length, timing and outcome. Never typed text, never launch arguments, never screenshots, never host paths — caller-supplied paths go into the instance manifest, which lives and dies with the instance |
-| A reset deleting the wrong thing | deletion requires a matching manifest and a confined, link-checked path; process exit must be confirmed. External caller files are never deleted, and managed layers still referenced by retained/running disks are protected |
-| A page persuading the agent to escalate | permissions come from the trusted profile. There is no tool that can grant a permission. Caller-supplied *arguments* are the one place a request can widen its own reach — which is why that switch exists separately and defaults where it does |
+| **Agent reaching the host via management APIs** | No `qmp_execute`, no HMP, and no generic monitor passthrough. The QMP client enforces a static allowlist of reviewed commands; unknown commands are rejected locally before touching the pipe |
+| **Management channel exposed on the network** | QMP runs strictly over private anonymous pipes to the child process spawned by Palette — never over TCP, VNC, or SPICE sockets |
+| **Live display stream abused to inject input** | Palette Desktop's `DisplayGateway` binds strictly to localhost, requires a one-time display ticket, and drops all client write messages at the RFB protocol layer |
+| **Path traversal or accidental host file deletion** | Managed paths (`overlay.qcow2`, transient frames, logs, audit trail, persistent definitions) are constructed from trusted config and generated IDs, then verified by `PathGuard` (both lexical confinement and symlink/junction/reparse-point checks) to stay inside `runtime_root` |
+| **Data exfiltration via shared host channels** | Palette never configures `9p`, `virtiofs`, SMB shares, bidirectional host clipboards, host USB/PCI passthrough, or microphone capture, and scrubs the QEMU child process environment via an allowlist |
+| **Guest probing the host or local network** | `offline` attaches no NIC; `restricted-lab` uses QEMU user-mode networking with `restrict=on` so the guest cannot route out of the sandbox; `internet-allowlist` is refused at start rather than approximated |
+| **Resource exhaustion or orphaned QEMU processes** | Bounded action durations, text lengths, capture sizes, queue depths, and IPC payloads; Windows uses a Kill-on-Close Job Object with kernel memory limits, and POSIX uses a dedicated process-group supervisor with 250 ms RSS sampling |
+| **Competing writers on the same desktop** | Single serialized action queue per VM and a single-writer input controller; human takeover in Palette Desktop or `palette vm take-control` increments `controller_epoch` and retires all prior agent frames |
+| **Secrets leaking into logs** | `audit/palette.jsonl` records only action type, length, timing, outcome, and error code — **never** input text, launch arguments, persistent screenshots, or host paths |
+| **Prompt injection on screen escalating privileges** | Permissions come strictly from the static profile on disk; no MCP tool can grant permissions or assume the `operator` role |
 
-## What Palette does not defend against
+## 4. Explicit Non-Goals
 
-The CLI's operator channel is local: a Unix socket on POSIX or a current-user protected
-named pipe on Windows, with a runtime-scoped token and service generation. It shares the
-existing service and does not expose QMP or accept an agent-supplied operator role. A
-process already running as that same OS user is outside this boundary.
+* **Malicious Processes Running as the Same Host OS User**: Local operator IPC uses current-user-restricted Unix Sockets (POSIX) or Named Pipes (Windows) with per-runtime tokens. Any process already running as the same OS user can read `.runtime/` or invoke QEMU directly. Defending against same-user processes requires a separate low-privilege service account and OS sandbox.
+* **Multi-Tenancy**: A single Palette service instance runs under one host user and operator authority without per-tenant quotas or isolation.
+* **Hostile Malware Sandboxing**: Treat the guest VM as an operational containment boundary for agents, not a formally verified zero-day malware sandbox (especially under TCG software emulation, for which QEMU provides no security isolation guarantee).
+* **Hiding Screen Content from the Vision Model**: Screenshots are captured specifically to be sent to the configured model. Not persisting screenshots to disk does not mean no one saw them — always use test accounts and non-sensitive templates inside the guest.
+* **Cross-Crash Exactly-Once Execution**: `request_id` deduplication is bounded and in-memory for the life of the service process. If a crash or disconnect occurs between sending input and recording the result, Palette reports `unknown` (`ACTION_OUTCOME_UNKNOWN`) rather than replaying the action.
+* **Tool Annotations as Authorization**: MCP `readOnlyHint` and `destructiveHint` help clients render UI prompts; all real authorization is enforced server-side on every call.
 
-* **A malicious process already running as the same host user.** Anything that can read
-  this user's files can read the runtime directory and talk to the same QEMU binary.
-  Stronger isolation needs a separate low-privilege service account and an OS sandbox —
-  a reasonable next step, not something this MVP claims.
-* **Multi-tenancy.** One service runs under one host user and operator authority, including
-  when it owns several VMs. There is no per-tenant authorization, quota or audit separation.
-* **Real malware.** A guest is a virtual machine, not a proof. Treat it as a containment
-  measure, not a sandbox for hostile code.
-* **Screenshots staying private.** A screenshot is sent to whichever model the client
-  configured. Not writing it to disk does not mean nobody saw it. Use test accounts and a
-  template with nothing sensitive in it, and assume anything on screen reached the model.
-* **The remote transport.** MCP uses stdio; the operator channel is local only. Streamable HTTP would need TLS,
-  authentication, per-VM authorization, strict `Origin`/`Host` validation, message limits,
-  rate limits, session expiry and audit — and an MCP session id is not an identity.
-* **Guaranteed exactly-once.** De-duplication is in-process and bounded. A crash between
-  sending input and recording the result leaves an action whose outcome nobody knows; the
-  service reports `unknown` rather than replaying it.
-* **A caller who may supply QEMU arguments.** Once `allow_agent_qemu_args` is on, the host
-  boundary is the caller's to keep, and every argument-level control in this document is
-  advisory. This is the one item on this list that is a configuration choice rather than a
-  limit of the design: turn the switch off and the boundary is back.
-* **A caller who may supply a base image.** The guest is then whatever that file contains.
-  Treat an image from an untrusted source exactly as you would treat running it directly.
-* **Tool annotations as authorization.** `readOnlyHint` and `destructiveHint` help a client
-  present a decision. They replace nothing: every call is checked server-side.
+## 5. Summary of Enforced Guarantees
 
-## Guarantees the service does make
-
-* Input is never sent to an instance other than the one the request names, or from a frame
-  that another action has already invalidated.
-* A timeout, a lost response or a failed follow-up screenshot **never** causes an automatic
-  replay. The receipt says `unknown`, and the decision to try again is the caller's.
-* A release is only reported as confirmed when the service actually confirmed it. A dead
-  channel produces "cannot confirm", never a claim of success.
-* Cleanup only touches objects registered in a manifest and confined to the runtime root.
-  External caller-supplied files are opened read-only and are never deleted. A managed
-  layer used as another image's backing store is protected while that dependency is retained.
-* Host-material switches are authorised one at a time. Supplying an image does not imply the
-  right to supply arguments, and each refusal names the switch that would have allowed it.
-* `system_reset` is never treated as a reset: a clean reset replaces the writable layer and
-  leaves the base image byte-for-byte identical. With a caller-supplied base the same holds
-  for that file. A guest `RESET` event invalidates frames and guest-tool sessions immediately;
-  reconnecting the enhancement channel does not block the visual baseline.
+1. **No Cross-Instance or Stale-Frame Input**: Input is never sent to the wrong `instance_id` or against a `frame_id` invalidated by another action, resize, boot, or control takeover.
+2. **Never Replay Unknown Outcomes**: Timeouts, broken pipes, or failed post-action captures never trigger automatic input replay.
+3. **Honest Input Release Reporting**: `release_confirmed` is reported as `true` only after the underlying channel confirms release.
+4. **Byte-for-Byte Base Image Immutability**: `vm_reset` and Desktop **Restore Initial State** replace the writable `overlay.qcow2` and per-VM UEFI variable copy inside `.runtime/` without ever modifying or deleting the read-only base image.

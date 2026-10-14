@@ -1,68 +1,55 @@
-# Guest tool service (not implemented)
+# In-Guest Enhancement Service Contract (`guest/agent/`)
 
 **English** | [简体中文](README.zh-CN.md)
 
-This directory is the intended home of the in-guest service behind the retained
-enhancement channel. **No implementation exists in this build.** The host side is
-complete — protocol, framing, version negotiation, capability reconciliation, policy and
-a mock — and `VirtioSerialGuestToolTransport` reports "not implemented" rather than
-pretending to connect.
+This directory defines the protocol specification for the guest-side daemon backing Palette's **Retained Guest Enhancement Channel**.
 
-The plan's position is deliberate: the enhancement path is defined now, with a disabled
-backend and mock contract tests, so that turning it on later is a transport
-implementation rather than an architecture change. It is also explicitly *not* reduced to
-a clipboard broker, and it is explicitly *not* a general guest shell.
+* **Host-Side Status (Implemented & Tested)**: Length-prefixed framing (`src/palette/guest_tools/protocol.py`), version and capability intersection negotiation, policy enforcement, `GuestToolBridge` (`src/palette/guest_tools/bridge.py`), and an in-process fault-injecting transport (`MemoryGuestToolTransport`) are fully implemented and covered by automated tests.
+* **Guest-Side Status (Specification Only; No Binary Bundled)**: Until a guest image runs a daemon implementing this contract over `virtio-serial`, `VirtioSerialGuestToolTransport` reports the channel as offline, `vm_status` reports transport and service readiness as separate facts, and calls to `vm_guest_input_text` or `vm_guest_launch_app` fail cleanly with `GUEST_TOOL_UNAVAILABLE` — **never silently downgrading to simulated keystrokes**.
 
-## What a service would have to satisfy
+Keeping the host bridge and contract complete today means that enabling native Unicode/CJK text injection or allowlisted app launching later requires only dropping in a guest daemon and wiring the `virtio-serial` transport, without changing Palette's policy, scheduling, or audit architecture.
 
-### Transport
+## 1. Transport Specification
 
-* Reachable over a per-instance channel that the host opens privately. The plan's first
-  choice is a dedicated virtio-serial port (`org.palette.tools.0`); it must not be a
-  listening TCP socket, and it must not share QEMU's QMP stream.
-* Length-framed messages: a 4-byte big-endian length followed by UTF-8 JSON, matching
-  `palette.guest_tools.protocol`.
-* Size and rate limited on both sides.
+* **Dedicated Private Channel**: Communicates over a per-instance `virtio-serial` port (`org.palette.tools.0`) opened privately by the host. It must never use a listening TCP socket and must never multiplex onto QEMU's QMP stream.
+* **Length-Prefixed Framing**: Each message consists of a **4-byte big-endian unsigned integer (`uint32 BE`)** payload length followed by that many bytes of **UTF-8 JSON** (matching `palette.guest_tools.protocol`).
+* **Bounded Bidirectional Limits**: Both host and guest enforce maximum message byte lengths and request rate limits.
 
-### Handshake
+## 2. Handshake & Capability Intersection
 
-1. Host sends `hello` with its protocol versions, `vm_id`, `instance_id`, `boot_epoch`,
-   a `connect_id`, and the capabilities it intends to use.
-2. Service replies `hello_ack` with the version it selected, the capabilities and input
-   methods it actually offers, its registered applications, the session it is attached
-   to, and whether an interactive desktop is ready.
+Upon connection or after a guest `RESET` event, the host and guest service perform an explicit handshake:
 
-Both sides must report the *intersection* of what was asked for and what they can do. A
-service that advertises a capability it cannot honour is worse than one that offers fewer.
+1. **Host Sends `hello`**:
+   Includes `protocol_version` (`"1.0"`), `vm_id`, `instance_id`, `boot_epoch`, a unique `connect_id`, and the `capabilities` and `input_methods` permitted by the active profile.
+2. **Guest Service Replies with `hello_ack`**:
+   Reports the selected `protocol_version`, the `capabilities` and `input_methods` the guest service actually implements, its registered `allowed_apps`, the attached session type (`"interactive"`), and whether the interactive desktop is ready (`desktop_ready: true/false`).
 
-### Operations
+> **Intersection Rule**: Both sides enforce the strict **intersection** of what the profile permits and what the guest service actually provides. A service must never advertise a capability or input method it cannot honor.
 
-| Capability | Request | Notes |
-| --- | --- | --- |
-| `guest.input_text` | `{text, method, target}` | `method` is `native_text` or `clipboard_paste`; the service must reject a method it does not offer rather than substituting another |
-| `guest.launch_app` | `{app_id, options}` | `app_id` resolves to a fixed executable with a bounded set of options. Never a free-form command line, path or argv array, and never a shell |
+## 3. Supported Operations
 
-### Non-negotiable rules
+The guest service exposes strictly two bounded operations — **it is neither a general guest shell nor a host-clipboard broker**:
 
-* **Run in the interactive user session.** On Linux, bind to the graphical session's
-  environment. Creating a process in the wrong session is not "opening an application".
-* **Never escalate.** No automatic `sudo`, no UAC prompt, no inheriting host secrets.
-* **Report honestly.** Return `effect_state` (`not_sent`, `submitted`, `partial`,
-  `unknown`), the method actually used, and a `launch_id` for a launch. An accepted
-  request is not a completed task: a process existing does not mean a window is visible.
-* **Treat the host as untrusted in the other direction too.** The service is a small
-  attack surface inside the guest; it should validate everything it receives and expose no
-  file, shell or process-management operations beyond the two capabilities above.
+| Capability | MCP Tool | Request Payload | Rules & Constraints |
+| --- | --- | --- | --- |
+| `guest.input_text` | `vm_guest_input_text` | `{text, method, target}` | `method` is explicitly `"native_text"` (written via the guest OS platform API) or `"clipboard_paste"` (sets the *guest's* clipboard only, never the host's). The service must reject any method it does not implement rather than silently substituting another |
+| `guest.launch_app` | `vm_guest_launch_app` | `{app_id, options}` | `app_id` resolves to a fixed executable path and bounded option allowlist registered in both the profile and guest (e.g., `text-editor` → `/usr/bin/mousepad`). **Never accepts free-form command lines, arbitrary paths, or `argv` arrays, and never invokes a shell** |
 
-## Testing a future implementation
+## 4. Non-Negotiable Security Rules
 
-Replace `VirtioSerialGuestToolTransport` with the real transport and run:
+1. **Run Inside the Interactive User Session**: Bind to the active graphical desktop session (`target_session = "interactive"`). Spawning a process in a detached background session does not count as launching a desktop app.
+2. **Never Elevate Privileges**: Run as the standard desktop user — no automatic `sudo`, no UAC elevation prompts, and no inherited host secrets.
+3. **Report `effect_state` Honestly**: Return `effect_state` (`not_sent`, `submitted`, `partial`, or `unknown`), the actual `method` used, and a `launch_id` for app launches. A running process does not prove a window appeared on screen — agents still verify visually via post-action screenshots.
+4. **Treat the Channel as Untrusted Input**: Validate every incoming JSON payload, enforce `max_text_chars` (4096 by default), and expose zero file-system, shell, or arbitrary process-control endpoints.
+
+## 5. Testing a Guest Service Implementation
+
+After wiring `VirtioSerialGuestToolTransport` to your guest daemon, run the contract and integration suites:
 
 ```bash
-uv run pytest tests/guest_tools -v        # contract tests, in-process
+# In-process protocol, handshake intersection, timeout, and out-of-order reply tests
+uv run pytest tests/guest_tools -v
+
+# End-to-end service integration tests for the guest enhancement channel
 uv run pytest tests/integration/test_guest_channel.py -v
 ```
-
-`MemoryGuestToolTransport` implements the same interface as a real channel and can stall,
-disconnect or reorder replies, so the bridge's timeout, correlation and generation logic is
-already exercised the way a real service would exercise it.

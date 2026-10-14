@@ -1,93 +1,80 @@
-# 客户机模板
+# 客户机模板构建指南
 
 [English](guest-template.md) | **简体中文**
 
-如何构建 `profiles/*.toml` 所指向的只读桌面镜像。本项目不分发镜像：镜像是体积庞大、带许可
-义务、且与宿主强相关的产物，计划要求运维记录它从哪来、里面有什么。
+本文说明如何构建并固化 `profiles/*.toml` 所指向的**只读桌面基础镜像**。Palette 仓库本身不分发客户机系统镜像：基础镜像体积庞大、附带操作系统发行版许可义务，且强依赖于目标指令集与启动固件，因此应由运维人员按本规范在本地构建并锁定 SHA-256 摘要。
 
-## 模板必须满足什么
+## 1. 标准客户机模板基线要求
 
-| 属性 | 取值 | 为什么固定 |
+| 属性维度 | 推荐标准取值 | 为什么要固定这一项 |
 | --- | --- | --- |
-| 发行版 | Debian 13 (trixie)，匹配 `qemu.arch` 的 x86_64 或 aarch64 | 原始 P0 使用 x86_64；ARM 目标需要独立镜像 |
-| 桌面 | X11 上的 XFCE | 键盘与指针行为可预测；Wayland compositor 之间差异较大 |
-| 分辨率 | 1280×800，100% 缩放 | 在客户机**内部**配置，而不是靠内核参数 |
-| 键盘 | US 布局 | 严格文本模式假定 US；换一种布局会静默打错字 |
-| 用户 | 普通非 root 用户，仅受控开发模板允许自动登录 | 计划禁止在可分享的模板里放宿主账号与生产凭据 |
-| 网络 | 夹具不要求联网 | 模板应能在 profile 的 `offline` 网络模式下工作 |
-| 夹具 | `guest/fixtures/offline-workbench.html` | 让点击、拖拽、滚轮和输入都有可见的结果 |
+| **操作系统发行版** | Debian 13 (`trixie`)，匹配 `qemu.arch` 的 `x86_64` 或 `aarch64` | 保持跨宿主实验环境一致；`x86_64` 与 `aarch64` 需要各自独立安装的镜像 |
+| **桌面会话环境** | X11 上的 **XFCE** | 键盘焦点与指针坐标行为确定且轻量；不同 Wayland 合成器在虚拟设备下的行为差异较大 |
+| **内部分辨率与缩放** | `1280 × 800`，`100%` 缩放 | 在客户机桌面环境**内部**固定配置，确保与 Profile 的 `[display]` 声明一致，避免中途跳变 |
+| **键盘布局** | 标准 **US** 布局 | 视觉基线的 `type_text` 发送 US 硬件扫描码；若客户机设为其他布局会静默打错符号 |
+| **登录用户** | 普通非 `root` 用户（仅受控开发模板可开启自动登录） | 严禁在可复用的基础模板中存放宿主机真实账号、生产凭据、SSH 私钥或浏览器 Cookie |
+| **网络依赖** | 离线自足（支持 `offline` 与 `restricted-lab`） | 桌面及验收夹具不得依赖公网连接才能启动或渲染 |
+| **离线验收夹具** | 预置仓库中的 `guest/fixtures/offline-workbench.html` | 让单击、双击、右键、拖拽、滚轮和键盘输入都能产生确定、可见的像素状态变化 |
 
-## 构建步骤概览
+## 2. 镜像构建步骤
 
-安装前先确定客户机 ISA 与 BIOS/UEFI 启动模式。`virt`/aarch64 使用匹配的 AArch64 UEFI 与
-virtio 显示/存储驱动；x86 `q35` 镜像必须匹配所配置的 BIOS 或 x86 UEFI。切换到 TCG 不会
-转换已安装的系统。完整宿主/客户机组合与固件配置见[平台指南](platforms.zh-CN.md)。
+在开始安装前，请先根据[平台与客户机架构指南](platforms.zh-CN.md)确定客户机 ISA 与引导模式：
 
-下面的例子在配置根目录下构建 x86_64 镜像。AArch64 应安装匹配的客户机，并改用
-`images/debian-13-xfce-aarch64.qcow2`；重命名或转换 x86_64 磁盘不会改变其架构。
+* **`aarch64`（`virt` 机器模型）**：使用匹配的 AArch64 UEFI（EDK2/AAVMF）固件与 `virtio-gpu-pci` / `virtio-blk-pci` 驱动，输出至 `images/debian-13-xfce-aarch64.qcow2`。
+* **`x86_64`（`q35` 机器模型）**：匹配所选 BIOS 或 x86 OVMF UEFI 及 `VGA` / `virtio-blk-pci` 驱动，输出至 `images/debian-13-xfce-x86_64.qcow2`。
 
-1. 从可信介质安装，记录确切版本与介质的 SHA-256。
-2. 安装桌面环境、浏览器、文本编辑器，以及上面那个夹具页面（例如放到
-   `~/palette-fixture/index.html`）。
-3. 固定显示为 1280×800、100% 缩放、US 布局。用客户机内的 `xrandr` 验证，不要从宿主机验证。
-4. 关掉一切会自行改变画面的东西：屏幕熄灭、锁屏、通知弹窗、首次运行引导、自动更新。
-5. 用普通用户身份操作。**不要**把宿主凭据、cookies、SSH 私钥或真实文档放进模板。
-6. 构建期间更新系统，然后关闭自动升级：任务进行到一半时升级软件包，会让桌面在 Agent 眼皮底下
-   发生变化。
-7. 正常关机，使镜像文件系统一致，然后转换并计算摘要：
+> **注意**：切换到 `tcg-x86_64` 或 `tcg-aarch64` 不会转换已安装系统的架构，重命名或 `qemu-img convert` 也只改变磁盘容器格式。
 
-   ```sh
-   qemu-img convert -O qcow2 template.raw images/debian-13-xfce-x86_64.qcow2
-   qemu-img info images/debian-13-xfce-x86_64.qcow2
-   sha256sum images/debian-13-xfce-x86_64.qcow2
-   ```
+按以下步骤构建并固化基础镜像：
 
-8. 把摘要写进 profile：
-
-   ```toml
-   [images]
-   base = "images/debian-13-xfce-x86_64.qcow2"
-   format = "qcow2"
-   sha256 = "<上面打印出的摘要>"
-   ```
-
-相对路径从配置根目录解析。固定摘要的作用，是把“那个路径上恰好放着的文件”变成“这个 profile
-被允许运行的镜像”。没有它，`palette doctor` 会把镜像报告为未经校验。它通过 `qemu-img info`
-探测实际格式，不依赖文件扩展名。
-
-## 验证模板
+1. **从可信安装介质安装系统**：记录所用安装 ISO 的确切版本号与 SHA-256 摘要。
+2. **安装桌面与基础工具**：安装 XFCE（X11）、轻量级浏览器、文本编辑器（如 `mousepad`）、文件管理器（如 `thunar`），并将仓库内的 `guest/fixtures/offline-workbench.html` 复制到客户机本地（例如 `~/palette-fixture/index.html`）。
+3. **固定显示分辨率与键盘布局**：在客户机内部将显示分辨率固定为 `1280 × 800`（100% 缩放）、键盘布局设为 `us`，并通过客户机内的 `xrandr` 验证实际输出尺寸。
+4. **关闭一切自发画面干扰源**：禁用屏幕保护程序、自动熄屏、自动锁屏、桌面通知弹窗、浏览器首次运行向导以及后台自动升级（构建期间完成系统更新后即关闭自动更新，防止 Agent 执行任务中途弹出更新窗口改变画面）。
+5. **清理敏感数据**：确认使用普通非特权用户，清除命令历史、临时缓存，确保镜像内不含任何宿主机凭据、私钥或真实个人文档。
+6. **正常关机并转换为只读 `qcow2` 模板**：在客户机内执行正常关机以确保文件系统完全同步，随后在宿主机上转换格式并计算 SHA-256 摘要：
 
 ```bash
-uv run palette doctor --json                      # 选定的原生 profile
+qemu-img convert -O qcow2 template.raw images/debian-13-xfce-x86_64.qcow2
+qemu-img info images/debian-13-xfce-x86_64.qcow2
+sha256sum images/debian-13-xfce-x86_64.qcow2
 ```
 
-启动 `uv run palette serve`（或由 MCP 客户端启动）并保持运行。在另一终端使用相同配置根目录：
+7. **将路径与摘要锁定到 Profile**：打开对应的 `profiles/*.toml`，填入相对路径（从配置根目录解析）与 64 位十六进制 SHA-256 摘要：
+
+```toml
+[images]
+base = "images/debian-13-xfce-x86_64.qcow2"
+format = "qcow2"
+sha256 = "<上面计算出的 64 位 SHA-256 摘要>"
+size_gib = 24
+```
+
+锁定 `sha256` 的作用，是把“恰好放在那个路径上的某个磁盘文件”变成“经此 Profile 明确授权运行的那一份不可变镜像”。未配置 `sha256` 时，`palette doctor` 会提示基础镜像未经哈希锁定；`doctor` 同时会通过 `qemu-img info` 探测真实容器格式，而非仅看文件扩展名。
+
+## 3. 验证客户机模板
+
+### 步骤 1：运行 `doctor` 与基础启动验证
 
 ```bash
+uv run palette doctor --hash-base
+uv run palette daemon start
 uv run palette vm start --vm-id desktop
 uv run palette vm status --vm-id desktop
 ```
 
-`desktop_ready` 会被刻意报成 `null`：一个有效的显示缓冲区可能是固件界面，也可能是登录提示，
-而服务不会去猜。请在截图里自己确认桌面已经起来。
+观察 `vm_status` 输出：当 `screen_ready` 变为 `true` 时，说明已抓取到有效显示缓冲区；`desktop_ready` 在未运行客户机内增强服务时保持为 `null`（服务不会从帧缓冲猜测是否已进入桌面）。请打开 **Palette Desktop 控制台**或调用 `vm_observe` 亲眼确认客户机已进入 XFCE 桌面。
 
-## 自动化验收
+### 步骤 2：运行实机 E2E 验收套件
 
-设置 `PALETTE_E2E=1`，并把 `PALETTE_E2E_PROFILE` 指向匹配的已配置 profile。可选的
-QEMU/镜像/加速器覆盖方式见[运维指南](operator.zh-CN.md)。然后运行：
+配置好真实 QEMU 与模板镜像后，可通过环境变量开启实机端到端测试：
 
 ```bash
-uv run pytest tests/e2e -v
+PALETTE_E2E=1 PALETTE_E2E_PROFILE=default uv run pytest tests/e2e -v
 ```
 
-这套测试就是计划的实机门槛：20 次启停循环、基础镜像摘要不变、一次真正到达客户机的点击，以及
-在真实硬件上被拒绝的过期 frame。它默认跳过——而被跳过的测试不构成任何证据。
+`tests/e2e` 会验证连续启停循环、基础镜像哈希逐字节不变、真实点击到达客户机桌面，以及过期 `frame_id` 在真实实例上被正确拒绝。
 
-本次变更没有对原生及跨架构矩阵执行实机验收。每次真实测量都应同时记录客户机 ISA、加速器、
-固件与镜像摘要。
+## 4. 可选：集成客户机内增强服务
 
-## 客户机增强服务
-
-`guest/agent/` 是客户机内工具服务将来的所在位置。那里目前刻意什么都没有实现：计划把增强路线
-保持为一份已定义契约加一个 disabled 后端，这样以后启用它就是实现一个传输层，而不是改动架构。
-该服务必须满足的契约见 `guest/agent/README.md`。
+若需在客户机内启用 `vm_guest_input_text`（原生 Unicode/中文输入）与 `vm_guest_launch_app`（启动注册白名单应用），需在客户机的交互式图形会话中部署实现 `org.palette.tools.0`（`virtio-serial`）协议的守护进程。完整协议与安全要求见[客户机内增强服务契约](../guest/agent/README.zh-CN.md)。

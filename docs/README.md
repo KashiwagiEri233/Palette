@@ -1,53 +1,66 @@
-# Palette documentation
+# Palette Documentation Hub
 
 **English** | [简体中文](README.zh-CN.md)
 
-These pages are the practical documentation: what the agent may call, how to run the host, how
-to build the image, and what is deliberately out of scope. Two rules run through all of them —
-the agent gets images and bounded actions and nothing else, and the visual baseline has to keep
-working on its own.
+This directory contains the technical and operational documentation for Palette, covering **Palette Desktop**, the **MCP visual agent tool contract**, **shared daemon and CLI operations**, **cross-platform hardware acceleration**, and the **security threat model**.
 
-| Document | Read it when |
+Two core invariants run through every page:
+
+1. **Strict Agent Boundary**: Agents receive screenshots and submit bounded actions; they never touch raw QMP, HMP, the host desktop, or a general guest shell.
+2. **Self-Sufficient Visual Baseline**: The visual loop works end-to-end using standard framebuffer captures and standard HID keyboard/pointer events alone, without requiring any in-guest agent.
+
+## Documentation Map
+
+| Document | Audience & Scope |
 | --- | --- |
-| [`../README.md`](../README.md) · [中文](../README.zh-CN.md) | you want the one-paragraph summary and the safety defaults |
-| [`user-guide.md`](user-guide.md) · [中文](user-guide.zh-CN.md) | you are the agent or the client author: the tool contracts, the loop, the limits |
-| [`operator.md`](operator.md) · [中文](operator.zh-CN.md) | you run the host: install, profiles, lifecycle, emergency stop, recovery |
-| [`acceptance-test.md`](acceptance-test.md) · [中文](acceptance-test.zh-CN.md) | you test MCP connection, Agent clicks and GUI display/status synchronization |
-| [`platforms.md`](platforms.md) · [中文](platforms.zh-CN.md) | you choose Windows/macOS/Linux, a native guest or explicit TCG, firmware and resource limits |
-| [`guest-template.md`](guest-template.md) · [中文](guest-template.zh-CN.md) | you are building the desktop image the profile points at |
-| [`threat-model.md`](threat-model.md) · [中文](threat-model.zh-CN.md) | you need to know what is trusted, what is enforced, and what is out of scope |
-| [`benchmarks.md`](benchmarks.md) · [中文](benchmarks.zh-CN.md) | you are measuring performance, or wondering whether anything has been measured |
-| [`known-limitations.md`](known-limitations.md) · [中文](known-limitations.zh-CN.md) | you want the honest list of what does not work yet |
-| [`../guest/agent/README.md`](../guest/agent/README.md) · [中文](../guest/agent/README.zh-CN.md) | you are implementing the guest-side enhancement service |
+| [Project Overview (../README.md)](../README.md) · [简体中文](../README.zh-CN.md) | Architecture overview, key features, quick start, and safety default switches |
+| [Desktop Guide (desktop.md)](desktop.md) · [简体中文](desktop.zh-CN.md) | Running Palette Desktop from source, persistent VM creation, offline hardware settings, read-only RFB gateway, human takeover, and shared daemon usage |
+| [Agent \& Client User Guide (user-guide.md)](user-guide.md) · [简体中文](user-guide.zh-CN.md) | For agent and MCP client authors: the 10 MCP tools, `vm_observe → vm_act` loop, frame epoch guards, text rules, and error recovery |
+| [Operator Runbook (operator.md)](operator.md) · [简体中文](operator.zh-CN.md) | For host administrators: host probing, `daemon` vs `serve`, profiles, lifecycle commands, emergency stop, retention, and fault recovery |
+| [Platforms \& Guest Architectures (platforms.md)](platforms.md) · [简体中文](platforms.zh-CN.md) | Native Windows (`WHPX`), macOS (`HVF`), and Linux (`KVM`) profiles, explicit cross-ISA `TCG`, UEFI firmware discovery, and process memory caps |
+| [Guest Template Guide (guest-template.md)](guest-template.md) · [简体中文](guest-template.zh-CN.md) | Building, hardening, and SHA-256 pinning the read-only Debian 13 + XFCE base image |
+| [Threat Model (threat-model.md)](threat-model.md) · [简体中文](threat-model.zh-CN.md) | Trust boundaries, caller-supplied material switches (`allow_agent_*`), enforced guarantees, and explicit non-goals |
+| [End-to-End Acceptance Testing (acceptance-test.md)](acceptance-test.md) · [简体中文](acceptance-test.zh-CN.md) | Full verification workflow from shared `daemon` startup, GUI VM creation, MCP observation/clicks, and human takeover to hardware settings and real test records |
+| [Benchmarks (benchmarks.md)](benchmarks.md) · [简体中文](benchmarks.zh-CN.md) | Capture latency, single-click round-trip, cold-boot phase breakdown targets, overhead analysis, and physical correctness criteria |
+| [Known Limitations (known-limitations.md)](known-limitations.md) · [简体中文](known-limitations.zh-CN.md) | Honest scope boundaries around IME, clipboard, allowlist networking, in-process deduplication, and multi-monitor |
+| [In-Guest Agent Contract (../guest/agent/README.md)](../guest/agent/README.md) · [简体中文](../guest/agent/README.zh-CN.md) | Length-prefixed JSON protocol, capability handshake, and security rules for the optional `virtio-serial` guest service |
+| [Guest Images Directory (../images/README.md)](../images/README.md) · [简体中文](../images/README.zh-CN.md) | Base image storage conventions and `palette doctor` verification |
 
-Every page here exists in both languages; the two versions are kept in step by hand, and a
-change to one is incomplete until the other is updated too.
+> **Bilingual Pairing Rule**: Every user documentation page ships in both English (`*.md`) and Simplified Chinese (`*.zh-CN.md`). `scripts/check_docs.py` enforces language switchers, resolvable relative links, balanced code fences, and valid UTF-8 in CI.
 
-## Where things are in the code
+## Source Code Map
 
-| Path | What lives there |
+| Path | Responsibility |
 | --- | --- |
-| `src/palette/server.py` | the MCP tool surface: schemas, images, structured results |
-| `src/palette/service.py` | policy, dispatch, audit and lifecycle in one place |
-| `src/palette/policy.py` | path confinement, lifecycle authority, capability gating |
-| `src/palette/models.py` | frames, the closed action union, receipts, error payloads |
-| `src/palette/qmp/` | the private management channel: transport and protocol |
-| `src/palette/vm/` | process, images, overlays, the lifecycle state machine, the process guard |
-| `src/palette/capture/` | framebuffer capture and the PNG/PPM fallback |
-| `src/palette/input/` | coordinates, keymaps, and the bounded action transaction |
-| `src/palette/guest_tools/` | the retained enhancement channel: protocol, disabled backend, bridge |
-| `scripts/` | operator tools (`p0_probe.py`, `mcp_stdio_smoke.py`) and `check_docs.py` |
-| `guest/` | the offline fixture page and the guest-service contract |
-| `profiles/` | trusted configuration templates, with no secrets in them |
+| `src/palette/cli.py` | Operator CLI entry point: `doctor`, `serve`, `daemon`, `config`, and `vm` lifecycle commands |
+| `src/palette/server.py` | MCP tool surface: tool registration, input/output schemas, `ImageContent` encoding, and structured errors |
+| `src/palette/service.py` | Core coordinator: policy checks, per-VM serialized action queue, frame epoch guards, lifecycle, and auditing |
+| `src/palette/runtime.py` | Shared `RuntimeOwner`: hosts `OperatorServer`, `DesktopManager`, `DisplayGateway`, and MCP remote proxying |
+| `src/palette/desktop.py` | Persistent VM definitions (`<runtime>/definitions`), safe offline disk expansion, hardware settings, and initial-state reset |
+| `src/palette/vm_settings.py` | Typed VM hardware configuration models (CPU/RAM/disk/boot/display/network/audio) and local QEMU capability probing |
+| `src/palette/display.py` | Localhost-only WebSocket RFB read-only display gateway with one-time tickets and client write filtering |
+| `src/palette/control.py` | Human-agent exclusive control lease manager: 3-second heartbeat renewal, `controller_epoch` bumps, and input release |
+| `src/palette/agent_ipc.py` | Shared daemon discovery and `RemoteService` proxy allowing `palette serve` to attach to an existing owner |
+| `src/palette/operator/` | Local operator IPC protocol and transports (Windows current-user Named Pipe / POSIX Unix Socket) |
+| `src/palette/policy.py` | `PathGuard` path confinement, lifecycle role authorization, and profile capability switches |
+| `src/palette/models.py` | `Frame`, closed `Action` union types, `Receipt`, and structured error payload models |
+| `src/palette/qmp/` | Private-pipe QMP protocol client, event dispatch, and command allowlist enforcement |
+| `src/palette/vm/` | QEMU command builder, read-only base image & `overlay.qcow2` manager, lifecycle state machine, and process supervision |
+| `src/palette/capture/` | Framebuffer capture, display resolution verification, and PNG/PPM fallback |
+| `src/palette/input/` | Coordinate space transforms, US hardware keymap table, and bounded action transactions |
+| `src/palette/guest_tools/` | Optional guest enhancement channel protocol, handshake validation, disabled backend, and `GuestToolBridge` |
+| `desktop/` | Palette Desktop app: `src/main/` (Electron main process), `src/preload/` (typed IPC bridge), `src/renderer/` (React UI & noVNC console) |
+| `profiles/` | Trusted hardware and security profile templates (`*.toml`) |
+| `scripts/` | Hardware probes (`p0_probe.py`), MCP stdio smoke test (`mcp_stdio_smoke.py`), click test (`mcp_click_test.py`), and doc checker (`check_docs.py`) |
 
-## A note on testing
+## Test Suite Structure
 
-`tests/` is organised by what a failure there would mean:
+Backend tests live under `tests/`; desktop tests live under `desktop/tests/` and `desktop/e2e/`:
 
-* `tests/unit` — pure logic: coordinates, keymaps, models, policy, capture decisions, the
-  action transaction against in-process doubles;
-* `tests/qmp` — the protocol layer against a scripted in-process QMP peer;
-* `tests/guest_tools` — the enhancement contract against a mock guest service;
-* `tests/integration` — a real child process speaking QMP over real pipes, plus the MCP
-  surface driven through the SDK's own tool manager;
-* `tests/e2e` — physical acceptance, skipped unless a real QEMU and image are configured.
+* **`tests/unit/`**: Pure logic and in-process doubles covering coordinates, keymaps, models, policy, hardware settings validation, display gateway filtering, and action transactions.
+* **`tests/qmp/`**: QMP protocol tests against a programmable in-process QMP peer covering framing, timeouts, disconnects, and interleaved events.
+* **`tests/guest_tools/`**: Guest enhancement contract tests against a mock transport verifying capability intersection, timeouts, and receipts.
+* **`tests/operator_ipc/`**: Local operator IPC framing, payload limits, and Windows Named Pipe adapter tests.
+* **`tests/integration/`**: Real supervised child processes speaking QMP over real pipes, plus `daemon`, persistent desktop definitions, and the MCP tool surface.
+* **`tests/e2e/`**: Physical QEMU hardware acceleration and guest image acceptance tests (skipped unless `PALETTE_E2E=1` is set).
+* **`desktop/tests/` & `desktop/e2e/`**: Vitest unit tests for frontend/IPC logic and Playwright Electron end-to-end tests covering VM creation, hardware settings, live console, and shutdown flows.

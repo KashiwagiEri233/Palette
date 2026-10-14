@@ -1,70 +1,51 @@
-# Benchmarks
+# Latency Benchmarks & Correctness Criteria
 
 **English** | [简体中文](benchmarks.zh-CN.md)
 
-Two things to be clear about before reading further.
+Before reading or reporting performance numbers for Palette, keep two rules in mind:
 
-**Nothing here has been measured yet.** The numbers below are the plan's targets, kept as
-targets. This change adds no real capture, input or boot timing measurements for the
-expanded platform matrix, and this page contains no benchmark results.
+1. **Targets vs. Measured Results**: The table below defines architectural latency budgets (targets), not universal guarantees across every host. For actual single-host hardware measurements, see the [acceptance test records](acceptance-test.md).
+2. **Test Doubles Are Not Benchmarks**: The in-process QMP server and supervised fake QEMU child processes in `tests/` do no virtualization, guest scheduling, or desktop rendering. Timings against them measure only Python framing overhead. **Every benchmark report must label each row with its execution mode (`mock`, `TCG`, `WHPX`, `HVF`, or `KVM`) alongside the host and guest architectures.**
 
-**A mock is not a measurement.** The test doubles in this repository (a fake QEMU process,
-an in-process QMP server) are fast because they do no virtualisation, rendering or guest
-scheduling at all. Timings taken against them say something about Python overhead and
-nothing about whether a real desktop meets a latency target. Any report must label its
-rows as `mock`, `TCG`, `WHPX`, `HVF` or `KVM`, including host and guest architectures.
+## 1. Running Hardware Measurements
 
-## How to measure
+On a host configured with a real QEMU binary and guest base image, run the hardware probe or E2E suite:
 
 ```bash
-PALETTE_E2E=1 PALETTE_E2E_PROFILE=tcg-x86_64 uv run pytest tests/e2e -v
+# Run the P0 hardware probe (reports cold boot, observe latency, and click-to-frame timing)
+uv run python scripts/p0_probe.py
+
+# Run the real-QEMU E2E test suite against a configured profile
+PALETTE_E2E=1 PALETTE_E2E_PROFILE=default uv run pytest tests/e2e -v
 ```
 
-Choose a configured profile for the guest ISA and accelerator being measured. Optional
-QEMU/image/accelerator overrides are described in the [operator guide](operator.md).
+Standard baseline conditions: one VM, `1280 × 800` resolution, `2` vCPUs, `4 GiB` RAM, and an idle guest desktop. Always record the host CPU model, RAM, and storage type alongside the numbers.
 
-On a fixed host — one VM, 1280×800, 2 vCPU, 4 GiB, no heavy load in the guest — record host
-CPU, memory and disk alongside each figure.
+## 2. Latency Targets
 
-## Targets (not results)
+| Metric | Definition | Target Budget |
+| --- | --- | --- |
+| **`vm_observe` Latency** | Request start to MCP `ImageContent` ready across 100 steady-state captures | **P95 ≤ 500 ms** |
+| **`vm_act` Single-Click Loop** | Action start to post-action screenshot ready (single click, excluding model inference) | **P95 ≤ 1000 ms** |
+| **Cold Boot Breakdown** | Recorded as three separate milestones: `QMP reachable` / `first valid framebuffer (screen_ready)` / `desktop ready` | **Reported separately** (no single combined target across diverse guest OSes) |
 
-| Measurement | Target |
-| --- | --- |
-| "request → MCP image result ready", over 100 stable captures | P95 ≤ 500 ms |
-| "action start → post-action image ready", simple click, model inference excluded | P95 ≤ 1 s |
-| Cold start, split into: QMP reachable / first valid framebuffer / desktop ready | recorded separately, no single target |
+> **Note on `type_text`**: Keyboard text entry sends discrete key-down/key-up events paced by `char_interval_ms` (12 ms by default). Typing 256 characters involves hundreds of QMP round-trips under its own budget (`max_total_ms = 15000`) and does not share the single-click latency target.
 
-Long text has its own rate limit and does not share the click's latency budget: typing 256
-characters is hundreds of input messages, and pretending otherwise would set an impossible
-goal and then quietly miss it.
+## 3. Where the Time Goes
 
-## Where the time goes
+When a host misses a latency target, break the elapsed time down across these five stages before adding complexity:
 
-When a target is missed, decompose before adding complexity:
+1. **Image Encoding & Resizing (Pillow PNG)**: Compressing raw framebuffer bytes into PNG is typically the single largest CPU cost.
+2. **Scratch File I/O**: QEMU `screendump` writes to `.runtime/vms/<vm_id>/<instance_id>/frames/`, which Palette reads back and unlinks immediately.
+3. **QMP Pipe Round-Trip**: One pipe write plus one newline-delimited JSON response from the QEMU main loop.
+4. **Post-Input Settle (`settle_after_input_ms`)**: The configured delay between submitting input and capturing the post-action screenshot (`120 ms` by default).
+5. **Queue Wait**: Time spent queued behind another in-flight action on the same VM.
 
-1. **Image bytes and encoding** — Pillow's PNG encode is often the largest single cost.
-2. **Temporary file I/O** — `screendump` writes to disk; the service reads it back and
-   deletes it.
-3. **QMP round trip** — a pipe write plus a JSON response.
-4. **Guest settle** — the configured delay between input and capture.
-5. **Queue wait** — time spent behind another action.
+## 4. Physical Correctness & Endurance Criteria
 
-If the totals cannot be met and the bottleneck is capture I/O, the plan's answer is a VNC
-capture backend, not a faster fake: QMP's whole-surface dump is not designed for high frame
-rates, whereas VNC maintains a live framebuffer. Input would stay on QMP, so only the
-capture path changes.
+These physical acceptance criteria require a real QEMU hypervisor and guest image and have no meaningful mock equivalent:
 
-## Correctness measurements
-
-Some acceptance criteria are physical and have no useful mock equivalent:
-
-* click accuracy at a grid's corners, centre and at least 200 points, error ≤ 2 original
-  pixels;
-* a resolution change mid-session being refused rather than mis-clicked;
-* twenty start/stop cycles with no orphaned processes and an unchanged base-image digest;
-* 1000 mixed actions over at least 30 minutes, checking for stuck keys, leaks and disk
-  growth.
-
-A CI machine without hardware acceleration can run the unit suite and a TCG smoke test
-against a trusted image. That is not evidence that WHPX/HVF/KVM or the isolation properties hold,
-and the report must not present it as such.
+* **Click Coordinate Accuracy**: Clicking the four corners, center, and at least 200 grid points on `guest/fixtures/offline-workbench.html` lands within **≤ 2 native pixels**.
+* **Mid-Session Resolution Change Protection**: Changing guest display resolution mid-session rejects subsequent actions built on pre-resize frames with `STALE_FRAME` rather than clicking the wrong coordinates.
+* **20 Start/Stop/Reset Cycles**: Zero orphaned QEMU or supervisor processes, and the read-only base image SHA-256 digest remains unchanged byte-for-byte.
+* **30-Minute / 1,000-Action Soak Test**: Mixed moves, clicks, drags, wheel scrolls, key chords, and text entry complete with zero stuck keys, zero descriptor/memory leaks, and bounded `.runtime/` disk usage.

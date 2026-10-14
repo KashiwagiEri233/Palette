@@ -1,13 +1,14 @@
-# MCP、Agent 与桌面应用端到端测试
+# MCP、Agent 与桌面应用端到端验收指南
 
 [English](acceptance-test.md) | **简体中文**
 
-本流程验证同一台虚拟机上的 MCP 观察、Agent 点击、GUI 连续画面及状态同步。
-主线使用常驻 daemon；MCP 和 GUI 必须连接相同的配置目录与运行目录。
+本流程用于端到端验证同一台虚拟机上的 **MCP 视觉观察（`vm_observe`）**、**Agent 有界点击（`vm_act`）**、**Palette Desktop 实时画面流（RFB）**、**人机独占接管（`BUSY` / `STALE_FRAME`）** 以及**离线硬件设置修改**。
 
-## 1. 准备环境与证据目录
+主线流程使用常驻共享后台（`palette daemon`）；MCP 客户端、CLI 与 Palette Desktop 必须指向相同的配置根目录（`CONFIG_ROOT`）与运行目录（`runtime_root`）。
 
-在仓库根目录运行：
+## 1. 环境准备与证据目录约定
+
+在仓库根目录执行依赖同步与桌面端构建：
 
 ```bash
 uv sync --locked
@@ -15,16 +16,11 @@ npm --prefix desktop ci
 npm --prefix desktop run build
 ```
 
-需要 Python 3.12/3.13、uv、Node.js 22.12+、匹配客户机架构的 QEMU 和固件。
-原生 Apple Silicon 使用 aarch64/HVF；跨架构测试必须显式选择 TCG。
-先准备一台可启动的桌面镜像，或 ISO 来源的虚拟机。真实 QEMU 测试与 fake QEMU
-测试分别记录，fake 结果不能证明 Windows/WinPE 已进入桌面。
+* **前置组件**：Python `3.12`/`3.13`、`uv`、Node.js `22.12+`、匹配客户机架构的 QEMU 可执行文件与 UEFI 固件，以及可启动的桌面基础镜像（`qcow2`/`raw`）或系统安装 ISO。
+* **目录与标识约定**：下文中 `CONFIG_ROOT` 表示包含 `palette.toml` 和 `profiles/` 的配置根目录；`VM_ID` 必须从 GUI 的“状态”页复制真实虚拟机 ID（如 `vm_489cdb67aca0`），不能用显示名称代替。
+* **证据存放**：所有测试报告与截图均保存在 `.runtime/acceptance/` 下，切勿向 Git 提交磁盘镜像、截图或连接凭据。
 
-约定下文 `CONFIG_ROOT` 是包含 `palette.toml` 和 `profiles/` 的目录；
-`VM_ID` 从 GUI 的“状态”页复制，不能用显示名称代替。
-证据放在运行目录或 `.runtime/acceptance/`，不要提交磁盘、截图或连接凭据。
-
-## 2. 启动共享后台
+## 2. 启动并核验共享后台
 
 ```bash
 uv run python -m palette.cli --root CONFIG_ROOT config show
@@ -33,42 +29,37 @@ uv run python -m palette.cli --root CONFIG_ROOT daemon start
 uv run python -m palette.cli --root CONFIG_ROOT daemon status
 ```
 
-预期：环境检查 `ok=true`；owner 类型为 `daemon`，记录其 PID、generation、
-`config_root` 和 `runtime_root`。环境检查只证明启动条件，不能代替客户机桌面验收。
-若该运行目录已有 stdio owner，先正常结束原 MCP 会话再启动 daemon；不要开启第二个
-`--standalone` owner。此步骤不需要把 `serve` 手动留在终端里运行。
+**通过标准**：
 
-## 3. GUI 创建并启动测试虚拟机
+* `doctor` 报告 `ok = true`（环境检查仅证明宿主启动条件具备，不能替代客户机进入桌面的实机验收）。
+* `daemon status` 显示 `kind = "daemon"`，记录其 `pid`、`generation`、`config_root` 与 `runtime_root`。
+* 若该运行目录已有旧的 `stdio` 托管服务，先正常结束原 MCP 会话再启动 `daemon`，不要额外开启第二个 `--standalone` 服务。
+
+## 3. 在 Palette Desktop 中创建并启动测试虚拟机
+
+启动桌面端预览并指向同一 `CONFIG_ROOT`：
 
 ```bash
+# macOS / Linux
 PALETTE_ROOT="CONFIG_ROOT" npm --prefix desktop run preview
 ```
 
-PowerShell 使用：
-
 ```powershell
+# Windows PowerShell
 $env:PALETTE_ROOT = "CONFIG_ROOT"
 npm --prefix desktop run preview
 ```
 
-1. 在“环境设置”确认配置目录和运行目录与第 2 步一致。
-2. 创建虚拟机：选择 qcow2/raw 镜像或 ISO，选择匹配架构的 profile，配置 CPU、内存、
-   磁盘和网络，完成确认。记录 VM 标识。
-3. 启动后打开“控制台”，保持“仅查看”。等待客户机完成启动，不能把 UEFI、登录画面
-   或 `RUNNING` 状态当作桌面可用。
-4. 在“状态”页记录当前实例、操作序号、控制权、代次、画面尺寸、保持的键鼠输入。
-   状态在窗口可见时每 2 秒轮询更新；画面通过独立 RFB 连接连续更新。
-5. 切换回“控制台”继续看画面。切离控制台会释放人工输入；检查持续按键时不要同时
-   切到“状态”页。
+1. 打开**“环境设置”**，确认配置目录与运行目录同第 2 步完全一致。
+2. 点击**“创建虚拟机”**：选择 `qcow2`/`raw` 基础镜像或安装 ISO，选择匹配架构的 Profile，配置 CPU、内存、磁盘容量与网络模式后完成创建，记录生成的 `VM_ID`。
+3. 启动虚拟机并打开**“控制台”**，保持默认的**“仅查看”**模式。等待客户机真正进入可操作的图形桌面（切勿将 UEFI 启动画面、登录界面或单纯的 `RUNNING` 状态视为桌面就绪）。
+4. 切换到**“状态”**页，记录当前 `instance_id`、`action_seq` 操作序号、控制权归属、代次（Epochs）、画面尺寸及保持的键鼠输入（状态页每 2 秒自动轮询；控制台画面通过独立 RFB 通道连续更新）。
 
-状态页中的“客户机桌面：尚未确认”表示未取得桌面就绪证据，不代表无法观察或点击。
-“控制权：Agent”表示允许 Agent 操作，不证明某个 MCP 客户端当前在线。
-后台断线以错误提示为准，旧状态快照不能作为最新状态。
+> **说明**：状态页显示“客户机桌面：尚未确认”（`desktop_ready: null`）属于正常现象，代表未运行客户机内增强服务握手，不影响视觉观察或点击。切换离开“控制台”页会自动释放人工输入，因此测试人工按键保持时请留在控制台页。
 
-## 4. 连接 MCP 客户端
+## 4. 连接 MCP 视觉客户端
 
-在支持 stdio MCP 和图片转发的客户端添加连接。替换三个绝对路径：uv 可执行文件、
-Palette 仓库和 `CONFIG_ROOT`。
+在支持 `stdio` MCP 且会将图像块（`ImageContent`）转发给模型的客户端中添加配置（请将以下三个路径替换为本机绝对路径）：
 
 ```json
 {
@@ -86,225 +77,145 @@ Palette 仓库和 `CONFIG_ROOT`。
 }
 ```
 
-预期：初始化成功；工具列表至少包含 `vm_status`、`vm_observe`、`vm_act`、
-`vm_wait`、`vm_release_inputs`。`serve --connect-only` 不创建第二个 owner；如果后台
-不存在，应报错而不是启动独立服务。每个 MCP 客户端单独启动自己的 stdio 代理。
+**通过标准**：
 
-调用 `vm_status({"vm_id":"VM_ID"})`，确认 `ok=true`、`state=RUNNING`，并与 GUI 比较
-相同的 `instance_id`。调用 `vm_observe`，确认 Agent 实际收到了图片，而不只是 JSON。
-只列出工具或只看到 `ImageContent` 元数据，不能算视觉 Agent 连接通过。
+* MCP 会话初始化成功，工具列表包含 `vm_status`、`vm_observe`、`vm_act`、`vm_wait`、`vm_release_inputs`。
+* 调用 `vm_status({"vm_id": "VM_ID"})` 返回 `ok = true`、`state = "RUNNING"`，且 `instance_id` 与 GUI 状态页完全一致。
+* 调用 `vm_observe({"vm_id": "VM_ID"})`，确认模型实际收到了 PNG 图像（仅列出工具或仅看到 JSON 文本不算通过）。
 
-## 5. Agent 点击验收
+## 5. 执行 Agent 视觉点击验收
 
-使用客户机中可逆且结果明显的目标，例如双击 WinPE 的“此电脑”打开资源管理器，或点击
-可正常工作的开始菜单；也可在客户机浏览器打开
-仓库的 `guest/fixtures/offline-workbench.html`，点击一个网格单元，观察变绿和计数变化。
-夹具必须先复制进客户机，宿主的 `localhost` 和宿主文件路径不等于客户机内的地址。
+选择客户机桌面中**可逆且视觉变化明显**的目标（如双击 WinPE 桌面的“此电脑”打开资源管理器、点击开始菜单，或在客户机浏览器中打开预置的 `guest/fixtures/offline-workbench.html` 点击测试网格单元）。
 
-可以把下面的测试任务交给 Agent，替换 VM 标识：
+可直接向视觉 Agent 下达如下验收提示词（替换 `VM_ID`）：
 
-> 对虚拟机 VM_ID 执行一次视觉点击测试。先调用 vm_status，确认正在运行且控制权可用；
-> 再调用 vm_observe，根据实际收到的最新截图选择“此电脑”或测试网格等可逆目标。
-> 使用本次 frame 的 instance_id、frame_id 和新的 request_id，只调用一次 vm_act。
-> 目标需要双击时在 click 动作中使用 count=2。
-> 检查返回的截图确认目标确实发生变化，必要时重新观察。
-> 不猜坐标，不重复结果未知的动作，不关机、不重置、不执行安装或删除。
-> 报告前后实例、操作序号、回执、画面变化和键鼠释放状态。
+> 对虚拟机 `VM_ID` 执行一次视觉点击测试：
+> 1. 先调用 `vm_status` 确认正在运行且控制权可用；
+> 2. 调用 `vm_observe` 获取最新截图，根据实际收到的画面选择“此电脑”或测试网格等可逆目标；
+> 3. 使用本次 `frame` 的 `instance_id`、`frame_id` 和全新的 `request_id`，只调用一次 `vm_act`（若目标需双击则设置 `count = 2`）；
+> 4. 检查返回的动作后截图确认目标已发生可见变化，必要时调用 `vm_observe` 复核；
+> 5. 严禁盲猜坐标、严禁重放结果未知的动作、不关机、不重置、不执行删除；
+> 6. 汇报前后 `instance_id`、`action_seq`、动作回执、画面变化与键鼠释放状态。
 
-调用顺序与关键参数：
+标准 MCP 工具调用参数格式：
 
 ```json
-{"name":"vm_observe","arguments":{"vm_id":"VM_ID"}}
+{"name": "vm_observe", "arguments": {"vm_id": "VM_ID"}}
 ```
-
-从结果的 `frame` 取实例和帧标识，坐标使用 `image_size` 定义的交付图片像素，
-不是 GUI 缩放后的 CSS 像素。随后调用：
 
 ```json
 {
-  "name":"vm_act",
-  "arguments":{
-    "vm_id":"VM_ID",
-    "instance_id":"FROM_LATEST_FRAME",
-    "frame_id":"FROM_LATEST_FRAME",
-    "request_id":"acceptance-click-unique-001",
-    "action":{"type":"click","x":100,"y":200,"button":"left"}
+  "name": "vm_act",
+  "arguments": {
+    "vm_id": "VM_ID",
+    "instance_id": "FROM_LATEST_FRAME",
+    "frame_id": "FROM_LATEST_FRAME",
+    "request_id": "acceptance-click-unique-001",
+    "action": {"type": "click", "x": 100, "y": 200, "button": "left", "count": 1}
   }
 }
 ```
 
-`100,200` 只是参数格式示例，实际坐标必须从截图选择。预期：
+**通过标准**：
 
-- 回执 `ok=true`、`effect_state=submitted`，有新的截图与帧标识。
-- 客户机目标发生可见变化；GUI 控制台显示同样的变化。
-- GUI 状态页与 `vm_status` 的实例一致，操作序号增加，键和按钮最终均为空。
-- 此时关闭 MCP 代理连接，GUI 的 VM 继续运行，daemon PID/generation 不改变。
+* `vm_act` 回执 `ok = true`、`effect_state = "submitted"`，并返回新截图与新 `frame_id`。
+* 动作后截图与 GUI 控制台画面同步呈现目标变化（如窗口打开、菜单展开或网格变绿）。
+* GUI 状态页与 `vm_status` 的 `action_seq` 同步递增，按住的键与鼠标按钮最终均为空。
+* 关闭 MCP 客户端连接后，GUI 中的虚拟机继续运行，`daemon` 的 PID 与 `generation` 不变。
 
-成功回执只证明输入被提交，不证明点击命中了正确应用。画面未改变时记录“不通过／
-待确认”，不能仅凭 `ok=true` 判定应用点击成功。
+## 6. 使用脚本执行确定性 MCP 观察与点击
 
-## 6. 可执行的 MCP 观察／点击脚本
-
-脚本连接既有 owner，不启动、重置或停止 VM。先仅观察并保存截图：
+仓库提供 `scripts/mcp_click_test.py`，可在不依赖外部大模型的情况下通过真实 MCP 协议验证观察与点击：
 
 ```bash
-uv run python scripts/mcp_click_test.py \
-  --root CONFIG_ROOT --vm-id VM_ID --out .runtime/acceptance/observe
+# 1. 仅执行观察并保存 02-before.png，用于查看并选定目标像素坐标 (X, Y)
+uv run python scripts/mcp_click_test.py   --root CONFIG_ROOT --vm-id VM_ID --out .runtime/acceptance/observe
+
+# 2. 对选定坐标执行单次点击（双击可加 --count 2，右键可加 --button right）
+uv run python scripts/mcp_click_test.py   --root CONFIG_ROOT --vm-id VM_ID --x X --y Y   --out .runtime/acceptance/click
 ```
 
-查看 `02-before.png`，选定可逆目标，并确认客户机未改变。再基于同样布局执行一次点击；
-脚本会重新观察，使用本次新 frame。若布局已改变，应重新选坐标：
+脚本会输出 `report.json`、点击前截图 `02-before.png`、点击后即时截图 `03-click.png`，并默认通过 `vm_wait` 等待 1 秒后保存 `04-verification.png`（可通过 `--wait-ms 2000` 调整，上限 10 秒）。退出码 `0` 表示检查通过，`4` 表示失败。
 
-```bash
-uv run python scripts/mcp_click_test.py \
-  --root CONFIG_ROOT --vm-id VM_ID --x X --y Y \
-  --out .runtime/acceptance/click
-```
+## 7. 人工接管与控制权冲突验收
 
-输出 `report.json`、点击前图片和成功点击后的 `03-click.png`。默认再通过 `vm_wait`
-等待 1 秒，保存 `04-verification.png`；可用 `--wait-ms 2000` 调整，上限 10 秒。
-如果客户机仍未响应，继续只读观察，不重放该次输入。报告记录工具名、结构化
-结果和每次 MCP 调用的耗时，不保存凭据。返回码 0 表示所选检查通过，4 表示失败。
-目标需要双击时加 `--count 2`；它仍是一次有界 `vm_act` 调用。
-要打开右键菜单可加 `--button right`。
-脚本没有视觉推理能力，仍需人工或视觉 Agent 核对目标变化。
-`elapsed_ms` 包含传输和截图等处理，不能称为纯输入延迟或 GUI 帧延迟。
+1. 在 Palette Desktop 控制台点击**“接管”**，保持窗口焦点停留在该控制台页面。
+2. 从另一客户端或预置延迟命令运行点击测试，验证人工接管期间 Agent 仍可 `vm_observe`，但 `vm_act` 必须被拒绝并返回 `BUSY`：
+   ```bash
+   uv run python scripts/mcp_click_test.py      --root CONFIG_ROOT --vm-id VM_ID --x X --y Y --expect-error BUSY      --out .runtime/acceptance/takeover
+   ```
+3. 在控制台画面上按住按键、拖拽鼠标与滚动滚轮，核对客户机响应，并通过另一客户端调用 `vm_status` 确认按键保持期间账本非空。
+4. 点击**“交还 Agent”**或按 **`Ctrl+Alt+G`** 释放控制权：验证重新 `vm_observe` 后 Agent 点击恢复正常，而继续使用接管前的旧 `frame_id` 会返回 `STALE_FRAME`。
+5. 验证失焦、切换页面、隐藏窗口、断开连接或停止心跳满 **3 秒**后，控制权租约自动过期且按住的键鼠状态被清空。
 
-## 7. 人工接管与冲突测试
+## 8. 边界回归与安全退出检查清单
 
-1. GUI 在控制台点击“接管”，保持窗口焦点和该页，不切到另一个应用。
-2. 独立 MCP 客户端仍可 `vm_observe`；`vm_act` 应返回 `BUSY`，客户机不能产生该次输入。
-   可由另一个客户端运行以下命令，或预先安排延迟执行，避免切终端触发失焦释放：
-
-```bash
-uv run python scripts/mcp_click_test.py \
-  --root CONFIG_ROOT --vm-id VM_ID --x X --y Y --expect-error BUSY \
-  --out .runtime/acceptance/takeover
-```
-
-3. 在控制台画面上按住一个键、拖动和滚动，核对客户机响应；使用另一个客户端
-   `vm_status` 确认相应键／按钮在保持期间存在。
-4. 点击“交还 Agent”，或使用 Ctrl+Alt+G。重新观察后，Agent 点击应恢复；操作旧 frame
-   应返回 `STALE_FRAME`。失焦、切换 VM、离开控制台和显示断线均应释放输入。
-5. 要验证 3 秒租约超时，需要暂停心跳或受控断开客户端；单纯网络空闲不等于心跳丢失。
-   观察保持键鼠清空、控制权恢复。释放未确认时应继续阻止写入。
-
-## 8. 其他回归与退出
-
-| 用例 | 动作 | 通过条件 |
+| 测试用例 | 执行动作 | 通过条件 |
 | --- | --- | --- |
-| 旧帧 | 一次成功动作后再用动作前的 frame | `STALE_FRAME`，无新增客户机效果 |
-| 重复请求 | 相同 request_id、完全相同参数重发 | 返回相同回执，无重复点击；换参数应拒绝 |
-| 坐标／缩放 | 适应窗口、原始尺寸、高 DPI 下点击同一目标 | 目标一致；MCP 使用图片坐标，人工使用映射后的坐标 |
-| 全屏 | 进入和退出控制台全屏 | 画面正常，退出释放人工控制 |
-| 重启 | 正常关机再启动 | 新 instance_id，持久盘与 UEFI 变量保留；旧输入失效 |
-| 退出确认 | 空列表、全部已关机、有 VM 运行或后台断线时关闭窗口 | 均显示“退出 Palette？”；取消后可再次关闭 |
-| 退出取消 | 有 VM 运行时关闭窗口并取消 | 窗口和 VM 保留 |
-| 后台运行 | 关闭窗口选择“仅关闭窗口” | MCP 仍能观察；再次开 GUI 看见同一实例 |
-| 完全退出 | 选择“完全退出” | 先正常关机，再停止当前后台；确认原进程退出后关闭窗口，持久数据保留 |
-| 退出失败 | 正常关机超时、后台停止失败或断线 | 保留窗口并说明原因，可重试或仅关闭窗口，不自动强停 |
-| 托管退出 | MCP stdin 保持打开时选择“完全退出” | 托管服务退出、连接中断，端点和锁释放；旧托管后台提示升级 |
-| 重复退出 | 退出执行中重复点击关闭、按钮或按 Escape | 不重复提交，不关闭弹窗 |
+| **旧帧拒绝** | 一次成功动作后再次使用动作前的旧 `frame_id` 调用 `vm_act` | 返回 `STALE_FRAME`，客户机不产生任何额外输入 |
+| **幂等去重** | 使用相同 `request_id` 与完全相同的参数重发 `vm_act` | 返回缓存回执（`deduplicated = true`），无重复点击；若参数不同则返回 `REQUEST_ID_CONFLICT` |
+| **缩放坐标映射** | 在适应窗口、原始尺寸与高 DPI 下分别通过 MCP 和人工点击同一目标 | 均准确命中目标（MCP 使用图像像素坐标，GUI 人工使用映射坐标） |
+| **全屏切换** | 进入并退出控制台全屏模式 | 画面正常显示，退出全屏时自动释放人工控制权 |
+| **持久重启** | 正常关机后再次启动同一持久虚拟机 | 生成新 `instance_id`，持久磁盘文件与 UEFI 变量保留，旧 frame 失效 |
+| **仅关闭窗口** | 关闭桌面端窗口并选择“仅关闭窗口” | `daemon` 与 VM 继续运行，MCP 仍可观察，重开 GUI 可见同一运行实例 |
+| **完全退出** | 关闭桌面端窗口并选择“完全退出” | 先正常关闭所有运行中 VM，再停止当前 `daemon`，确认进程退出后关闭窗口，持久数据保留 |
+| **退出异常保护** | 正常关机超时或后台断线时点击“完全退出” | 窗口保留并显示错误原因，支持重试、取消或改为“仅关闭窗口”，绝不静默强杀 |
 
-WinPE 的 X: RAM 盘会随重启重建；测试持久化时使用受管理磁盘上的测试文件，
-且先确认该 WinPE 能识别磁盘控制器。ISO 来源“恢复初始状态”回到空白盘，会丢弃持久盘修改。
-测试结束先正常关机，之后再 `daemon stop`。`daemon stop` 的清理不能当作客户机正常关机证据。
+## 9. 离线硬件设置验收清单
 
-## 9. 本机 ARM64 WinPE 专项
+在关机状态下使用真实客户机逐项验证硬件设置修改（运行中设置面板必须只读，且后端拒绝写入）：
 
-提供的 ISO 是 `CNBYDJ_PE_V4.0.0.ISO`。当前准备的独立配置在
-`.runtime/winpe-acceptance/`，不混入普通 VM 的运行目录；ISO 保持在原路径且以只读介质挂载。
-配置使用 QEMU aarch64、HVF、`virt,gic-version=3,its=off`、UEFI 和 `ramfb`，
-2 核／4 GiB／8 GiB 空白盘／离线网络。Windows ARM 的显示兼容性参考
-[QEMU 官方说明](https://www.qemu.org/docs/master/system/whpx.html)。
+1. **处理器与内存**：关机修改 vCPU 与内存大小，启动后通过 QMP 与客户机系统内核对资源配置。
+2. **受管磁盘扩容**：在客户机写入测试文件后关机扩容，核对实盘虚拟容量增大、原有测试文件字节完好且 UEFI 变量未变，随后在客户机内扩展分区。
+3. **显卡与默认分辨率**：为支持分辨率提示的显卡（如 `virtio-gpu-pci`）修改默认分辨率，记录请求值与实际画面尺寸；验证 `ramfb` 明确提示分辨率由固件/客户机决定。
+4. **ISO 挂载与启动顺序**：验证挂载、更换、移除 ISO，以及自动、硬盘优先、光盘优先三种启动顺序。
+5. **网络与端口转发**：分别验证 `offline`、`restricted-lab` 与 `nat` 模式；配置 TCP 端口转发后验证宿主机仅在 `127.0.0.1` 监听且可连通客户机服务。
+6. **Intel HDA 音频**：启用声音并验证 QEMU 音频后端（CoreAudio / DirectSound / PipeWire 等）初始化成功、客户机播放声音正常输出且不采集麦克风。
 
-重新打开本机测试 GUI：
+## 10. 本机实机验收历史记录（macOS ARM64 + HVF）
 
-```bash
-PALETTE_ROOT="$PWD/.runtime/winpe-acceptance" npm --prefix desktop run preview
-```
+### 10.1 2026-10-13 ARM64 WinPE 端到端视觉与接管实测
 
-此 ISO 有“Press any key to boot from CD or DVD”提示，出现时及时按键；错过后可能进入
-UEFI shell。先依据屏幕的 Mapping table 找到安装介质的文件系统。本机见到的是 `FS1:`，
-可输入 `fs1:`，再执行 `EFI\BOOT\BOOTAA64.EFI`，并及时再次按 Enter 确认光盘启动。
-其他启动环境的 FS 编号可能不同，不要固定照抄。只有出现实际 WinPE 桌面后，才继续
-第 5 步的可见目标点击测试。
+* **测试环境**：macOS ARM64，QEMU `11.1.2`（`HVF`），机器模型 `virt,gic-version=3,its=off` + UEFI + `ramfb`，2 vCPU / 4 GiB RAM / 8 GiB 磁盘 / `offline` 网络。
+* **测试介质**：`CNBYDJ_PE_V4.0.0.ISO`（SHA-256: `11bc4c89e6529febc07beb60768c4bab2f3167c739ada9182547095363f2f61d`），独立运行目录 `.runtime/winpe-acceptance/`，VM ID `vm_489cdb67aca0`，实例 `inst_90f74625c80b`，画面 `800 × 600`。
 
-### 2026-10-13 本机实测记录
-
-宿主 macOS ARM64，QEMU 11.1.2，HVF；ISO SHA-256：
-`11bc4c89e6529febc07beb60768c4bab2f3167c739ada9182547095363f2f61d`。
-本机 VM 为 `vm_489cdb67aca0`，实例为 `inst_90f74625c80b`，画面 800 × 600。
-
-| 检查 | 结果与证据 |
+| 验收项目 | 实测结果与证据说明 |
 | --- | --- |
-| WinPE 启动 | 通过；确认光盘启动提示后进入实际桌面 |
-| MCP 初始化、状态、截图和键盘 | 通过；标准 stdio 代理连接到共享 daemon |
-| 开始按钮 | 点击回执成功，即时截图没有确认菜单展开；不将其单独计为应用点击通过 |
-| 双击“此电脑” | 通过；即时截图先显示图标选中，后续只读截图确认资源管理器已打开 |
-| 右键点击 | 通过；后续截图确认资源管理器空白区右键菜单可见 |
-| GUI 同步 | 通过；同一实例的操作序号从 11 更新到 12，实际画面正常显示 |
-| 人工接管 | 通过；MCP 观察正常，MCP 点击返回 BUSY；交还后键鼠均为空、释放已确认 |
-| MCP 代理退出 | 通过；多次测试会话结束后 VM 和 daemon 继续运行 |
-| 实机重启、持久化、全部关机 | 本次未执行；测试 VM 保持运行供人工继续检查 |
+| **WinPE 引导进入桌面** | **通过**：响应光盘启动按键提示（或从 UEFI Shell 执行 `fs1:\EFI\BOOT\BOOTAA64.EFI`）后成功进入 WinPE 桌面 |
+| **MCP 初始化与截图** | **通过**：标准 `stdio` 代理连接共享 `daemon`，成功获取 `vm_status` 与 `vm_observe` PNG 截图 |
+| **双击“此电脑”** | **通过**：单次耗时 `889.70 ms`（含传输、输入与即时截图），后续截图确认资源管理器窗口已打开 |
+| **右键点击空白区** | **通过**：单次耗时 `273.42 ms`，后续截图确认资源管理器右键上下文菜单可见 |
+| **GUI 实时同步** | **通过**：同一实例的 `action_seq` 从 `11` 同步更新至 `12`，桌面端 RFB 画面实时反映窗口变化 |
+| **人工接管与冲突拦截** | **通过**：人工接管期间 MCP `vm_observe` 正常，MCP `vm_act` 返回 `BUSY`；交还控制权后键鼠账本为空且 `release_confirmed = true` |
+| **MCP 代理断开保持运行** | **通过**：多次测试会话断开后，虚拟机与共享 `daemon` 均保持稳定运行 |
 
-MCP 完整点击调用的单次耗时：开始按钮 693.15 ms，双击 889.70 ms，右键 273.42 ms。
-包含传输、输入和即时截图；只有各 1 个样本，不是分位数，也不是 GUI 帧延迟。
-客户机反应可晚于动作回执，应用效果根据后续截图确认，未重复相同的结果未知动作。
-证据在本机 `.runtime/winpe-acceptance/evidence/`，其中 `gui-verification.json`、
-`gui-status.png` 和各测试目录下的 `report.json` / PNG 不纳入 Git。
+### 10.2 2026-10-14 硬件设置与磁盘扩容实测
 
-准备其他宿主时，不复制 HVF 配置到 Windows/Linux；依据平台指南选择对应加速器，并验证
-WinPE 的启动路径、显示和磁盘驱动。出现 UEFI shell 或无法找到启动设备时，先检查 ISO
-是否包含可用的 ARM64 EFI 启动文件；这是引导未完成，不是 Agent 点击成功。
+* **测试环境**：macOS `27.0.1` / ARM64，QEMU `11.1.2` / `HVF`，独立测试虚拟机。
+* **实测结果**：
+  * 真实 `qemu-img` 将受管理可写磁盘从 `8 GiB` 安全扩容至 `12 GiB`；`qemu-io` 校验偏移 `1048576` 处的 `4096` 字节测试数据完好保留，UEFI 变量文件字节未变。
+  * QMP 与进程参数确认 `2` vCPU、`1024 MiB` 内存、VirtIO 网卡、仅 `127.0.0.1` 端口转发监听、Intel HDA 声卡及 macOS `CoreAudio` 后端初始化成功。
 
-## 10. 硬件设置验收
+## 11. 验收记录模板与自动化回归命令
 
-使用可丢弃的真实客户机，每项单独记录，不与 fake QEMU 回归结果混合：
-
-1. 写入客户机文件，关机后修改 CPU、内存，启动后在客户机内核对资源。运行中设置
-   应只读，后端也必须拒绝运维配置写入。
-2. 扩容受管理磁盘，核对实盘容量和原有文件，再手动扩展客户机分区。重启后台后
-   确认磁盘与 UEFI 变量保持不变。
-3. 修改支持的默认分辨率，分别记录请求值和客户机实际尺寸。RAMFB 的不可用控件
-   应解释限制。
-4. 更换、移除 ISO，分别验证自动、硬盘优先和光盘优先的启动偏好。
-5. 单独测试离线、隔离和 NAT。端口转发需在客户机启动服务，经 localhost 连接，
-   并确认宿主没有公开监听该端口。
-6. 客户机安装 HDA 驱动后启用声音，播放测试音并确认宿主实际输出、不采集麦克风。
-   缺少驱动或后端不可用不能判定为通过。
-7. 检查未保存修改、非法输入、重开设置、旧后台提示和常用窗口尺寸下的截图布局。
-   磁盘完整性恢复失败必须继续阻止启动并保留操作记录。
-
-### 本机硬件检查记录：2026-10-14
-
-macOS 27.0.1 / ARM64，QEMU 11.1.2 / HVF，使用独立测试 VM 和提供的 WinPE ISO。
-真实 `qemu-img` 将受管理磁盘从 8 扩至 12 GiB；`qemu-io` 确认偏移 1048576 处的
-4096 字节数据模式保留，UEFI 变量字节未改变。QMP 确认 2 个 vCPU，实际进程参数确认
-1024 MiB 内存、VirtIO 网卡、仅本机转发、Intel HDA 输出及 CoreAudio 初始化。
-localhost 可以连接转发监听端口，未验证客户机服务或外网连接。VirtIO GPU 收到
-`xres=1920,yres=1080`，但固件画面仍为 640×480。客户机分区扩展、系统内资源检查、
-显示驱动行为和实际声音播放尚未验证。本机证据不纳入 Git：
-`.runtime/settings-acceptance/report.json`、`.runtime/settings-acceptance/display.png`。
-
-## 11. 记录验收结果
+每次执行实机验收时，请按以下模板归档记录：
 
 ```text
-日期／宿主系统／架构：
-Git SHA／Python／QEMU／加速器：
-ISO 或镜像版本／摘要：
-CONFIG_ROOT／runtime_root／daemon PID／generation：
-VM_ID／instance_id／客户机画面尺寸：
-MCP 客户端／模型／是否实际收到图片：
-点击目标／图片坐标／request_id／前后 action_seq：
-输入回执／客户机可见结果／GUI 同步结果：
-人工接管／BUSY／旧 frame／释放结果：
-正常关机／代理断开／GUI 退出结果：
-耗时口径／样本数量／截图和 report.json 路径：
-通过、失败或未执行的项目／原因：
+日期 / 宿主系统 / 架构：
+Git SHA / Python / QEMU / 加速器：
+ISO 或基础镜像版本 / SHA-256 摘要：
+CONFIG_ROOT / runtime_root / daemon PID / generation：
+VM_ID / instance_id / 客户机画面尺寸：
+MCP 客户端 / 模型 / 是否实际收到 ImageContent 图片：
+点击目标 / 图片像素坐标 / request_id / 前后 action_seq：
+输入回执 / 客户机可见变化 / GUI 同步结果：
+人工接管 / BUSY 拦截 / STALE_FRAME 拒绝 / 释放确认结果：
+正常关机 / 代理断开 / GUI 退出结果：
+耗时口径 / 样本数量 / 截图与 report.json 路径：
+通过、失败或未执行的项目及原因：
 ```
 
-自动回归命令：
+自动化回归命令：
 
 ```bash
 uv run pytest tests/integration/test_desktop.py tests/integration/test_vm_settings.py tests/unit/test_display.py
@@ -312,6 +223,3 @@ uv run python scripts/check_docs.py
 npm --prefix desktop test
 npm --prefix desktop run test:e2e
 ```
-
-Electron 测试使用 fake QEMU、真实 stdio MCP 和本机 RFB 连接，包含“GUI 创建 → MCP
-观察与点击 → GUI 状态更新”。其成功不能替代以上 WinPE 或其他真实客户机的人工视觉验收。

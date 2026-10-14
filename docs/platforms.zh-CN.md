@@ -1,74 +1,72 @@
-# 平台与客户机架构
+# 平台、客户机架构与资源限制
 
 [English](platforms.md) | **简体中文**
 
-Palette 默认选择原生架构客户机。`qemu.arch` 描述客户机指令集；QEMU 可执行文件自身应使用宿主
-架构的构建。本项目不附带客户机镜像。
+**Palette** 默认选择与宿主机架构匹配的原生硬件加速客户机。配置中的 `qemu.arch` 描述的是**客户机指令集架构（ISA）**，而 QEMU 可执行文件本身应始终使用宿主机原生架构构建。
 
-## 原生 Profile
+> 本仓库不分发客户机系统镜像；请准备与目标架构、固件模式及设备驱动匹配的镜像文件（构建规范见[客户机模板指南](guest-template.zh-CN.md)）。
 
-`host.default_profile = "auto"` 按下表选择 profile。缺少加速器或宿主/客户机架构不兼容时明确报错，
-不会自动切换到 TCG。
+## 1. 原生硬件加速 Profile 矩阵
 
-| 宿主 | 客户机 | Profile | 加速器 | 机器与显示 |
+在 `palette.toml` 中，默认配置 `host.default_profile = "auto"` 会根据当前宿主操作系统与 CPU 架构按下表自动映射原生 Profile。若宿主机缺少对应的硬件加速器或架构不兼容，Palette 会直接诊断报错，**绝不静默回退到软件模拟（TCG）**。
+
+| 宿主机平台 | 客户机 ISA | 默认 Profile ID | 硬件加速器 | 机器模型与默认显示设备 |
 | --- | --- | --- | --- | --- |
-| Windows x86_64 | x86_64 | `default` | WHPX | `q35`、VGA |
-| macOS Apple Silicon | aarch64 | `macos-aarch64` | HVF | `virt`、virtio GPU、UEFI |
-| macOS Intel | x86_64 | `macos-x86_64` | HVF | `q35`、VGA |
-| Linux x86_64 | x86_64 | `linux-x86_64` | KVM | `q35`、VGA |
-| Linux aarch64 | aarch64 | `linux-aarch64` | KVM | `virt`、virtio GPU、UEFI |
+| Windows x86_64 | `x86_64` | `default` | `whpx` | `q35` + `VGA` |
+| macOS Apple Silicon | `aarch64` | `macos-aarch64` | `hvf` | `virt` + `virtio-gpu-pci` + UEFI |
+| macOS Intel | `x86_64` | `macos-x86_64` | `hvf` | `q35` + `VGA` |
+| Linux x86_64 | `x86_64` | `linux-x86_64` | `kvm` | `q35` + `VGA` |
+| Linux aarch64 | `aarch64` | `linux-aarch64` | `kvm` | `virt` + `virtio-gpu-pci` + UEFI |
 
-安装对应的 `qemu-system-x86_64` 或 `qemu-system-aarch64`，以及 `qemu-img`。macOS 可通过 Homebrew
-执行 `brew install qemu`。Linux 安装发行版中对应目标架构的 QEMU system 包，并授予服务用户
-访问 `/dev/kvm` 的权限。Windows 需要开启固件虚拟化与 Windows Hypervisor Platform。所有平台
-都应使用普通用户运行 QEMU。
+### 各宿主平台安装与权限要求
 
-AArch64 profile 会从常见 QEMU 安装目录发现 EDK2/AAVMF code 与变量存储模板。发现失败时，显式
-配置 `qemu.firmware.code` 和 `qemu.firmware.vars`，二者必须是一套匹配客户机架构的固件。
-Palette 为每个实例复制变量存储，干净重置也会替换这份副本。采用 UEFI 安装的 x86 镜像需要
-显式配置对应的 x86 固件。
+* **Windows (`WHPX`)**：安装 `qemu-system-x86_64` 与 `qemu-img`，在主板固件中开启虚拟化，并在 Windows 功能中启用 **Windows Hypervisor Platform**。
+* **macOS (`HVF`)**：通过 Homebrew 执行 `brew install qemu` 安装原生构建的 `qemu-system-aarch64` / `qemu-system-x86_64` 与 `qemu-img`。
+* **Linux (`KVM`)**：安装发行版对应的 `qemu-system-x86` / `qemu-system-arm` 与 `qemu-utils`，并将当前运行用户加入 `kvm` 用户组以访问 `/dev/kvm`。
+* **非特权执行**：所有平台均必须以普通非管理员用户运行 QEMU。
 
-## 显式软件模拟
+### UEFI 固件自动发现与变量隔离
 
-`tcg-x86_64` 与 `tcg-aarch64` 在受支持宿主上调用对应的 system emulator，使用
-`accelerator = "tcg"` 和 `cpu = "max"`；TCG 下的 `cpu = "host"` 会被拒绝。`tcg-debug` 保留为
-旧的 x86_64 调试 profile。TCG 不要求宿主 ISA 匹配，也不依赖硬件 hypervisor；只有显式选择
-时才启用，不会自动回退。
+* **AArch64 固件发现**：`aarch64` Profile（`virt` 机器模型）会自动从常见的 QEMU 安装目录中搜索匹配的 EDK2/AAVMF 固件代码（`code`）与变量存储模板（`vars`）。若自动发现失败，可在 Profile 中显式指定：
+  ```toml
+  [qemu.firmware]
+  code = "/path/to/edk2-aarch64-code.fd"
+  vars = "/path/to/edk2-arm-vars.fd"
+  ```
+* **每实例独立变量存储**：Palette 在启动实例或创建持久虚拟机时，会将 `vars` 模板复制到 `.runtime/` 下该实例/定义的私有目录中；执行 `vm reset` 或桌面端“恢复初始状态”时，也会用干净模板替换该副本，确保基础固件模板永不被污染。
+* **x86 UEFI 镜像**：若你的 `x86_64` 客户机镜像采用 UEFI 而非传统 BIOS 安装，请在对应 Profile 中显式配置匹配的 OVMF `code` 与 `vars` 路径。
 
-在 Apple Silicon 上运行 x86_64 客户机，先保持 `serve` 运行，再执行：
+## 2. 显式跨架构软件模拟（TCG Profiles）
+
+当需要在不同架构的宿主机上运行客户机（例如在 Apple Silicon Mac 上运行 `x86_64` 桌面，或在无硬件虚拟化的环境中调试）时，可显式选择内置的软件模拟 Profile：
+
+* **`tcg-x86_64`**：使用 `qemu-system-x86_64`、`accelerator = "tcg"`、`machine = "q35"` 与 `cpu = "max"`。
+* **`tcg-aarch64`**：使用 `qemu-system-aarch64`、`accelerator = "tcg"`、`machine = "virt"` 与 `cpu = "max"`。
+* **`tcg-debug`**：保留的 `x86_64` 空白盘软件模拟调试配置。
+
+> **TCG 注意事项**：
+> 1. 在 TCG 模式下配置 `cpu = "host"` 会被直接拒绝；内置 TCG Profile 统一使用 `cpu = "max"`。
+> 2. 在 Apple Silicon 上使用 `--profile tcg-x86_64` 只需宿主原生 ARM64 构建的 `qemu-system-x86_64`，由 QEMU TCG 引擎动态翻译指令，**无需安装 Rosetta**。
+> 3. 软件模拟速度显著慢于硬件加速，因此内置 TCG Profile 放宽了超时预算（启动至首帧就绪 `600s`、QMP 握手 `60s`、单条 QMP 命令与截图 `30s`、单次动作 `60s`、`frame_ttl_seconds = 60s`）。
+> 4. **切换 Profile 不会转换磁盘镜像架构**：`x86_64` 镜像只能由 `x86_64` Profile 启动，`aarch64` 镜像只能由 `aarch64` Profile 启动；`qemu-img convert` 只改变容器格式（`raw` ↔ `qcow2`），不改变客户机指令集或引导方式。
+
+在 Apple Silicon 上使用 `tcg-x86_64` 启动 `x86_64` 镜像示例：
 
 ```bash
 uv run palette doctor --profile tcg-x86_64
-uv run palette vm start --vm-id x86-desktop --profile tcg-x86_64 \
-    --image /absolute/path/debian-x86_64.qcow2
+uv run palette daemon start
+uv run palette vm start --vm-id x86-desktop --profile tcg-x86_64     --image /absolute/path/to/debian-13-xfce-x86_64.qcow2
 ```
 
-使用宿主原生构建的 `qemu-system-x86_64` 即可，由 TCG 翻译客户机指令，无需 Rosetta。性能预计
-低于原生客户机。Profile 保持有限预算：实例构建至首帧就绪共 600 秒、QMP 握手 60 秒、QMP 命令和截图 30 秒、
-单次动作 60 秒。有效显示缓冲区仍可能只是固件画面，不能证明桌面已经启动完成。
+## 3. 进程生命周期监管与内存上限执行
 
-选择加速器不会转换镜像架构或启动方式。客户机 ISA、BIOS/UEFI 模式及存储/显示驱动必须匹配
-所选机器。raw 转 qcow2 只改变磁盘容器；qcow2/raw 元数据不能证明客户机 ISA，应在模板说明和
-profile 中记录它。详见[客户机模板](guest-template.zh-CN.md)。
+为防止 QEMU 子进程在后台崩溃后残留失控或耗尽宿主机内存，Palette 按宿主操作系统实施双层进程保护：
 
-## 进程寿命与资源限制
+| 维度 | Windows 实现 (`win32`) | macOS / Linux 实现 (`POSIX`) |
+| --- | --- | --- |
+| **孤儿进程回收** | 将 QEMU 绑定至开启 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Windows **Job Object**；服务进程退出或被强杀时由内核立即终止 QEMU | 启动独立的 **POSIX Supervisor** 守护进程持有 QEMU 进程组，并监听私有 liveness 管道；服务退出或被 `SIGKILL` 时管道关闭，立即清理整个进程组 |
+| **宿主内存上限 (`process_memory_limit_mib`)** | 通过 Windows Job Object 内核硬上限强制执行 | 由 `psutil` 每 **250 ms** 采样 QEMU 及其所有子孙进程的 RSS 总和；一旦超出预算即终止进程组（采样式限制允许极短暂超调） |
+| **最长运行时间 (`process_max_runtime_seconds`)** | 由服务与进程监管器共同强制执行 | 由独立 Supervisor 脱离主事件循环计时并强制终止超时进程组 |
+| **QMP 传输隔离** | 匿名私有管道直连，服务重启后不可重新接管旧进程，需清理并创建新实例 | 匿名私有管道直连（Supervisor 不解析、不代理 QMP 流量），服务重启后创建新实例 |
 
-Windows 将 QEMU 加入 kill-on-close Job Object，并设置配置的内存限制。macOS 与 Linux 使用
-独立 supervisor 持有 QEMU 进程组、监测私有 liveness pipe。服务正常退出或被强杀都会关闭该
-管道并触发进程组清理。QMP 仍通过 Palette 与 QEMU 间的直接私有管道传输，supervisor 不解析
-或代理 QMP。匿名 QMP 管道不能由重启后的服务恢复，因此服务故障后要重新启动 `serve` 并创建
-新实例。
-
-POSIX 上由 psutil 每 250 ms 采样 QEMU 及其后代进程的 RSS 总量；超过
-`resources.process_memory_limit_mib` 后结束进程组。这是允许短暂超调的采样预算，不是与
-Windows Job Object 等价的硬上限。supervisor 还会独立于服务事件循环执行
-`process_max_runtime_seconds` 时限。`doctor`、状态和 manifest 会报告宿主/客户机 ISA、加速器、
-是否跨架构以及内存限制方式。进程组不能约束主动创建新会话的程序；任意 QEMU 参数仍位于 Palette
-隔离保证之外。
-
-## 验证状态
-
-自动化测试使用测试进程覆盖 profile 选择、命令构建、私有管道、取消、进程回收和资源限制。
-**本次变更没有执行** WHPX、HVF、KVM 或跨架构 TCG 搭配真实桌面镜像的实机验收矩阵。
-请在每个目标宿主和镜像上运行[运维探针](operator.zh-CN.md)。E2E 被跳过或 CI 通过，不构成
-桌面兼容性或性能结论。
+`palette doctor`、`vm_status` 以及每个实例的 `manifest.json` 均会明确记录当前的宿主架构、客户机架构、所选加速器、是否跨架构运行以及内存限制执行方式。
