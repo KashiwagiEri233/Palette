@@ -8,17 +8,70 @@ import time
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
-from palette.agent_ipc import RemoteService
+from palette.agent_ipc import AgentCommand, RemoteService
 from palette.config import PaletteConfig
 from palette.desktop import DesktopManager
 from palette.display import VERSION
 from palette.errors import ErrorCode, PaletteError
 from palette.operator import OperatorClient
+from palette.operator.protocol import DesktopCommand
 from palette.runtime import RuntimeOwner
 from palette.service import PaletteService
+
+
+@pytest.mark.parametrize("kind", ["daemon", "embedded"])
+async def test_runtime_stop_requires_exited_processes_and_seals_starts(
+    service: PaletteService, kind: str
+) -> None:
+    owner = RuntimeOwner(service, kind=kind)
+    await owner.start()
+    try:
+        client = OperatorClient(service.config.runtime_root)
+        assert "runtime-stop" in (await client.call("hello"))["features"]
+        definition = await owner.desktop.create(draft(service))
+        vm_id = definition["vm_id"]
+        await owner.desktop.start(vm_id)
+        instance = service.manager.get(vm_id)
+        disk = instance.paths.overlay
+        marker = disk.with_suffix(".userdata")
+        marker.write_text("preserved")
+        with pytest.raises(PaletteError) as active:
+            await client.call("runtime.stop")
+        assert active.value.code == ErrorCode.STATE_CONFLICT
+        assert not owner.stopping.is_set()
+        assert instance.process.returncode is None
+        # State alone is insufficient: a FAILED VM can still own a live process.
+        instance.view.state = "FAILED"
+        with pytest.raises(PaletteError):
+            await client.call("runtime.stop")
+        instance.view.state = "RUNNING"
+        with pytest.raises(ValidationError):
+            AgentCommand.model_validate({"method": "runtime.stop", "parameters": {}})
+        if kind == "embedded":
+            with pytest.raises(PaletteError):
+                await client.call("daemon.stop")
+        await owner.desktop.stop(vm_id)
+        async with service.manager._lock:
+            stop = asyncio.create_task(owner.route(DesktopCommand(method="runtime.stop")))
+            await asyncio.sleep(0)
+            start = asyncio.create_task(service.manager.start(vm_id))
+            await asyncio.sleep(0)
+        assert await stop == {"stopping": True}
+        with pytest.raises(PaletteError) as sealed:
+            await start
+        assert sealed.value.code == ErrorCode.STATE_CONFLICT
+        with pytest.raises(PaletteError):
+            await service.manager.reset(vm_id)
+        await asyncio.wait_for(owner.stopping.wait(), 2)
+    finally:
+        await owner.close()
+    assert disk.exists()
+    assert marker.read_text() == "preserved"
+    assert vm_id in DesktopManager(service).definitions
 
 
 @pytest.fixture(autouse=True)

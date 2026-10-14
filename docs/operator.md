@@ -185,6 +185,9 @@ The operator control endpoint starts before MCP initialization, so a terminal ca
 `serve` running while another terminal uses the CLI. Closing the CLI leaves the VM alive;
 EOF or exit of `serve` ends its ownership and stops its VMs. One owner is allowed per runtime
 root. `vm list` reads manifests offline and does not require a live owner.
+Windows console stdin retains line editing and Unicode input. Press Ctrl+Z followed by
+Enter for EOF, or Ctrl+C to interrupt `serve`; both release the runtime and clean up its VMs.
+Desktop complete exit can also stop a console owner without waiting for a line of input.
 
 Operator control uses a Unix socket on POSIX and a local, current-user protected named pipe
 on Windows. `.operator/endpoint.json` under the runtime root holds endpoint discovery,

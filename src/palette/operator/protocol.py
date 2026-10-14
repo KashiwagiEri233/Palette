@@ -93,6 +93,7 @@ class DesktopCommand(StrictModel):
         "control.heartbeat",
         "control.release",
         "daemon.stop",
+        "runtime.stop",
     ]
     vm_id: str | None = Field(default=None, max_length=128)
     payload: dict[str, Any] = Field(default_factory=dict)

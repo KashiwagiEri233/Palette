@@ -210,9 +210,13 @@ uv run python scripts/mcp_click_test.py \
 | Coordinates/zoom | Fit, native size and high DPI | Same target; MCP uses image pixels, human input uses the GUI transform |
 | Fullscreen | Enter and leave console fullscreen | Display works; exit releases human control |
 | Restart | Normal shutdown and startup | New instance, preserved managed disk/NVRAM, old input invalid |
+| Exit confirmation | Close with an empty list, stopped machines, running machines or a disconnected backend | Always asks “退出 Palette？”; cancellation permits another close |
 | Cancel exit | Close with a running VM, then cancel | Window and VM remain |
-| Background | Close and continue in background | MCP observes; reopened Desktop shows the same instance |
-| Shutdown exit | Shut down all and exit | Normal shutdown first; timeout keeps the window, explains the error, never silently kills |
+| Background | Choose “仅关闭窗口” | MCP observes; reopened Desktop shows the same instance |
+| Complete exit | Choose “完全退出” | Graceful shutdown, then connected backend stop; window closes after original process exits; persistent data remains |
+| Exit failure | Shutdown timeout, backend stop failure or disconnect | Window and error remain; retry or close only; never silently kills |
+| Embedded exit | Choose complete exit while MCP stdin stays open | Embedded process exits, connections end, endpoints and lock are released; older embedded owners request an upgrade |
+| Duplicate exit | Repeat close, clicks or Escape during exit | No duplicate submission or dialog dismissal |
 
 WinPE's X: RAM disk is recreated at boot. Test persistence with a file on the managed disk,
 after verifying the PE contains the storage-controller driver. ISO reset restores a blank

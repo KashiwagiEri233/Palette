@@ -32,8 +32,9 @@ const DialogContent = React.forwardRef<
   Omit<DialogPrimitive.Popup.Props, "className" | "style"> & {
     className?: string
     style?: React.CSSProperties
+    closeDisabled?: boolean
   }
->(({ className, children, style, ...props }, ref) => (
+>(({ className, children, style, closeDisabled = false, ...props }, ref) => (
   <DialogPortal>
     <DialogOverlay />
     <DialogPrimitive.Popup
@@ -51,6 +52,7 @@ const DialogContent = React.forwardRef<
     >
       {children}
       <DialogPrimitive.Close
+        disabled={closeDisabled}
         className={cn(
           "absolute right-4 top-4 rounded-lg p-1 text-muted-foreground",
           "transition-[background-color,color,box-shadow] duration-150",

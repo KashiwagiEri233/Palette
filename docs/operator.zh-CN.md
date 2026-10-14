@@ -168,6 +168,9 @@ uv run palette serve --profile other # 换一个默认 profile
 本地运维端点在 MCP 初始化之前就会启动，因此可以让一个终端保持 `serve` 运行、另一终端使用
 CLI。CLI 退出不影响 VM；`serve` 收到 EOF 或退出则结束管理并停止其 VM。每个 runtime root 只
 允许一个 owner。`vm list` 离线读取 manifest，不要求服务在线。
+Windows 控制台 stdin 保留行编辑和 Unicode 输入。按 Ctrl+Z 再按 Enter 发送 EOF，或按
+Ctrl+C 中断 `serve`；两者都会释放 runtime 并清理其 VM。GUI 的“完全退出”也可停止
+控制台托管的后台，无须等待输入一行文本。
 
 运维控制在 POSIX 上使用 Unix socket，在 Windows 上使用只允许当前用户访问、拒绝远程客户端的
 named pipe。Runtime 下的 `.operator/endpoint.json` 保存发现信息、服务代次与认证 token，

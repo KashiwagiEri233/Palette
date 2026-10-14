@@ -14,6 +14,7 @@ plan requires verifying the real target client rather than assuming.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -37,6 +38,7 @@ from .models import (
     WaitResult,
 )
 from .service import PaletteService
+from .stdio import StoppableMCPServer
 
 logger = logging.getLogger("palette.server")
 
@@ -70,6 +72,8 @@ Things that will save you time:
 def build_server(service: PaletteService) -> MCPServer:
     """Wire the service into an MCP server. All authorization stays server-side."""
 
+    stopping = asyncio.Event()
+
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[dict[str, Any]]:
         from .agent_ipc import RemoteService
@@ -79,6 +83,7 @@ def build_server(service: PaletteService) -> MCPServer:
             yield {}
             return
         owner = RuntimeOwner(service)
+        owner.stopping = stopping
         try:
             await owner.start()
             yield {}
@@ -86,7 +91,8 @@ def build_server(service: PaletteService) -> MCPServer:
             with CancelScope(shield=True):
                 await owner.close()
 
-    server: MCPServer = MCPServer(
+    server = StoppableMCPServer(
+        input_stopping=stopping,
         name="palette",
         title="Palette virtual desktop",
         instructions=INSTRUCTIONS,
