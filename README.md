@@ -20,27 +20,22 @@ Instead of operating the host desktop, agents connect over the Model Context Pro
 
 ## Architecture
 
-```
-┌──────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
-│     MCP Visual Agent     │  │     Palette Desktop      │  │       Operator CLI       │
-│  (stdio: palette serve)  │  │ (Electron + React/noVNC) │  │ (palette vm / daemon)    │
-└────────────┬─────────────┘  └──────┬─────────────┬─────┘  └────────────┬─────────────┘
-             │ MCP Tool Surface      │ Local IPC   │ Read-Only RFB       │ Local IPC
-             ▼                       ▼             ▼ (One-Time Ticket)   ▼
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│                        Shared RuntimeOwner / PaletteService                          │
-│  • Policy & PathGuard (.runtime/)      • Frame / Epoch Guards & request_id Dedup     │
-│  • Single-Writer Input & Human Lease   • Local DisplayGateway & Metadata Audit Log   │
-└────────────────────────────┬───────────────────────────────────┬─────────────────────┘
-                             │ Private QMP Pipe                  │ Guest Tool Bridge
-                             ▼ (Standard HID / Screendump)       ▼ (Optional Channel)
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│                          Supervised QEMU Guest Subprocess                            │
-│  • Visual Baseline: usb-kbd / usb-tablet + Framebuffer (VGA / virtio-gpu-pci)        │
-│  • Guest Enhancement: In-Guest Service (native Unicode text / allowlisted app_id)    │
-│  • Storage Isolation: Read-only base image + per-instance overlay.qcow2 + UEFI vars  │
-│  • Process Guard: Windows Kill-on-Close Job Object / POSIX Supervisor (250 ms RSS)   │
-└──────────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    agent["MCP Visual Agent<br/>stdio: palette serve"]
+    desktop["Palette Desktop<br/>Electron + React / noVNC"]
+    cli["Operator CLI<br/>palette vm / daemon"]
+
+    runtime["Shared RuntimeOwner / PaletteService<br/>Policy & PathGuard (.runtime/)<br/>Frame / epoch guards + request_id deduplication<br/>Single-writer input + human control lease<br/>Local DisplayGateway + metadata-only audit"]
+
+    guest["Supervised QEMU Guest Subprocess<br/>usb-kbd / usb-tablet + framebuffer (VGA / virtio-gpu-pci)<br/>In-guest service: Unicode text / allowlisted app_id<br/>Read-only base image + per-instance overlay.qcow2 + UEFI variables<br/>Windows Kill-on-Close Job Object / POSIX supervisor (250 ms RSS)"]
+
+    agent -->|MCP tool surface| runtime
+    desktop -->|Local IPC| runtime
+    desktop -->|Read-only RFB / one-time ticket| runtime
+    cli -->|Local IPC| runtime
+    runtime -->|Private QMP pipes / standard HID + screendump| guest
+    runtime -.->|Guest Tool Bridge / optional channel| guest
 ```
 
 Palette provides two complementary execution paths:

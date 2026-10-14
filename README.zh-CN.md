@@ -20,27 +20,22 @@ Agent 通过标准 Model Context Protocol（MCP）接收桌面截图并发送有
 
 ## 系统架构
 
-```
-┌──────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
-│     MCP 视觉 Agent       │  │     Palette Desktop      │  │       运维 CLI           │
-│  (stdio: palette serve)  │  │ (Electron + React/noVNC) │  │ (palette vm / daemon)    │
-└────────────┬─────────────┘  └──────┬─────────────┬─────┘  └────────────┬─────────────┘
-             │ MCP 工具契约          │ 本地 IPC    │ 只读 RFB (一次性票据)│ 本地 IPC
-             ▼                       ▼             ▼                     ▼
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│                        Shared RuntimeOwner / PaletteService                          │
-│  • 权限策略与 PathGuard (.runtime/)    • Frame / Epoch 校验与 request_id 幂等去重    │
-│  • 单写入者输入控制器 & 人工控制租约   • 本机只读 DisplayGateway & 元数据审计日志    │
-└────────────────────────────┬───────────────────────────────────┬─────────────────────┘
-                             │ 私有 QMP 管道                     │ Guest Tool Bridge
-                             ▼ (标准 HID / 帧缓冲截图)           ▼ (可选增强通道)
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│                           受监管的 QEMU 虚拟机子进程                                 │
-│  • 基线路线：usb-kbd / usb-tablet + 显示缓冲区 (VGA / virtio-gpu-pci)                │
-│  • 增强路线：客户机内增强服务 (原生 Unicode 文本输入 / 白名单应用启动)               │
-│  • 存储隔离：只读基础镜像 + 实例独立 overlay.qcow2 + 独立 UEFI 变量副本              │
-│  • 进程保护：Windows Kill-on-Close Job Object / POSIX Supervisor (250 ms RSS 采样)   │
-└──────────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    agent["MCP 视觉 Agent<br/>stdio: palette serve"]
+    desktop["Palette Desktop<br/>Electron + React / noVNC"]
+    cli["运维 CLI<br/>palette vm / daemon"]
+
+    runtime["共享 RuntimeOwner / PaletteService<br/>权限策略与 PathGuard (.runtime/)<br/>Frame / Epoch 校验与 request_id 去重<br/>单写入者输入控制与人工控制租约<br/>本机 DisplayGateway 与元数据审计"]
+
+    guest["受监管的 QEMU 虚拟机子进程<br/>usb-kbd / usb-tablet + 显示缓冲区 (VGA / virtio-gpu-pci)<br/>客户机增强服务：Unicode 文本 / 白名单 app_id<br/>只读基础镜像 + 实例独立 overlay.qcow2 + UEFI 变量<br/>Windows Kill-on-Close Job Object / POSIX supervisor (250 ms RSS 采样)"]
+
+    agent -->|MCP 工具契约| runtime
+    desktop -->|本地 IPC| runtime
+    desktop -->|只读 RFB / 一次性票据| runtime
+    cli -->|本地 IPC| runtime
+    runtime -->|私有 QMP 管道 / 标准 HID 与帧缓冲截图| guest
+    runtime -.->|Guest Tool Bridge / 可选增强通道| guest
 ```
 
 Palette 提供两条互补的交互路径：
