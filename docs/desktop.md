@@ -57,8 +57,12 @@ Restart preserves the disk. **Restore initial state** discards changes: an impor
 image returns to its original base; an ISO installation returns to an empty disk.
 Deletion removes managed files subject to dependency checks, never the imported base.
 Normal GUI shutdown reports an ACPI timeout and leaves the machine running. Forced
-stop is a separate confirmed operation. Closing the window asks whether to keep
-machines running, shut them down, or cancel.
+stop is a separate confirmed operation. Every window close asks “退出 Palette？”,
+including an empty list or machines that are all stopped. “仅关闭窗口” keeps the backend
+and running machines alive. “完全退出” gracefully shuts down all machines in the connected
+runtime, stops that backend, and closes the window after its process exits. Shutdown or
+stop failures keep the window open with an error and a retry option; cancellation is also
+available. Definitions and disks are preserved; other configuration roots are unaffected.
 
 ## Virtual machine settings
 
@@ -125,6 +129,8 @@ daemon. `serve` connects to an existing compatible owner; without one it retains
 original stdio-owned lifetime. `serve --standalone` explicitly requires its own owner.
 A proxy disconnect does not stop the daemon. When Desktop attaches to a stdio-owned
 service, it identifies that mode: the MCP session ending still stops those machines.
+“完全退出” also ends the embedded service and interrupts its MCP connections. Older
+embedded backends require an upgrade for this option; “仅关闭窗口” remains available.
 Stopping a daemon closes all its managed processes; use GUI shutdown first when guest
 data needs a graceful shutdown. After updating backend source, restart the owner.
 

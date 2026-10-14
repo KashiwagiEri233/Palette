@@ -4,7 +4,8 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { call } from './ipc'
-import type { DesktopMethod, OwnerInfo, VmRecord } from '../shared/types'
+import { RuntimeShutdown } from './shutdown'
+import type { DesktopMethod, OwnerInfo } from '../shared/types'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const backendRoot = resolve(here, '../../..')
@@ -13,6 +14,8 @@ let runtimeRoot = join(configRoot, '.runtime')
 let window: BrowserWindow
 let allowedClose = false
 let handlingClose = false
+let connectionsInFlight = 0
+const shutdown = new RuntimeShutdown()
 const leases = new Map<string, string>()
 const methods = new Set<DesktopMethod>(['profiles', 'doctor', 'vms.list', 'vms.create', 'vms.update', 'vms.start', 'vms.stop', 'vms.restart', 'vms.reset', 'vms.delete', 'display.ticket', 'display.sync', 'control.acquire', 'control.input', 'control.heartbeat', 'control.release'])
 methods.add('image.info')
@@ -33,18 +36,22 @@ function run(args: string[]): Promise<string> {
 }
 
 async function connectOwner(): Promise<OwnerInfo> {
-  const config = JSON.parse(await run(['config', 'show']))
-  runtimeRoot = config.runtime_root
-  try { await call(runtimeRoot, 'hello') }
-  catch (error) {
-    const message = String(error)
-    if (!/ENOENT|ECONNREFUSED/.test(message)) throw error
-    await run(['daemon', 'start'])
-  }
-  const result = await call(runtimeRoot, 'hello')
-  if (result.desktop_protocol !== 1) throw new Error('后台协议版本不兼容')
-  // Agent credentials never cross the preload boundary.
-  return { owner_kind: result.owner_kind, config_root: result.config_root, runtime_root: result.runtime_root, version: result.version, features: Array.isArray(result.features) ? result.features : [] } as OwnerInfo
+  if (handlingClose) throw new Error('正在退出，请稍候')
+  connectionsInFlight++
+  try {
+    const config = JSON.parse(await run(['config', 'show']))
+    runtimeRoot = config.runtime_root
+    try { await call(runtimeRoot, 'hello') }
+    catch (error) {
+      const message = String(error)
+      if (!/ENOENT|ECONNREFUSED/.test(message)) throw error
+      await run(['daemon', 'start'])
+    }
+    const result = await call(runtimeRoot, 'hello')
+    if (result.desktop_protocol !== 1) throw new Error('后台协议版本不兼容')
+    // Agent credentials never cross the preload boundary.
+    return { owner_kind: result.owner_kind, config_root: result.config_root, runtime_root: result.runtime_root, version: result.version, features: Array.isArray(result.features) ? result.features : [] } as OwnerInfo
+  } finally { connectionsInFlight-- }
 }
 
 async function releaseAll(): Promise<void> {
@@ -93,17 +100,10 @@ app.whenReady().then(async () => {
     if (allowedClose) return
     event.preventDefault()
     if (handlingClose) return
-    handlingClose = true
-    void releaseAll().then(async () => {
-      try {
-        const response = await call(runtimeRoot, 'vms.list')
-        const vms = response.vms as VmRecord[]
-        if (vms.some(vm => !['STOPPED', 'FAILED'].includes(vm.status.state))) window.webContents.send('close-request')
-        else { allowedClose = true; window.close() }
-      } catch { window.webContents.send('close-request') }
-    }).finally(() => { handlingClose = false })
+    window.webContents.send('close-request')
+    void releaseAll()
   })
-  ipcMain.handle('connect', event => { trusted(event); return connectOwner() })
+  ipcMain.handle('connect', event => { trusted(event); if (handlingClose) throw new Error('正在退出，请稍候'); return connectOwner() })
   ipcMain.handle('window-backdrop', (event, opacity: unknown) => {
     trusted(event)
     if (typeof opacity !== 'number' || !Number.isFinite(opacity) || opacity < 0 || opacity > 1) throw new Error('窗口遮罩参数无效')
@@ -131,8 +131,10 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('choose-root', async event => {
     trusted(event)
+    if (handlingClose) throw new Error('正在退出，请稍候')
     const result = await dialog.showOpenDialog(window, { properties: ['openDirectory'] })
     if (result.canceled) return null
+    if (handlingClose) throw new Error('正在退出，请稍候')
     await releaseAll()
     const previous = configRoot
     const previousRuntime = runtimeRoot
@@ -146,16 +148,20 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('finish-close', async (event, choice: string) => {
     trusted(event)
+    if (handlingClose) throw new Error('正在退出，请稍候')
     if (choice === 'cancel') return
     if (!['background', 'shutdown'].includes(choice)) throw new Error('退出选项无效')
-    await releaseAll()
-    if (choice === 'shutdown') {
-      const response = await call(runtimeRoot, 'vms.list')
-      for (const vm of response.vms as VmRecord[]) if (!['STOPPED', 'FAILED'].includes(vm.status.state)) await call(runtimeRoot, 'vms.stop', vm.vm_id)
-      const owner = await call(runtimeRoot, 'hello')
-      if (owner.owner_kind === 'daemon') await call(runtimeRoot, 'daemon.stop')
+    if (choice === 'shutdown' && connectionsInFlight) throw new Error('正在连接后台，请等待连接完成后重试退出')
+    const closingRuntime = runtimeRoot
+    handlingClose = true
+    try {
+      await releaseAll()
+      if (choice === 'shutdown') await shutdown.stop(closingRuntime)
+      allowedClose = true
+      window.close()
+    } finally {
+      handlingClose = false
     }
-    allowedClose = true; window.close()
   })
   if (process.env.ELECTRON_RENDERER_URL) await window.loadURL(process.env.ELECTRON_RENDERER_URL)
   else await window.loadURL('app://palette/index.html')

@@ -134,7 +134,7 @@ test('desktop lifecycle, streaming, control, font loading and exit confirmation'
     }
     await writeFile(resolve('test-results/spacing.json'), JSON.stringify(states))
     await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close())
-    await expect(page.getByRole('heading', { name: '虚拟机仍在运行' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: '退出 Palette？' })).toBeVisible()
     await page.getByRole('button', { name: '取消', exact: true }).click()
     expect(errors).toEqual([])
   } finally {

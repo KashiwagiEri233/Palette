@@ -149,6 +149,7 @@ class VmManager:
         self._instances: dict[str, VmInstance] = {}
         self._boot_epochs: dict[str, int] = {}
         self._lock = asyncio.Lock()
+        self._runtime_stopping = False
         self._cleanup_waiters: set[asyncio.Task[Any]] = set()
         self._guest_tool_transport_factory = guest_tool_transport_factory
         self.persistent_roots: set[Path] = set()
@@ -196,6 +197,7 @@ class VmManager:
         validate_identifier(vm_id, what="vm_id")
         profile = profile_override or self.config.profile(profile_id)
         async with self._lock:
+            self._require_accepting_starts()
             existing = self._instances.get(vm_id)
             if existing is not None and existing.state in {
                 VmState.RUNNING,
@@ -220,6 +222,7 @@ class VmManager:
         storage: InstancePaths | None = None,
         on_storage_ready: Callable[[VmInstance], None] | None = None,
     ) -> VmInstance:
+        self._require_accepting_starts()
         validate_target(profile)
         guard_root = PathGuard(self.config.runtime_root)
         policy = Policy(profile, guard_root)
@@ -841,6 +844,7 @@ class VmManager:
         """
         validate_identifier(vm_id, what="vm_id")
         async with self._lock:
+            self._require_accepting_starts()
             instance = self.find(vm_id)
             self._check_identity(instance, expected_instance_id, expect_absent)
             profile = instance.profile if instance is not None else self.config.profile(profile_id)
@@ -940,6 +944,23 @@ class VmManager:
             else:
                 stopped.append(vm_id)
         return stopped
+
+    def _require_accepting_starts(self) -> None:
+        if self._runtime_stopping:
+            raise PaletteError(ErrorCode.STATE_CONFLICT, "the runtime is stopping")
+
+    async def prepare_runtime_stop(self) -> None:
+        """Seal the start gate only when every QEMU process has actually exited."""
+        async with self._lock:
+            if any(
+                instance.process is not None and instance.process.returncode is None
+                for instance in self._instances.values()
+            ):
+                raise PaletteError(
+                    ErrorCode.STATE_CONFLICT,
+                    "virtual machines are still running; shut them down before exiting",
+                )
+            self._runtime_stopping = True
 
     async def shutdown(self) -> None:
         await self._finish_cleanup(self._shutdown_all())

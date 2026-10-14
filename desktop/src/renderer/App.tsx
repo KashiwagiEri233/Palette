@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Sidebar, SidebarHeader, SidebarContent, SidebarFooter, SidebarGroup, SidebarItem } from '@/components/ui/sidebar'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -38,6 +38,9 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [confirm, setConfirm] = useState<{ vm: VmRecord; action: 'reset' | 'delete' | 'force' } | null>(null)
   const [closing, setClosing] = useState(false)
+  const [closeBusy, setCloseBusy] = useState<'background' | 'shutdown' | null>(null)
+  const [closeError, setCloseError] = useState('')
+  const submittingClose = useRef(false)
   const [doctor, setDoctor] = useState<DoctorReport | null>(null)
   const [editing, setEditing] = useState<VmRecord | null>(null)
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null)
@@ -59,7 +62,7 @@ export default function App() {
   }, [refresh])
   useEffect(() => { void connect(); return window.palette.onClose(() => setClosing(true)) }, [connect])
   useEffect(() => {
-    if (!owner) return
+    if (!owner || closing) return
     let inFlight = false
     const interval = setInterval(() => {
       if (inFlight || document.hidden) return
@@ -67,7 +70,18 @@ export default function App() {
       void refresh().catch(error => setError(errorText(error))).finally(() => { inFlight = false })
     }, 2000)
     return () => clearInterval(interval)
-  }, [owner, refresh])
+  }, [owner, refresh, closing])
+  async function finishClose(choice: 'background' | 'shutdown' | 'cancel'): Promise<void> {
+    if (submittingClose.current) return
+    submittingClose.current = true
+    setCloseError('')
+    if (choice !== 'cancel') setCloseBusy(choice)
+    try {
+      await window.palette.finishClose(choice)
+      if (choice === 'cancel') setClosing(false)
+    } catch (error) { setCloseError(errorText(error)) }
+    finally { submittingClose.current = false; setCloseBusy(null) }
+  }
   const vm = vms.find(item => item.vm_id === selected)
   const filtered = vms.filter(item => `${item.name} ${item.vm_id}`.toLowerCase().includes(search.toLowerCase()))
   function openCreate(source: 'image' | 'iso' = 'image'): void { setCreateSource(source); setCreating(true) }
@@ -123,7 +137,7 @@ export default function App() {
     </main>
     <CreateVm open={creating} source={createSource} onClose={() => setCreating(false)} profiles={profiles} defaultProfile={defaultProfile} advancedSupported={owner?.features.includes('vm-settings-v2') ?? false} onCreated={async id => { setCreating(false); setPage('vms'); await refresh(); setSelected(id) }} />
     <Dialog open={!!confirm} onOpenChange={open => { if (!open && !busy) setConfirm(null) }}><DialogContent><DialogHeader><DialogTitle>{confirm?.action === 'delete' ? '删除虚拟机' : confirm?.action === 'force' ? '强制停止虚拟机' : '恢复初始状态'}</DialogTitle><DialogDescription>{confirm?.action === 'delete' ? '删除定义和受管理磁盘。原始镜像不会被删除。' : confirm?.action === 'force' ? '立即停止运行，尚未保存的数据可能丢失。' : confirm?.vm.definition?.draft.source === 'iso' ? '清空当前磁盘，重新从 ISO 安装系统。' : '丢弃当前磁盘修改，重新使用初始镜像。'}</DialogDescription></DialogHeader>{error && <p role="alert" className="text-sm text-destructive">{error}</p>}<DialogFooter><Button variant="secondary" disabled={!!busy} onClick={() => setConfirm(null)}>取消</Button><Button variant="destructive" disabled={!!busy} onClick={() => confirm && void execute(confirm.vm, confirm.action)}>{busy ? '处理中…' : '确认'}</Button></DialogFooter></DialogContent></Dialog>
-    <Dialog open={closing} onOpenChange={open => { if (!open && !busy) setClosing(false) }}><DialogContent><DialogHeader><DialogTitle>虚拟机仍在运行</DialogTitle><DialogDescription>{owner?.owner_kind === 'embedded' ? '后台由 MCP 会话托管，MCP 会话结束时虚拟机会停止。' : '选择继续后台运行，或关机后退出。'}</DialogDescription></DialogHeader>{error && <p role="alert" className="text-sm text-destructive">{error}</p>}<DialogFooter><Button variant="ghost" disabled={!!busy} onClick={() => { setClosing(false); void window.palette.finishClose('cancel') }}>取消</Button><Button variant="secondary" disabled={!!busy} onClick={() => void window.palette.finishClose('background').catch(error => setError(errorText(error)))}>后台继续运行</Button><Button disabled={!!busy} onClick={() => { setBusy('exit'); void window.palette.finishClose('shutdown').catch(error => setError(errorText(error))).finally(() => setBusy(null)) }}>{busy === 'exit' ? '正在关机…' : '全部关机并退出'}</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={closing} onOpenChange={(open, details) => { if (!open) { if (submittingClose.current) details.cancel(); else void finishClose('cancel') } }}><DialogContent closeDisabled={!!closeBusy}><DialogHeader><DialogTitle>退出 Palette？</DialogTitle><DialogDescription>仅关闭窗口会保留后台和运行中的虚拟机。完全退出会先正常关闭所有虚拟机，再停止当前连接的后台。{owner?.owner_kind === 'embedded' && '后台由 MCP 会话托管，完全退出将结束托管服务并中断相关 MCP 连接。'}</DialogDescription></DialogHeader>{closeError && <p role="alert" className="text-sm text-destructive">{closeError}</p>}<DialogFooter><Button variant="ghost" disabled={!!closeBusy} onClick={() => void finishClose('cancel')}>取消</Button><Button variant="secondary" disabled={!!closeBusy} onClick={() => void finishClose('background')}>{closeBusy === 'background' ? '正在关闭…' : '仅关闭窗口'}</Button><Button disabled={!!closeBusy} onClick={() => void finishClose('shutdown')}>{closeBusy === 'shutdown' ? '正在退出…' : '完全退出'}</Button></DialogFooter></DialogContent></Dialog>
     {editing && <VmSettings vm={vms.find(item => item.vm_id === editing.vm_id) ?? editing} owner={owner} onClose={() => setEditing(null)} onSaved={refresh} />}
   </div>
 }

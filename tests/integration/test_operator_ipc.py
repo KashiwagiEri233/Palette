@@ -18,7 +18,7 @@ from anyio import CancelScope
 from palette.config import PaletteConfig, Profile
 from palette.errors import ErrorCode, PaletteError
 from palette.operator import OperatorClient, OperatorServer
-from palette.operator.paths import IS_WINDOWS, RuntimePaths, _check_private
+from palette.operator.paths import IS_WINDOWS, RuntimeLease, RuntimePaths, _check_private
 from palette.operator.protocol import Request, Response, receive_frame, send_frame
 from palette.operator.unix import UnixChannel
 from palette.server import build_server
@@ -303,7 +303,10 @@ def process_alive(pid: int) -> bool:
     return True
 
 
-async def test_real_serve_owns_cli_vms_until_stdio_closes(base_image: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize("exit_method", ["stdin", "runtime.stop"])
+async def test_real_serve_owns_cli_vms_until_exit(
+    base_image: Path, tmp_path: Path, exit_method: str
+) -> None:
     profile = make_profile(base_image)
     wrapper = Path(__file__).parents[1] / "support" / "operator_qemu.py"
     profile = profile.model_copy(
@@ -331,6 +334,31 @@ async def test_real_serve_owns_cli_vms_until_stdio_closes(base_image: Path, tmp_
                     break
                 except (OSError, ValueError):
                     await asyncio.sleep(0.025)
+        # The stoppable transport must still complete an ordinary MCP handshake
+        # and carry Unicode through its independently buffered byte reader.
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "退出回归", "version": "1"},
+            },
+        }
+        process.stdin.write(json.dumps(initialize, ensure_ascii=False).encode() + b"\n")
+        await process.stdin.drain()
+        initialized = json.loads(await asyncio.wait_for(process.stdout.readline(), 5))
+        assert initialized["id"] == 1
+        assert initialized["result"]["serverInfo"]["name"] == "palette"
+        process.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+        process.stdin.write(b'{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n')
+        await process.stdin.drain()
+        tools = json.loads(await asyncio.wait_for(process.stdout.readline(), 5))
+        assert tools["id"] == 2
+        names = {tool["name"] for tool in tools["result"]["tools"]}
+        assert "vm_status" in names
+        assert "runtime.stop" not in names
         code, output, error = await cli(tmp_path, "start", "--profile", "default")
         assert code == 0, error.decode()
         started = json.loads(output)
@@ -341,13 +369,26 @@ async def test_real_serve_owns_cli_vms_until_stdio_closes(base_image: Path, tmp_
         code, output, error = await cli(tmp_path, "status")
         assert code == 0, error.decode()
         assert json.loads(output)["status"]["instance_id"] == started["instance_id"]
-        process.stdin.close()
+        if exit_method == "stdin":
+            process.stdin.close()
+        else:
+            client = OperatorClient(runtime)
+            assert (await client.call("hello"))["owner_kind"] == "embedded"
+            with pytest.raises(PaletteError):
+                await client.call("runtime.stop")
+            await client.call("vms.stop", vm_id="desktop")
+            assert await client.call("runtime.stop") == {"stopping": True}
+            assert not process.stdin.is_closing()
         await asyncio.wait_for(process.wait(), 20)
         assert process.returncode == 0, (await stderr).decode()
         async with asyncio.timeout(5):
             while process_alive(pid):  # noqa: ASYNC110 - another OS process has no asyncio event
                 await asyncio.sleep(0.025)
         assert not RuntimePaths(runtime).metadata.exists()
+        # A new owner can acquire the runtime after the original process exits.
+        replacement = RuntimeLease(RuntimePaths(runtime))
+        replacement.acquire()
+        replacement.release()
     finally:
         if process.returncode is None:
             process.kill()

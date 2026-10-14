@@ -19,8 +19,9 @@ export async function readEndpoint(runtimeRoot: string): Promise<Endpoint> {
   return endpoint
 }
 
-export async function call(runtimeRoot: string, method: string, vmId?: string, payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+export async function call(runtimeRoot: string, method: string, vmId?: string, payload: Record<string, unknown> = {}, expectedGeneration?: string): Promise<Record<string, unknown>> {
   const endpoint = await readEndpoint(runtimeRoot)
+  if (expectedGeneration !== undefined && endpoint.generation !== expectedGeneration) throw new Error('后台已更换，请检查状态后重试退出')
   const requestId = randomBytes(16).toString('hex')
   const command = { method, vm_id: vmId ?? null, payload }
   const body = Buffer.from(JSON.stringify({ version: 1, generation: endpoint.generation, token: endpoint.token, request_id: requestId, command }))

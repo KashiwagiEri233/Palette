@@ -60,7 +60,7 @@ class RuntimeOwner:
             return {
                 "version": __version__,
                 "desktop_protocol": 1,
-                "features": ["vm-settings-v2", "disk-resize"],
+                "features": ["vm-settings-v2", "disk-resize", "runtime-stop"],
                 "owner_kind": self.kind,
                 "pid": os.getpid(),
                 "generation": self.operator.endpoint.generation,
@@ -142,6 +142,10 @@ class RuntimeOwner:
                 payload["height"],
                 payload["events"],
             )
+        if method == "runtime.stop":
+            await self.service.manager.prepare_runtime_stop()
+            asyncio.get_running_loop().call_later(0.1, self.stopping.set)
+            return {"stopping": True}
         if method == "daemon.stop":
             if self.kind != "daemon":
                 raise PaletteError(ErrorCode.STATE_CONFLICT, "this owner belongs to an MCP session")
