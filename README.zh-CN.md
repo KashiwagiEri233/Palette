@@ -21,21 +21,35 @@ Agent 通过标准 Model Context Protocol（MCP）接收桌面截图并发送有
 ## 系统架构
 
 ```mermaid
+---
+config:
+  layout: dagre
+  fontFamily: "Arial, Microsoft YaHei, sans-serif"
+  flowchart:
+    curve: linear
+    wrappingWidth: 280
+    nodeSpacing: 50
+    rankSpacing: 65
+---
 flowchart TB
-    agent["MCP 视觉 Agent<br/>stdio: palette serve"]
-    desktop["Palette Desktop<br/>Electron + React / noVNC"]
-    cli["运维 CLI<br/>palette vm / daemon"]
+    agent("MCP Agent")
+    desktop("Palette Desktop")
+    cli("运维 CLI")
+    backend["共享后台<br/>权限校验 · 输入控制 · 审计"]
+    vm["QEMU 虚拟机<br/>键鼠 · 画面 · 持久磁盘"]
 
-    runtime["共享 RuntimeOwner / PaletteService<br/>权限策略与 PathGuard (.runtime/)<br/>Frame / Epoch 校验与 request_id 去重<br/>单写入者输入控制与人工控制租约<br/>本机 DisplayGateway 与元数据审计"]
+    agent -->|"MCP 工具"| backend
+    desktop -->|"管理 / 接管 / 查看画面"| backend
+    cli -->|"本地 IPC"| backend
+    backend -->|"私有 QMP：键鼠与截图"| vm
+    backend -.->|"可选客户机增强通道"| vm
 
-    guest["受监管的 QEMU 虚拟机子进程<br/>usb-kbd / usb-tablet + 显示缓冲区 (VGA / virtio-gpu-pci)<br/>客户机增强服务：Unicode 文本 / 白名单 app_id<br/>只读基础镜像 + 实例独立 overlay.qcow2 + UEFI 变量<br/>Windows Kill-on-Close Job Object / POSIX supervisor (250 ms RSS 采样)"]
-
-    agent -->|MCP 工具契约| runtime
-    desktop -->|本地 IPC| runtime
-    desktop -->|只读 RFB / 一次性票据| runtime
-    cli -->|本地 IPC| runtime
-    runtime -->|私有 QMP 管道 / 标准 HID 与帧缓冲截图| guest
-    runtime -.->|Guest Tool Bridge / 可选增强通道| guest
+    classDef client fill:#F8FAFC,stroke:#94A3B8,color:#334155
+    classDef runtime fill:#EFF6FF,stroke:#2563EB,stroke-width:2px,color:#1E40AF
+    classDef guest fill:#F0FDFA,stroke:#0F766E,stroke-width:2px,color:#115E59
+    class agent,desktop,cli client
+    class backend runtime
+    class vm guest
 ```
 
 Palette 提供两条互补的交互路径：

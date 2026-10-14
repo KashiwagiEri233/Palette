@@ -21,21 +21,35 @@ Instead of operating the host desktop, agents connect over the Model Context Pro
 ## Architecture
 
 ```mermaid
+---
+config:
+  layout: dagre
+  fontFamily: "Arial, Microsoft YaHei, sans-serif"
+  flowchart:
+    curve: linear
+    wrappingWidth: 280
+    nodeSpacing: 50
+    rankSpacing: 65
+---
 flowchart TB
-    agent["MCP Visual Agent<br/>stdio: palette serve"]
-    desktop["Palette Desktop<br/>Electron + React / noVNC"]
-    cli["Operator CLI<br/>palette vm / daemon"]
+    agent("MCP Agent")
+    desktop("Palette Desktop")
+    cli("Operator CLI")
+    backend["Shared runtime<br/>Policy · input control · audit"]
+    vm["QEMU virtual machine<br/>Input · screen · persistent disk"]
 
-    runtime["Shared RuntimeOwner / PaletteService<br/>Policy & PathGuard (.runtime/)<br/>Frame / epoch guards + request_id deduplication<br/>Single-writer input + human control lease<br/>Local DisplayGateway + metadata-only audit"]
+    agent -->|"MCP tools"| backend
+    desktop -->|"Manage / take over / view"| backend
+    cli -->|"Local IPC"| backend
+    backend -->|"Private QMP: input and screenshots"| vm
+    backend -.->|"Optional guest tools"| vm
 
-    guest["Supervised QEMU Guest Subprocess<br/>usb-kbd / usb-tablet + framebuffer (VGA / virtio-gpu-pci)<br/>In-guest service: Unicode text / allowlisted app_id<br/>Read-only base image + per-instance overlay.qcow2 + UEFI variables<br/>Windows Kill-on-Close Job Object / POSIX supervisor (250 ms RSS)"]
-
-    agent -->|MCP tool surface| runtime
-    desktop -->|Local IPC| runtime
-    desktop -->|Read-only RFB / one-time ticket| runtime
-    cli -->|Local IPC| runtime
-    runtime -->|Private QMP pipes / standard HID + screendump| guest
-    runtime -.->|Guest Tool Bridge / optional channel| guest
+    classDef client fill:#F8FAFC,stroke:#94A3B8,color:#334155
+    classDef runtime fill:#EFF6FF,stroke:#2563EB,stroke-width:2px,color:#1E40AF
+    classDef guest fill:#F0FDFA,stroke:#0F766E,stroke-width:2px,color:#115E59
+    class agent,desktop,cli client
+    class backend runtime
+    class vm guest
 ```
 
 Palette provides two complementary execution paths:
