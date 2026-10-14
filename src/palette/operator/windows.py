@@ -442,7 +442,10 @@ class WindowsListener:
             try:
                 self._next = self._create()
             except OSError as exc:
-                if getattr(exc, "winerror", exc.errno) != _ERROR_PIPE_BUSY:
+                error = getattr(exc, "winerror", None)
+                if error is None:
+                    error = exc.errno
+                if error != _ERROR_PIPE_BUSY:
                     raise
                 # Reuse our instance instead of losing the listener when every slot is in use.
                 await self._reject_and_wait(channel)
