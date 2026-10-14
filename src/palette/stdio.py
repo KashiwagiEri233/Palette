@@ -12,9 +12,11 @@ import anyio
 from mcp.server.mcpserver import MCPServer
 from mcp.server.stdio import stdio_server
 
+from .windows_console import WindowsConsoleInput
+
 
 class StoppableInput(anyio.AsyncFile[str]):
-    """Read only available bytes; an idle pipe must never hold a worker thread."""
+    """Poll file/pipe bytes and use cancellable native reads for console lines."""
 
     def __init__(self, fd: int, stopping: asyncio.Event) -> None:
         self._fd = os.dup(fd)
@@ -25,6 +27,7 @@ class StoppableInput(anyio.AsyncFile[str]):
         self._peek: Any = None
         self._handle: int | None = None
         self._disk = False
+        self._console: WindowsConsoleInput | None = None
         if sys.platform == "win32":
             import msvcrt
             from ctypes import wintypes
@@ -39,9 +42,10 @@ class StoppableInput(anyio.AsyncFile[str]):
             kernel.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
             kernel.GetConsoleMode.restype = wintypes.BOOL
             mode = wintypes.DWORD()
-            self._disk = file_type == 1 or (
-                file_type == 2 and not kernel.GetConsoleMode(self._handle, ctypes.byref(mode))
-            )
+            console = file_type == 2 and kernel.GetConsoleMode(self._handle, ctypes.byref(mode))
+            self._disk = file_type == 1 or (file_type == 2 and not console)
+            if console:
+                self._console = WindowsConsoleInput(self._handle)
             self._peek = kernel.PeekNamedPipe
             self._peek.argtypes = [
                 wintypes.HANDLE,
@@ -58,18 +62,19 @@ class StoppableInput(anyio.AsyncFile[str]):
             import select
 
             return 4096 if select.select([self._fd], [], [], 0)[0] else 0
-        if self._disk:
-            return 4096
-        from ctypes import wintypes
+        else:
+            if self._disk:
+                return 4096
+            from ctypes import wintypes
 
-        available = wintypes.DWORD()
-        if not self._peek(self._handle, None, 0, None, ctypes.byref(available), None):
-            error = getattr(ctypes, "get_last_error", lambda: 0)()
-            if error in {109, 232, 233}:  # Broken, closing or disconnected pipe.
-                self._eof = True
-                return 0
-            raise OSError(error, "cannot read MCP stdin pipe")
-        return min(available.value, 4096)
+            available = wintypes.DWORD()
+            if not self._peek(self._handle, None, 0, None, ctypes.byref(available), None):
+                error = getattr(ctypes, "get_last_error", lambda: 0)()
+                if error in {109, 232, 233}:  # Broken, closing or disconnected pipe.
+                    self._eof = True
+                    return 0
+                raise OSError(error, "cannot read MCP stdin pipe")
+            return min(available.value, 4096)
 
     async def readline(self) -> str:
         while not self._stopping.is_set():
@@ -79,6 +84,12 @@ class StoppableInput(anyio.AsyncFile[str]):
                 line = bytes(self._pending[:size]).decode("utf-8", errors="replace")
                 del self._pending[:size]
                 return line
+            if self._console is not None:
+                text = await self._console.read(self._stopping)
+                # Match Windows text stdin's Ctrl+Z EOF convention.
+                self._eof = not text or "\x1a" in text
+                self._pending.extend(text.split("\x1a", 1)[0].encode("utf-8"))
+                continue
             size = self._available()
             if size:
                 chunk = os.read(self._fd, size)
