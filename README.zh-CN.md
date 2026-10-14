@@ -272,4 +272,4 @@ uv run python scripts/p0_probe.py          # 实机冷启动、截图、点击�
 
 ## 许可证
 
-本项目基于 **Apache-2.0** 许可证开源（详见 `pyproject.toml`）。
+本项目基于 [Apache-2.0 许可证](LICENSE)开源。

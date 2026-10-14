@@ -272,4 +272,4 @@ uv run python scripts/p0_probe.py          # measure cold boot, capture latency,
 
 ## License
 
-Licensed under the **Apache-2.0** License (see `pyproject.toml`).
+Licensed under the [Apache-2.0 License](LICENSE).
