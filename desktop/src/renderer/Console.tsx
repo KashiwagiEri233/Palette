@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 import RFB from '@novnc/novnc'
 import { Button } from '@/components/ui/button'
-import { NativeSelect } from '@/components/ui/native-select'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PcMouseIcon, ExpandIcon, CollapseIcon, RefreshIcon } from '@/components/icons'
 import type { ControlLease, VmRecord, VmStatus, InputEvent } from '../shared/types'
 import { InputQueue, physicalKey, pointerPosition } from '@/lib/input'
-import { Play, Power, RotateCw, Monitor, AlertTriangle, MousePointer2 } from 'lucide-react'
+import { Play, Power, RotateCw, Monitor, AlertTriangle, MousePointer2, MoreHorizontal } from '@/components/icons/workbench'
 import { ButtonGroup } from '@/components/ui/button-group'
+import { EmptyState } from '@/components/ui/empty-state'
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
 import { IconButton } from './components/workspace-primitives'
 import { toast } from 'sonner'
 
@@ -21,12 +23,14 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
   const [connected, setConnected] = useState(false)
   const [controlling, setControlling] = useState(false)
   const [scale, setScale] = useState('fit')
+  const selectedScale = useRef('fit')
   const [revision, setRevision] = useState(0)
   const [displayError, setDisplayError] = useState('')
   const [fullscreen, setFullscreen] = useState(false)
   const [fullscreenPending, setFullscreenPending] = useState(false)
   const acquisition = useRef(0)
   const modifierOnly = useRef(false)
+  const scaleMenuOpen = useRef(false)
   const [acquiring, setAcquiring] = useState(false)
   const running = vm.status.state === 'RUNNING'
 
@@ -46,7 +50,7 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
   useEffect(() => {
     const syncFullscreen = (): void => setFullscreen(document.fullscreenElement === panel.current)
     const escapeFullscreen = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape' && document.fullscreenElement === panel.current) {
+      if (event.key === 'Escape' && document.fullscreenElement === panel.current && !scaleMenuOpen.current) {
         event.preventDefault(); event.stopPropagation()
         void toggleFullscreen()
       }
@@ -87,7 +91,7 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
         if (disposed || !mount.current) return
         const client = new RFB(mount.current, result.url, { shared: true })
         rfb.current = client
-        client.viewOnly = true; client.scaleViewport = true; client.resizeSession = false; client.focusOnClick = false
+        client.viewOnly = true; client.scaleViewport = selectedScale.current === 'fit'; client.resizeSession = false; client.focusOnClick = false
         client.addEventListener('connect', () => { if (!disposed) setConnected(true) })
         client.addEventListener('disconnect', () => {
           if (rfb.current === client) rfb.current = null
@@ -170,13 +174,29 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
     for (const key of [...keys].reverse()) send({ type: 'key', key, down: false })
     surface.current?.focus()
   }
+  function changeScale(value: string): void {
+    selectedScale.current = value
+    setScale(value)
+    if (rfb.current) rfb.current.scaleViewport = value === 'fit'
+  }
 
   return <section ref={panel} className="console-panel" onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) void release() }}>
     <div className="console-toolbar">
       <div className="flex items-center gap-2"><span className={`status-dot ${connected ? 'online' : ''}`} /><span>{connected ? controlling ? '人工控制' : '仅查看' : '未连接'}</span>{onAction && <ButtonGroup aria-label="虚拟机电源操作"><IconButton label="关机" disabled={busy || !['RUNNING', 'PAUSED'].includes(vm.status.state)} onClick={() => onAction('stop')}><Power size={15} /></IconButton><IconButton label="重启" disabled={busy || !running || !vm.persistent} onClick={() => onAction('restart')}><RotateCw size={15} /></IconButton></ButtonGroup>}</div>
       <div className="flex items-center gap-2">
         <Button variant={controlling ? 'default' : 'secondary'} disabled={!connected || acquiring} onClick={() => controlling ? void release() : void acquire()}><PcMouseIcon className="size-4" />{acquiring ? '正在接管…' : controlling ? '结束控制' : '接管'}</Button>
-        <NativeSelect aria-label="画面缩放" value={scale} onChange={event => { setScale(event.target.value); if (rfb.current) rfb.current.scaleViewport = event.target.value === 'fit' }}><option value="fit">适应窗口</option><option value="native">原始尺寸</option></NativeSelect>
+        <Select value={scale} items={{ fit: '适应窗口', native: '原始尺寸' }} onValueChange={value => { if (value) changeScale(value) }} onOpenChange={open => { scaleMenuOpen.current = open }}>
+          <SelectTrigger aria-label="画面缩放" className="console-scale-select"><SelectValue /></SelectTrigger>
+          <SelectContent container={panel} align="end">
+            <SelectItem value="fit">适应窗口</SelectItem>
+            <SelectItem value="native">原始尺寸</SelectItem>
+          </SelectContent>
+        </Select>
+        <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" className="console-overflow" aria-label="更多画面操作" />}><MoreHorizontal size={16} /></DropdownMenuTrigger><DropdownMenuContent align="end">
+          <DropdownMenuItem onClick={() => changeScale('fit')}>适应窗口{scale === 'fit' ? '（当前）' : ''}</DropdownMenuItem>
+          <DropdownMenuItem onClick={() => changeScale('native')}>原始尺寸{scale === 'native' ? '（当前）' : ''}</DropdownMenuItem>
+          {onAction && <><DropdownMenuSeparator /><DropdownMenuItem disabled={busy || !running || !vm.persistent} onClick={() => onAction('restart')}>重启虚拟机</DropdownMenuItem></>}
+        </DropdownMenuContent></DropdownMenu>
         <Button variant="ghost" size="icon" aria-label="重新连接画面" onClick={() => setRevision(value => value + 1)}><RefreshIcon className="size-4" /></Button>
         <Button variant="ghost" size="icon" aria-label={fullscreen ? '退出全屏' : '全屏'} title={fullscreen ? '退出全屏' : '全屏'} aria-pressed={fullscreen} disabled={fullscreenPending} onClick={() => void toggleFullscreen()}>{fullscreen ? <CollapseIcon className="size-4" /> : <ExpandIcon className="size-4" />}</Button>
       </div>
@@ -190,7 +210,7 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
       onWheelCapture={event => { if (!lease.current) return; const horizontal = Math.abs(event.deltaX) > Math.abs(event.deltaY); const delta = horizontal ? event.deltaX : event.deltaY; if (delta) send({ type: 'wheel', direction: horizontal ? delta < 0 ? 'left' : 'right' : delta < 0 ? 'up' : 'down', steps: Math.min(8, Math.max(1, Math.round(Math.abs(delta) / 100))) }) }}>
       <div ref={mount} className="rfb-mount" />
       {controlling && <div className="human-control-label"><MousePointer2 size={14} />人工控制中<span>按 Ctrl+Alt 释放</span></div>}
-      {!connected && <div className="console-placeholder">{vm.status.state === 'FAILED' ? <AlertTriangle size={32} /> : <Monitor size={32} />}<h2>{displayError || ({ STOPPED: '虚拟机已关机', STARTING: '正在启动虚拟机…', STOPPING: '正在关机…', PAUSED: '虚拟机已暂停', FAILED: '虚拟机发生故障' }[vm.status.state] ?? '正在连接画面…')}</h2>{vm.status.last_error && <p>{vm.status.last_error.code}: {vm.status.last_error.message}</p>}{onAction && ['STOPPED', 'FAILED'].includes(vm.status.state) && <Button disabled={busy} onClick={() => onAction('start')}><Play size={16} />启动</Button>}{running && displayError && <Button variant="secondary" onClick={() => setRevision(value => value + 1)}>重新连接</Button>}</div>}
+      {!connected && <EmptyState variant="plain" heading="h2" className="console-placeholder" icon={vm.status.state === 'FAILED' ? <AlertTriangle size={24} /> : <Monitor size={24} />} title={displayError || ({ STOPPED: '虚拟机已关机', STARTING: '正在启动虚拟机…', STOPPING: '正在关机…', PAUSED: '虚拟机已暂停', FAILED: '虚拟机发生故障' }[vm.status.state] ?? '正在连接画面…')} description={vm.status.last_error && `${vm.status.last_error.code}: ${vm.status.last_error.message}`} action={<>{onAction && ['STOPPED', 'FAILED'].includes(vm.status.state) && <Button size="sm" disabled={busy} onClick={() => onAction('start')}><Play size={16} />启动</Button>}{running && displayError && <Button variant="secondary" size="sm" onClick={() => setRevision(value => value + 1)}>重新连接</Button>}</>} />}
     </div>
     <div className="console-footer"><span>{geometry.current.width ? `${geometry.current.width} × ${geometry.current.height}` : '—'}</span>{controlling ? <div className="flex items-center gap-2"><Button variant="ghost" size="sm" onClick={() => chord(['ctrl', 'alt', 'delete'])}>Ctrl + Alt + Del</Button><Button variant="ghost" size="sm" onClick={() => chord(['meta_l'])}>Super</Button></div> : <span>画面仅用于查看，接管后可操作</span>}</div>
   </section>

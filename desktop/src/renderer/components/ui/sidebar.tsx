@@ -11,16 +11,20 @@ import { cn } from "@/lib/utils"
 
 interface SidebarProps extends React.HTMLAttributes<HTMLElement> {
   collapsible?: boolean
+  variant?: "default" | "inset" | "rail"
 }
 
 const Sidebar = React.forwardRef<HTMLElement, SidebarProps>(
-  ({ className, ...props }, ref) => (
+  ({ className, variant = "default", ...props }, ref) => (
     <aside
       ref={ref}
+      data-slot="sidebar"
+      data-variant={variant}
       className={cn(
-        "flex h-full w-64 flex-col",
-        "bg-card text-card-foreground border-r border-border",
-        "[box-shadow:var(--shadow-s)]",
+        "flex h-full flex-col text-card-foreground",
+        variant === "default" && "w-64 bg-card border-r border-border [box-shadow:var(--shadow-s)]",
+        variant === "inset" && "w-full bg-card",
+        variant === "rail" && "w-full items-center bg-background py-2 px-1",
         className
       )}
       {...props}
@@ -29,11 +33,15 @@ const Sidebar = React.forwardRef<HTMLElement, SidebarProps>(
 )
 Sidebar.displayName = "Sidebar"
 
-const SidebarHeader = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
-  ({ className, ...props }, ref) => (
+interface SidebarHeaderProps extends React.HTMLAttributes<HTMLDivElement> {
+  separator?: boolean
+}
+
+const SidebarHeader = React.forwardRef<HTMLDivElement, SidebarHeaderProps>(
+  ({ className, separator = true, ...props }, ref) => (
     <div
       ref={ref}
-      className={cn("flex items-center gap-2 px-4 py-3 border-b border-border", className)}
+      className={cn("flex items-center gap-2 px-4 py-3", separator && "border-b border-border", className)}
       {...props}
     />
   )
@@ -61,6 +69,42 @@ const SidebarGroup = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLD
 )
 SidebarGroup.displayName = "SidebarGroup"
 
+const SidebarActionRow = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
+  ({ className, ...props }, ref) => (
+    <div
+      ref={ref}
+      data-slot="sidebar-action-row"
+      className={cn(
+        "group/sidebar-row relative flex min-w-0 rounded-lg transition-colors duration-150",
+        "hover:bg-accent focus-within:bg-accent has-[[aria-haspopup=menu][aria-expanded=true]]:bg-accent",
+        "[&>button]:min-w-0 [&>button]:w-full [&>button]:justify-start [&>button]:gap-1.5 [&>button]:px-2 [&>button]:py-1",
+        "[&>button]:rounded-[inherit] [&>button]:bg-transparent [&>button:hover]:bg-transparent [&>button]:active:scale-100",
+        "hover:[&>button]:pr-16 focus-within:[&>button]:pr-16 has-[[aria-haspopup=menu][aria-expanded=true]]:[&>button]:pr-16",
+        "hover:[&_[data-slot=sidebar-row-status]]:invisible focus-within:[&_[data-slot=sidebar-row-status]]:invisible has-[[aria-haspopup=menu][aria-expanded=true]]:[&_[data-slot=sidebar-row-status]]:invisible",
+        className
+      )}
+      {...props}
+    />
+  )
+)
+SidebarActionRow.displayName = "SidebarActionRow"
+
+const SidebarRowActions = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
+  ({ className, ...props }, ref) => (
+    <div
+      ref={ref}
+      data-slot="sidebar-row-actions"
+      className={cn(
+        "invisible absolute inset-y-0 right-1 flex items-center bg-transparent",
+        "group-hover/sidebar-row:visible group-focus-within/sidebar-row:visible group-has-[[aria-haspopup=menu][aria-expanded=true]]/sidebar-row:visible",
+        className
+      )}
+      {...props}
+    />
+  )
+)
+SidebarRowActions.displayName = "SidebarRowActions"
+
 const SidebarGroupLabel = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
   ({ className, ...props }, ref) => (
     <div
@@ -78,15 +122,18 @@ SidebarGroupLabel.displayName = "SidebarGroupLabel"
 interface SidebarItemProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   active?: boolean
   icon?: React.ReactNode
+  density?: "default" | "compact"
 }
 
 const SidebarItem = React.forwardRef<HTMLButtonElement, SidebarItemProps>(
-  ({ className, active, icon, children, ...props }, ref) => (
+  ({ className, active, icon, density = "default", children, ...props }, ref) => (
     <button
       ref={ref}
       type="button"
+      data-slot="sidebar-item"
       className={cn(
-        "flex items-center gap-2.5 w-full rounded-lg px-2 py-1.5 text-sm text-left",
+        "flex items-center gap-2.5 w-full rounded-lg px-2 text-left",
+        density === "compact" ? "min-h-8 py-1 text-[13px]" : "py-1.5 text-sm",
         "transition-[background-color,color,box-shadow] duration-150",
         "text-muted-foreground hover:bg-accent hover:text-foreground",
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
@@ -109,6 +156,8 @@ export {
   SidebarContent,
   SidebarFooter,
   SidebarGroup,
+  SidebarActionRow,
+  SidebarRowActions,
   SidebarGroupLabel,
   SidebarItem,
 }

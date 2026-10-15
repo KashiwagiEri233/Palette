@@ -17,6 +17,12 @@ With Palette Desktop, you can:
 
 The workbench has a global rail, VM/conversation navigation, chat, and VM workspace. Home selects a target VM and saves task drafts. VM management retains the creation wizard, console, status, and hardware settings. Settings includes runtime, Agent, permissions, appearance, shortcuts, and About.
 
+The conversation sidebar groups conversations under their VMs without a separate recent-conversations section. VM management lists and detail pages use the full content width beside the global rail, with no conversation sidebar. Returning to Home or a conversation restores the saved sidebar visibility and width. Settings uses its own category navigation.
+
+The interface retains its existing component styles: pill-shaped actions, rounded form fields, larger card corners, and rounded menus. Similar controls share the same styling in light and dark themes. Selection menus use the application theme and support keyboard navigation; console scaling remains available in fullscreen. Press Escape to close an open scaling menu before exiting fullscreen.
+
+The title bar and left icon rail share one background. VM navigation, chat, and workspace share a continuous content surface with four rounded corners, thin dividers, and aligned headers. A narrow outer gap along the right and bottom edges keeps the surrounding background visible. Powered-off screens show the start action directly; live screens retain scaling, fullscreen, and human control actions. Light and dark themes use the same structure.
+
 Each conversation permanently belongs to one VM; selecting it changes the displayed VM. Create, rename, pin, archive, delete, export, and search are supported. Drafts persist in local application data, isolated by configuration directory. Failed saves retain the current draft with a retry action. Search includes archived conversations.
 
 This delivery implements layout, conversation drafts, and human control. **Built-in Agent execution, credential entry, automatic approvals, and step replay are not connected yet.** Home's save action creates a draft conversation; chat send remains disabled. No simulated replies or model screenshot uploads occur. External MCP agents continue using the existing tool surface.
@@ -73,6 +79,8 @@ Persistent VM definitions are stored under `<runtime_root>/definitions/`. Writab
 
 ### Lifecycle & Restoring Initial State
 
+The VM management list provides **Start / Shut Down**, **Restart**, **Pause**, **VM Settings**, and **Delete VM** directly in each row. Start changes to Shut Down while the VM is active; unavailable actions are disabled. Pause is shown but is not supported yet. **More** retains Force Stop and Restore Initial State. Deleting a VM still requires confirmation.
+
 * **Graceful Shutdown & Force Stop**: Normal shutdown sends an ACPI shutdown signal; if the guest does not power off within the timeout budget, Palette Desktop reports an error and leaves the VM running rather than silently killing it. **Force Stop** requires explicit confirmation.
 * **Restart**: Preserves all persistent disk changes and UEFI variables.
 * **Restore Initial State**: Discards all writable disk modifications and resets UEFI variables — image-backed VMs return to the clean read-only base image, and ISO-backed VMs return to a fresh blank disk.
@@ -87,7 +95,7 @@ Closing the Palette Desktop window always prompts **"Exit Palette?"** (even when
 
 ## 3. Virtual Machine Hardware Settings
 
-Open **VM Settings** from a VM's action menu or detail view to configure hardware across six sections. **Settings are read-only while a VM is running**; stop the VM to edit and save changes for the next boot. Optimistic revision checks prevent concurrent sessions from overwriting each other, and leaving an unsaved form prompts you to save, discard, or keep editing.
+Open **VM Settings** directly from the VM management row, or from the VM's action menu or detail view, to configure hardware across six sections. **Settings are read-only while a VM is running**; stop the VM to edit and save changes for the next boot. Optimistic revision checks prevent concurrent sessions from overwriting each other, and leaving an unsaved form prompts you to save, discard, or keep editing.
 
 | Section | Capabilities & Rules |
 | --- | --- |

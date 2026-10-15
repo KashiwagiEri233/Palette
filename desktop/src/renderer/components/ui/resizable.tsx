@@ -23,14 +23,17 @@ const ResizablePanel = ResizablePrimitive.Panel
 
 const ResizableHandle = ({
   withHandle,
+  variant = "default",
   className,
   ...props
 }: React.ComponentProps<typeof ResizablePrimitive.PanelResizeHandle> & {
   withHandle?: boolean
+  variant?: "default" | "chrome"
 }) => (
   <ResizablePrimitive.PanelResizeHandle
     className={cn(
-      "relative flex w-px items-center justify-center bg-border",
+      "relative flex w-px items-center justify-center",
+      variant === "chrome" ? "bg-background" : "bg-border",
       "after:absolute after:inset-y-0 after:left-1/2 after:w-1 after:-translate-x-1/2",
       "transition-colors duration-150",
       "hover:bg-ring/40 focus-visible:bg-ring",

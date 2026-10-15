@@ -8,7 +8,7 @@ export interface NativeSelectProps extends React.SelectHTMLAttributes<HTMLSelect
 
 const NativeSelect = React.forwardRef<HTMLSelectElement, NativeSelectProps>(
   ({ className, children, ...props }, ref) => (
-    <div className="relative">
+    <div data-slot="native-select-wrapper" className="relative">
       <select
         ref={ref}
         className={cn(

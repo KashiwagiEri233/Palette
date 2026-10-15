@@ -5,12 +5,8 @@ import { cva, type VariantProps } from "class-variance-authority"
 import { cn } from "@/lib/utils"
 
 /*
- * Cashmere Button, a flat action pill.
- * Fully pill-shaped (rounded-full), a flat solid fill with NO gradient, sheen or
- * glow. The default (hero) variant is the warm near-black primary, exactly the
- * site's main CTA. Depth is just a hairline; tactility comes from a gentle
- * spring press (active:scale) rather than a pressed-in shadow. Cashmere is
- * clean paper, not a squishy pillow.
+ * Cashmere actions use a flat fill and a pill shape. Navigation uses the
+ * existing rounded rectangle shared by sidebar rows.
  */
 
 const buttonVariants = cva(
@@ -26,14 +22,14 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        // Hero: warm near-black pill, flat. Hover lifts a hair lighter.
+        // Primary action: flat, with a slightly lighter hover fill.
         default:
           "bg-primary text-primary-foreground [box-shadow:var(--shadow-xs)] " +
           "hover:bg-primary/90",
         primary:
           "bg-primary text-primary-foreground [box-shadow:var(--shadow-xs)] " +
           "hover:bg-primary/90",
-        // Secondary: the cream pill, flat with a hairline ring.
+        // Secondary action: neutral fill with a hairline ring.
         secondary:
           "bg-secondary text-secondary-foreground [box-shadow:var(--shadow-button)] " +
           "hover:bg-accent hover:[box-shadow:var(--shadow-button-hover)]",
@@ -43,6 +39,9 @@ const buttonVariants = cva(
         ghost:
           "bg-transparent text-muted-foreground " +
           "hover:bg-accent hover:text-accent-foreground",
+        navigation:
+          "rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground " +
+          "aria-[current=page]:bg-accent aria-[current=page]:text-foreground",
         destructive:
           "bg-destructive text-destructive-foreground [box-shadow:var(--shadow-xs)] " +
           "hover:brightness-105",
@@ -53,6 +52,7 @@ const buttonVariants = cva(
         default: "h-10 px-5",
         lg: "h-12 px-7 text-base",
         icon: "h-10 w-10",
+        "icon-sm": "h-8 w-8",
       },
     },
     defaultVariants: {
