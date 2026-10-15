@@ -13,6 +13,18 @@ With Palette Desktop, you can:
 
 ## 1. Prerequisites & Running from Source
 
+### Layout and conversations
+
+The workbench has a global rail, VM/conversation navigation, chat, and VM workspace. Home selects a target VM and saves task drafts. VM management retains the creation wizard, console, status, and hardware settings. Settings includes runtime, Agent, permissions, appearance, shortcuts, and About.
+
+Each conversation permanently belongs to one VM; selecting it changes the displayed VM. Create, rename, pin, archive, delete, export, and search are supported. Drafts persist in local application data, isolated by configuration directory. Failed saves retain the current draft with a retry action. Search includes archived conversations.
+
+This delivery implements layout, conversation drafts, and human control. **Built-in Agent execution, credential entry, automatic approvals, and step replay are not connected yet.** Home's save action creates a draft conversation; chat send remains disabled. No simulated replies or model screenshot uploads occur. External MCP agents continue using the existing tool surface.
+
+Minimum window size is1100×700. Below1280px navigation becomes a VM icon strip; below1100 effective CSS pixels the workspace is a drawer. Drag separators or double-click to reset. Layout and light/dark/system preferences persist locally. Ctrl+N creates a conversation, Ctrl+K opens commands, Ctrl+B toggles navigation, and Ctrl+J toggles workspace; macOS uses Cmd equivalents. Ctrl+Alt releases human control, with Ctrl+Alt+G retained; the UI action is “结束控制”.
+
+See the [GUI and built-in Agent specification](desktop-agent-design.md) for subsequent targets; its proposed Agent capabilities are not shipped functionality.
+
 To run Palette Desktop from source, install:
 
 * **Node.js**: `22.12` or newer
@@ -44,7 +56,7 @@ npm --prefix desktop run preview
 ### Window & UI Behavior
 
 * **Integrated Title Bar**: On Windows, the title bar blends into the workspace while preserving native minimize, maximize, and close controls. Drag the top blank area or the Palette brand header to move or snap the window; the menu bar is hidden by default.
-* **Responsive Scaling & Independent Scroll**: The minimum window size is `960 × 640` logical pixels, respecting OS display scaling. In the VM Settings view, the form body scrolls independently so the header and Save/Cancel actions remain pinned. Opening any modal dims the native window control region alongside the backdrop and restores it when the last modal closes.
+* **Responsive Scaling & Independent Scroll**: The minimum window size is `1100 × 700` logical pixels, respecting OS display scaling. In the VM Settings view, the form body scrolls independently so the header and Save/Cancel actions remain pinned. Opening any modal dims the native window control region alongside the backdrop and restores it when the last modal closes.
 
 ## 2. Creating & Managing Persistent VMs
 
@@ -104,7 +116,7 @@ Opening the **Console** tab starts in **View Only** mode:
 2. Click inside the display canvas to focus and send live pointer moves, clicks, drags, wheel scrolls, and key holds. The toolbar also provides one-click `Ctrl+Alt+Del` and `Super` buttons.
 3. Human input routes through the exact same single-writer input controller used by agents. While a human holds the lease, **agents can still call `vm_observe`, but any `vm_act` call is rejected with `BUSY`**.
 4. **Hardware Scancodes**: Physical key presses map to guest keyboard scancodes; host IME composition strings and host clipboard contents are not bridged in this release.
-5. **Releasing Control**: Press **`Ctrl+Alt+G`** (or click **Return to Agent**) to release control. Leaving the Console view, losing window focus, minimizing/hiding the window, exiting fullscreen, guest resolution changes, or display disconnects automatically release all held inputs and end the lease. If renderer heartbeats stop for **3 seconds**, the backend lease expires and releases any held keys/buttons automatically.
+5. **Releasing Control**: Press **`Ctrl+Alt`** (the legacy **`Ctrl+Alt+G`** also works), or click **End Control** to release control. Leaving the Console view, losing window focus, minimizing/hiding the window, exiting fullscreen, guest resolution changes, or display disconnects automatically release all held inputs and end the lease. If renderer heartbeats stop for **3 seconds**, the backend lease expires and releases any held keys/buttons automatically.
 
 ## 5. Shared Daemon & MCP Integration
 

@@ -1,11 +1,12 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { DesktopApi } from '../shared/types'
+import type { DesktopApi, DesktopMethod } from '../shared/types'
+import type { WorkspaceMethod } from '../shared/workspace'
 
 const api: DesktopApi = {
   platform: process.platform,
-  setWindowBackdrop: opacity => ipcRenderer.invoke('window-backdrop', opacity),
+  setWindowBackdrop: (opacity, background) => ipcRenderer.invoke('window-backdrop', opacity, background),
   connect: () => ipcRenderer.invoke('connect'),
-  request: (method, vmId, payload) => ipcRenderer.invoke('request', method, vmId, payload),
+  request: (method: DesktopMethod | WorkspaceMethod, vmId?: string, payload?: Record<string, unknown>) => ipcRenderer.invoke('request', method, vmId, payload),
   chooseFile: source => ipcRenderer.invoke('choose-file', source),
   chooseRoot: () => ipcRenderer.invoke('choose-root'),
   onClose: callback => { const listener = (): void => callback(); ipcRenderer.on('close-request', listener); return () => ipcRenderer.removeListener('close-request', listener) },

@@ -15,6 +15,7 @@ Two core invariants run through every page:
 | --- | --- |
 | [Project Overview (../README.md)](../README.md) · [简体中文](../README.zh-CN.md) | Architecture overview, key features, quick start, and safety default switches |
 | [Desktop Guide (desktop.md)](desktop.md) · [简体中文](desktop.zh-CN.md) | Running Palette Desktop from source, persistent VM creation, offline hardware settings, read-only RFB gateway, human takeover, and shared daemon usage |
+| [Desktop GUI and Built-in Agent Design (desktop-agent-design.md)](desktop-agent-design.md) · [简体中文](desktop-agent-design.zh-CN.md) | Proposed four-region layouts, component states, takeover/approval sequences, typed IPC draft, theme tokens, and staged acceptance |
 | [Agent \& Client User Guide (user-guide.md)](user-guide.md) · [简体中文](user-guide.zh-CN.md) | For agent and MCP client authors: the 10 MCP tools, `vm_observe → vm_act` loop, frame epoch guards, text rules, and error recovery |
 | [Operator Runbook (operator.md)](operator.md) · [简体中文](operator.zh-CN.md) | For host administrators: host probing, `daemon` vs `serve`, profiles, lifecycle commands, emergency stop, retention, and fault recovery |
 | [Platforms \& Guest Architectures (platforms.md)](platforms.md) · [简体中文](platforms.zh-CN.md) | Native Windows (`WHPX`), macOS (`HVF`), and Linux (`KVM`) profiles, explicit cross-ISA `TCG`, UEFI firmware discovery, and process memory caps |

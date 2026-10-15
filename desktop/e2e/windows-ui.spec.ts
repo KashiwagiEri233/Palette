@@ -5,9 +5,9 @@ import { join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 
 async function checkHeader(page: Page): Promise<void> {
-  const layout = await page.locator('.workspace-topbar').evaluate(element => {
+  const layout = await page.locator('.desktop-titlebar').evaluate(element => {
     const style = getComputedStyle(element)
-    const indicator = element.querySelector('.workspace-indicator')!.getBoundingClientRect()
+    const indicator = element.lastElementChild!.getBoundingClientRect()
     return { height: element.getBoundingClientRect().height, paddingRight: parseFloat(style.paddingRight), indicatorRight: indicator.right, width: innerWidth, drag: style.getPropertyValue('-webkit-app-region') }
   })
   expect(layout.height).toBe(48)
@@ -48,7 +48,7 @@ async function renderedFonts(application: ElectronApplication): Promise<{ family
 async function checkNativeBackdrop(application: ElectronApplication, color: string): Promise<void> {
   await expect.poll(() => application.evaluate(() => {
     const state = globalThis as typeof globalThis & { nativeOverlayColor?: string }
-    return state.nativeOverlayColor ?? '#ffffff'
+    return state.nativeOverlayColor ?? '#f7f6f5'
   })).toBe(color)
 }
 
@@ -76,7 +76,7 @@ for (const scale of [1, 1.25, 1.5, 2]) {
       })
       const errors: string[] = []
       page.on('pageerror', error => errors.push(error.message))
-      await expect(page.getByText('后台已连接')).toBeVisible({ timeout: 30_000 })
+      await expect(page.getByRole('button', { name: '后台已连接', exact: true })).toBeVisible({ timeout: 30_000 })
       expect(await page.evaluate(() => window.palette.platform)).toBe('win32')
       expect(await page.evaluate(() => window.palette.setWindowBackdrop(NaN).then(() => false, () => true))).toBe(true)
       expect(await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isMenuBarVisible())).toBe(false)
@@ -85,7 +85,7 @@ for (const scale of [1, 1.25, 1.5, 2]) {
       expect(fonts.some(font => /Microsoft YaHei/i.test(font.familyName) && font.glyphCount > 0)).toBe(true)
       await writeFile(join(artifacts, 'fonts.json'), JSON.stringify(fonts, null, 2))
       expect(await page.evaluate(() => devicePixelRatio)).toBeCloseTo(scale)
-      for (const [width, height] of [[1440, 900], [960, 640]]) {
+      for (const [width, height] of [[1440, 900], [1100, 700]]) {
         await application.evaluate(({ BrowserWindow }, size) => BrowserWindow.getAllWindows()[0].setContentSize(size[0], size[1]), [width, height])
         // Native borders can round to one logical pixel at fractional/high DPI.
         await page.waitForFunction(width => Math.abs(innerWidth - width) <= 1, width)
@@ -94,7 +94,7 @@ for (const scale of [1, 1.25, 1.5, 2]) {
         await page.getByRole('button', { name: '收起侧栏' }).click()
         await expect(page.locator('.app-sidebar')).toBeHidden()
         await checkHeader(page)
-        expect(await page.locator('.workspace-topbar').evaluate(element => getComputedStyle(element).paddingLeft)).toBe('28px')
+        expect(await page.locator('.desktop-titlebar').evaluate(element => getComputedStyle(element).paddingLeft)).toBe('12px')
         await page.getByRole('button', { name: '展开侧栏' }).click()
       }
       await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].maximize())
@@ -102,17 +102,17 @@ for (const scale of [1, 1.25, 1.5, 2]) {
       await checkHeader(page)
       await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].unmaximize())
       await expect.poll(() => application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isMaximized())).toBe(false)
-      await page.waitForFunction(() => Math.abs(innerWidth - 960) <= 1)
+      await page.waitForFunction(() => Math.abs(innerWidth - 1100) <= 1)
 
-      await page.getByRole('button', { name: '环境设置', exact: true }).click()
+      await page.getByRole('button', { name: '设置', exact: true }).click()
       await checkHeader(page)
       await page.screenshot({ path: join(artifacts, 'environment-960.png') })
-      await page.getByRole('button', { name: '全部虚拟机', exact: true }).click()
+      await page.getByRole('button', { name: '虚拟机管理', exact: true }).click()
       await application.evaluate(({ dialog }, path) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] }) }, join(root, 'base.qcow2'))
       await page.getByRole('button', { name: '创建虚拟机', exact: true }).click()
       const wizard = page.getByRole('dialog')
       await checkDialog(page)
-      await checkNativeBackdrop(application, '#4d4d4d')
+      await checkNativeBackdrop(application, '#b2b1b0')
       await wizard.getByRole('button', { name: '浏览', exact: true }).click()
       await wizard.getByRole('button', { name: '下一步', exact: true }).click()
       await wizard.getByLabel('名称', { exact: true }).fill('Windows 高 DPI 开发环境')
@@ -124,10 +124,10 @@ for (const scale of [1, 1.25, 1.5, 2]) {
       await wizard.getByRole('button', { name: '下一步', exact: true }).click()
       await wizard.getByRole('button', { name: '创建虚拟机', exact: true }).click()
       await expect(page.getByRole('button', { name: '虚拟机设置', exact: true })).toBeVisible()
-      await checkNativeBackdrop(application, '#ffffff')
+      await checkNativeBackdrop(application, '#f7f6f5')
       await page.getByRole('button', { name: '虚拟机设置', exact: true }).click()
       await expect(page.getByLabel('设置分类')).toBeVisible()
-      await checkNativeBackdrop(application, '#4d4d4d')
+      await checkNativeBackdrop(application, '#b2b1b0')
       await page.getByLabel('设置分类').getByRole('button', { name: '网络', exact: true }).click()
       await checkDialog(page)
       const settings = page.getByRole('dialog')
@@ -145,12 +145,12 @@ for (const scale of [1, 1.25, 1.5, 2]) {
       await page.screenshot({ path: join(artifacts, 'hardware-960.png') })
       await settings.getByRole('button', { name: '取消', exact: true }).click()
       await expect(page.getByRole('heading', { name: '保存配置修改？' })).toBeVisible()
-      await checkNativeBackdrop(application, '#171717')
+      await checkNativeBackdrop(application, '#80807f')
       await page.getByRole('button', { name: '继续编辑', exact: true }).click()
-      await checkNativeBackdrop(application, '#4d4d4d')
+      await checkNativeBackdrop(application, '#b2b1b0')
       await settings.getByRole('button', { name: '取消', exact: true }).click()
       await page.getByRole('button', { name: '丢弃修改', exact: true }).click()
-      await checkNativeBackdrop(application, '#ffffff')
+      await checkNativeBackdrop(application, '#f7f6f5')
       await page.getByRole('button', { name: '返回虚拟机列表' }).click()
       await page.screenshot({ path: join(artifacts, 'list-960.png') })
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)

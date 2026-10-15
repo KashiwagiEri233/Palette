@@ -1,3 +1,5 @@
+import type { WorkspaceMethod, WorkspaceRoutes } from './workspace'
+
 export type InputEvent =
   | { type: 'move'; x: number; y: number }
   | { type: 'button'; button: 'left' | 'middle' | 'right'; down: boolean }
@@ -18,9 +20,10 @@ export interface ControlLease { lease_id: string; instance_id: string; controlle
 export interface DoctorReport { ok: boolean; checks: { name: string; ok: boolean; blocking?: boolean; detail?: unknown }[] }
 export interface DesktopApi {
   readonly platform: string
-  setWindowBackdrop(opacity: number): Promise<void>
+  setWindowBackdrop(opacity: number, background?: string): Promise<void>
   connect(): Promise<OwnerInfo>
   request(method: DesktopMethod, vmId?: string, payload?: Record<string, unknown>): Promise<unknown>
+  request<K extends WorkspaceMethod>(method: K, vmId: string | undefined, payload: WorkspaceRoutes[K]['payload']): Promise<WorkspaceRoutes[K]['result']>
   chooseFile(source: 'image' | 'iso'): Promise<string | null>
   chooseRoot(): Promise<OwnerInfo | null>
   onClose(callback: () => void): () => void

@@ -15,6 +15,7 @@
 | --- | --- |
 | [项目总览 (../README.zh-CN.md)](../README.zh-CN.md) · [English](../README.md) | 架构全景、核心特性、快速开始与安全默认开关速览 |
 | [桌面应用指南 (desktop.zh-CN.md)](desktop.zh-CN.md) · [English](desktop.md) | Palette Desktop 源码运行、持久虚拟机创建、离线硬件配置、只读画面网关、人工独占接管与共用后台 |
+| [桌面 GUI 与内置 Agent 设计规范 (desktop-agent-design.zh-CN.md)](desktop-agent-design.zh-CN.md) · [English](desktop-agent-design.md) | 待实现的四区布局、组件状态、接管与审批时序、类型化 IPC 草案、主题 token 和分阶段验收 |
 | [Agent 与客户端用户指南 (user-guide.zh-CN.md)](user-guide.zh-CN.md) · [English](user-guide.md) | 面向 Agent 与 MCP 客户端开发者：10 个 MCP 工具契约、`vm_observe → vm_act` 工作循环、帧代次防抖、文本规则与错误码恢复 |
 | [宿主机运维指南 (operator.zh-CN.md)](operator.zh-CN.md) · [English](operator.md) | 面向宿主机管理员：环境检查、`daemon` 与 `serve` 协同、Profile 配置、生命周期控制、紧急停止、保留策略与故障恢复 |
 | [平台与客户机架构 (platforms.zh-CN.md)](platforms.zh-CN.md) · [English](platforms.md) | Windows (`WHPX`)、macOS (`HVF`)、Linux (`KVM`) 原生加速矩阵、显式跨架构 `TCG`、UEFI 固件发现与进程内存限制 |
