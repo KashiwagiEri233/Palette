@@ -125,6 +125,27 @@ async def test_disk_survives_stop_resume_and_service_restart(service: PaletteSer
         await rebuilt.shutdown()
 
 
+async def test_lease_watcher_does_not_revoke_an_in_progress_takeover(
+    service: PaletteService, monkeypatch
+) -> None:
+    await service.start("desktop")
+    instance = service.manager.get("desktop")
+    original = service.take_control
+
+    async def delayed_takeover(vm_id: str, *, reason: str) -> int:
+        epoch = await original(vm_id, reason=reason)
+        # Cross the watcher's 250ms interval while acquire still owns its lock.
+        await asyncio.sleep(0.35)
+        return epoch
+
+    monkeypatch.setattr(service, "take_control", delayed_takeover)
+    lease = await service.control.acquire("desktop", instance.view.instance_id)
+    await asyncio.sleep(0)
+    assert service.control.heartbeat("desktop", lease["lease_id"])["expires_after_ms"] == 3000
+    with pytest.raises(PaletteError, match="another operator"):
+        await service.control.acquire("desktop", instance.view.instance_id)
+
+
 async def test_operator_hold_excludes_agent_and_deduplicates(service: PaletteService) -> None:
     await service.start("desktop")
     instance = service.manager.get("desktop")
@@ -288,6 +309,82 @@ async def test_gui_graceful_stop_never_kills_on_failure(service: PaletteService)
         await desktop.stop(vm_id)
     assert instance.process.returncode is None
     assert instance.view.state == "RUNNING"
+    await desktop.stop(vm_id, force=True)
+
+
+async def test_guest_initiated_shutdown_cleans_up_and_preserves_the_persistent_disk(
+    service: PaletteService,
+) -> None:
+    desktop = DesktopManager(service)
+    definition = await desktop.create(draft(service))
+    vm_id = definition["vm_id"]
+    await desktop.start(vm_id)
+    instance = service.manager.get(vm_id)
+    disk = instance.paths.overlay
+    before = disk.read_bytes()
+    Path(str(disk) + ".behavior.json").write_text(json.dumps({"shutdown_on_input": True}))
+    watcher = next(task for task in instance.tasks if task.get_name().startswith("watch-"))
+    await instance.qmp.execute("input-send-event", {"events": []})
+    await asyncio.wait_for(asyncio.shield(watcher), 5)
+    assert instance.view.state == "STOPPED"
+    assert instance.process.returncode == 0
+    assert not instance.tasks
+    assert not instance.qmp.connected
+    assert instance.view.last_error is None
+    assert not instance.view.qmp_ready
+    assert not instance.view.screen_ready
+    manifest = json.loads(instance.paths.manifest.read_text())
+    assert manifest["state"] == "STOPPED" and manifest["process_exited"] is True
+    assert disk.read_bytes() == before
+    await desktop.start(vm_id)
+    assert service.manager.get(vm_id).view.instance_id != instance.view.instance_id
+    await desktop.stop(vm_id)
+
+
+async def test_shutdown_confirmation_does_not_stop_a_replacement_instance(
+    service: PaletteService,
+) -> None:
+    desktop = DesktopManager(service)
+    definition = await desktop.create(draft(service))
+    vm_id = definition["vm_id"]
+    first = await desktop.start(vm_id)
+    await desktop.stop(vm_id)
+    second = await desktop.start(vm_id)
+    assert second["instance_id"] != first["instance_id"]
+    with pytest.raises(PaletteError) as error:
+        await desktop.stop(vm_id, force=True, expected_instance_id=first["instance_id"])
+    assert error.value.code is ErrorCode.STATE_CONFLICT
+    assert service.manager.get(vm_id).view.state == "RUNNING"
+    await desktop.stop(vm_id, expected_instance_id=second["instance_id"])
+
+
+@pytest.mark.parametrize(
+    ("guest", "reason", "exit_code"),
+    [(False, "host-qmp-quit", 0), (True, "guest-panic", 0), (True, "guest-shutdown", 1)],
+)
+async def test_an_unclean_shutdown_is_still_reported_as_failed(
+    service: PaletteService, guest: bool, reason: str, exit_code: int
+) -> None:
+    desktop = DesktopManager(service)
+    definition = await desktop.create(draft(service))
+    vm_id = definition["vm_id"]
+    await desktop.start(vm_id)
+    instance = service.manager.get(vm_id)
+    Path(str(instance.paths.overlay) + ".behavior.json").write_text(
+        json.dumps(
+            {
+                "shutdown_on_input": True,
+                "shutdown_guest": guest,
+                "shutdown_reason": reason,
+                "shutdown_exit_code": exit_code,
+            }
+        )
+    )
+    watcher = next(task for task in instance.tasks if task.get_name().startswith("watch-"))
+    await instance.qmp.execute("input-send-event", {"events": []})
+    await asyncio.wait_for(asyncio.shield(watcher), 5)
+    assert instance.view.state == "FAILED"
+    assert instance.paths.overlay.exists()
     await desktop.stop(vm_id, force=True)
 
 

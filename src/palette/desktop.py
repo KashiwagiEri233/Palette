@@ -735,15 +735,22 @@ class DesktopManager:
             "state": str(instance.state),
         }
 
-    async def stop(self, vm_id: str, *, force: bool = False) -> dict[str, Any]:
+    async def stop(
+        self, vm_id: str, *, force: bool = False, expected_instance_id: str | None = None
+    ) -> dict[str, Any]:
         async with self._lock:
-            await self.service.control.revoke(vm_id)
             instance = self.service.manager.find(vm_id)
+            self.service.manager._check_identity(instance, expected_instance_id)
+            await self.service.control.revoke(vm_id)
             if instance is not None:
                 if force:
-                    await self.service.stop(vm_id, force=True)
+                    await self.service.stop(
+                        vm_id, force=True, expected_instance_id=expected_instance_id
+                    )
                 else:
-                    await self.service.manager.graceful_stop(vm_id)
+                    await self.service.manager.graceful_stop(
+                        vm_id, expected_instance_id=expected_instance_id
+                    )
                 definition = self.definitions.get(vm_id)
                 if definition and definition.storage_owner:
                     owner_paths = self._storage_after_stop(definition)

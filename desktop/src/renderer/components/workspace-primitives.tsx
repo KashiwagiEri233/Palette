@@ -7,9 +7,17 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuIte
 import type { VmRecord } from '../../shared/types'
 
 export const stateNames: Record<string, string> = { STOPPED: '已关机', STARTING: '启动中', RUNNING: '运行中', STOPPING: '关机中', PAUSED: '已暂停', FAILED: '故障' }
-export function errorText(error: unknown): string {
+function rawErrorText(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error)
   return message.replace(/^(?:Error: )?Error invoking remote method '[^']+': Error: /, '').replace(/^Error: /, '')
+}
+export function isShutdownTimeout(error: unknown): boolean {
+  return rawErrorText(error) === 'TIMEOUT: the guest did not shut down within the configured budget'
+}
+export function errorText(error: unknown): string {
+  const text = rawErrorText(error)
+  if (isShutdownTimeout(error)) return '虚拟机未在规定时间内完成正常关机。客户机未响应关机请求，可在虚拟机内关机，或确认后强制停止。'
+  return text
 }
 export const activeVm = (vm: VmRecord): boolean => !['STOPPED', 'FAILED'].includes(vm.status.state)
 

@@ -16,13 +16,13 @@ import { DesktopShell, useViewportWidth } from './components/DesktopShell'
 import { ConversationNavigation } from './components/ConversationNavigation'
 import { ConversationPage } from './components/ConversationPage'
 import { SettingsPage, settingsSections, type SettingsCategory, type ThemePreference } from './components/SettingsPage'
-import { IconButton, VmStatusBadge, VmActions, errorText } from './components/workspace-primitives'
+import { IconButton, VmStatusBadge, VmActions, errorText, isShutdownTimeout } from './components/workspace-primitives'
 import { Console } from './Console'
 import { VmSettings } from './VmSettings'
 import { CreateVm, LiveStatus, Configuration } from './VmPages'
 import { defaultLayout, layoutStorageKey, parseLayout, resolveLayout, type LayoutPreferences } from './lib/layout'
 import { useConversations } from './lib/use-conversations'
-import type { OwnerInfo, Profile, VmRecord, DesktopMethod } from '../shared/types'
+import type { OwnerInfo, Profile, VmRecord, DesktopMethod, ShutdownTimeout } from '../shared/types'
 import type { Conversation, ConversationPatch } from '../shared/workspace'
 
 interface Route { page: 'home' | 'vms' | 'settings' | 'conversation'; vmId?: string; conversationId?: string; category?: SettingsCategory }
@@ -44,7 +44,8 @@ export default function App() {
   const newConversationPending = useRef(false)
   const [creating, setCreating] = useState(false)
   const [createSource, setCreateSource] = useState<'image' | 'iso'>('image')
-  const [confirm, setConfirm] = useState<{ vm: VmRecord; action: 'reset' | 'delete' | 'force' } | null>(null)
+  const [confirm, setConfirm] = useState<{ vm: VmRecord; action: 'reset' | 'delete' | 'force'; resumeExit?: boolean } | null>(null)
+  const [shutdownFailedVm, setShutdownFailedVm] = useState<VmRecord | null>(null)
   const [conversationDialog, setConversationDialog] = useState<{ kind: 'rename' | 'delete' | 'clear'; item: Conversation } | null>(null)
   const [conversationTitle, setConversationTitle] = useState('')
   const [dialogBusy, setDialogBusy] = useState(false)
@@ -53,6 +54,7 @@ export default function App() {
   const [closing, setClosing] = useState(false)
   const [closeBusy, setCloseBusy] = useState<'background' | 'shutdown' | null>(null)
   const [closeError, setCloseError] = useState('')
+  const [closeFailure, setCloseFailure] = useState<ShutdownTimeout | null>(null)
   const submittingClose = useRef(false)
   const [editing, setEditing] = useState<VmRecord | null>(null)
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null)
@@ -134,24 +136,53 @@ export default function App() {
     if (['force', 'reset', 'delete'].includes(action)) { setConfirm({ vm, action: action as 'force' | 'reset' | 'delete' }); return }
     await execute(vm, action)
   }
-  async function execute(vm: VmRecord, action: string) {
+  async function execute(vm: VmRecord, action: string, resumeExit = false) {
     if (mutating.current) return
-    mutating.current = true; setBusy(vm.vm_id); setError('')
+    mutating.current = true; setBusy(vm.vm_id); setError(''); setShutdownFailedVm(null)
+    let continueExit = false
     try {
       const method = (action === 'force' ? 'vms.stop' : `vms.${action}`) as DesktopMethod
-      await window.palette.request(method, vm.vm_id, action === 'force' ? { force: true } : {})
+      const checkInstance = action === 'force' || owner?.features.includes('vm-stop-identity')
+      const payload = method === 'vms.stop' ? { force: action === 'force', ...(checkInstance && vm.status.instance_id ? { expected_instance_id: vm.status.instance_id } : {}) } : {}
+      await window.palette.request(method, vm.vm_id, payload)
       if (action === 'delete') { await conversations.load(); setTargetVmId(undefined); navigate({ page: 'home' }) }
       setConfirm(null); await refresh()
-    } catch (error) { reportError(error) }
+      continueExit = resumeExit
+    } catch (error) {
+      reportError(error)
+      if (owner?.features.includes('vm-stop-identity') && ['stop', 'restart'].includes(action) && isShutdownTimeout(error)) setShutdownFailedVm(vm)
+      // A failed graceful shutdown restores the previous state in the backend.
+      void refresh().catch(() => {})
+    }
     finally { mutating.current = false; setBusy(null) }
+    if (continueExit) { setClosing(true); await finishClose('shutdown') }
   }
   async function finishClose(choice: 'background' | 'shutdown' | 'cancel') {
     if (submittingClose.current) return
-    submittingClose.current = true; setCloseError('')
+    submittingClose.current = true; setCloseError(''); setCloseFailure(null)
     if (choice !== 'cancel') setCloseBusy(choice)
-    try { if (choice !== 'cancel') await conversations.flush(); await window.palette.finishClose(choice); if (choice === 'cancel') setClosing(false) }
-    catch (error) { setCloseError(errorText(error)) }
+    try {
+      if (choice === 'shutdown' && mutating.current) throw new Error('虚拟机操作尚未完成，请等待操作完成后重试退出，或选择仅关闭窗口')
+      if (choice !== 'cancel') await conversations.flush()
+      const result = await window.palette.finishClose(choice)
+      if (result?.shutdownTimeout) {
+        setCloseFailure(result.shutdownTimeout)
+        setCloseError(`虚拟机未在规定时间内完成正常关机：${result.shutdownTimeout.name}。可以重试，或确认后强制停止此虚拟机并继续退出。`)
+        void refresh().catch(() => {})
+      }
+      if (choice === 'cancel') setClosing(false)
+    }
+    catch (error) {
+      setCloseError(errorText(error))
+      void refresh().catch(() => {})
+    }
     finally { submittingClose.current = false; setCloseBusy(null) }
+  }
+  function confirmForceExit() {
+    const vm = vms.find(vm => vm.vm_id === closeFailure?.vm_id)
+    if (!vm || vm.status.instance_id !== closeFailure?.instance_id) { setCloseFailure(null); setCloseError('虚拟机状态已变化，请重新尝试完全退出'); return }
+    setClosing(false); setCloseFailure(null); setError('')
+    setConfirm({ vm, action: 'force', resumeExit: true })
   }
   async function chooseRoot() {
     try {
@@ -185,7 +216,7 @@ export default function App() {
   const navigation = route.page === 'vms' ? null : route.page === 'settings' ? <Sidebar variant="inset" className="app-sidebar settings-navigation"><SidebarHeader>设置</SidebarHeader><SidebarContent>{settingsSections.map(section => <SidebarItem key={section.id} title={section.label} active={(route.category ?? 'runtime') === section.id} onClick={() => navigate({ page: 'settings', category: section.id })}>{layout.compact ? section.label.slice(0, 1) : section.label}</SidebarItem>)}</SidebarContent></Sidebar> : <ConversationNavigation vms={vms} conversations={conversations.conversations} selectedId={route.conversationId} compact={layout.compact} connection={connection} busy={creatingConversation || !owner} onNew={id => void newConversation(id ?? currentConversation?.vm_id ?? targetVmId)} onSelect={selectConversation} onOpenVm={openVm} onVmAction={(vm, action) => void operate(vm, action)} onUpdate={(item, patch) => void updateConversation(item, patch)} onRename={item => editConversation(item, 'rename')} onDelete={item => editConversation(item, 'delete')} onSearch={() => setCommandOpen(true)} onManage={() => navigate({ page: 'vms' })} />
 
   return <TooltipProvider><DesktopShell preferences={preferences} onPreferences={updatePreferences} rail={rail} navigation={navigation} onSearch={() => setCommandOpen(true)} canBack={history.index > 0} canForward={history.index < history.routes.length - 1} onBack={() => setHistory(previous => ({ ...previous, index: Math.max(0, previous.index - 1) }))} onForward={() => setHistory(previous => ({ ...previous, index: Math.min(previous.routes.length - 1, previous.index + 1) }))}>
-    {error && <div className="desktop-error" role="alert"><span>{error}</span><Button variant="ghost" size="sm" onClick={() => setError('')}>关闭</Button></div>}
+    {error && <div className="desktop-error" role="alert"><span>{error}</span>{shutdownFailedVm && <Button variant="outline" size="sm" disabled={!!busy} onClick={() => setConfirm({ vm: shutdownFailedVm, action: 'force' })}>强制停止…</Button>}<Button variant="ghost" size="sm" onClick={() => { setError(''); setShutdownFailedVm(null) }}>关闭</Button></div>}
     {loading ? <div className="loading-state" role="status">正在连接后台…</div> : route.page === 'settings' ? <SettingsPage key={owner?.config_root} category={route.category ?? 'runtime'} owner={owner} theme={theme} onTheme={setTheme} onReconnect={() => void connect()} onChooseRoot={() => void chooseRoot()} onError={reportError} /> : route.page === 'conversation' ? currentConversation ? <ConversationPage conversation={currentConversation} vm={currentVm} preferences={preferences} busy={busy === currentVm?.vm_id} onPreferences={updatePreferences} onDraft={conversations.setDraft} draftState={conversations.draftStates[currentConversation.id]} onRetrySave={() => void conversations.flush().catch(reportError)} onRename={() => editConversation(currentConversation, 'rename')} onDelete={() => editConversation(currentConversation, 'delete')} onClear={() => editConversation(currentConversation, 'clear')} onExport={() => { void conversations.flush().then(() => window.palette.request('conversations.export', currentConversation.vm_id, { id: currentConversation.id })).catch(reportError) }} onAction={(vm, action) => void operate(vm, action)} onAgentSettings={() => navigate({ page: 'settings', category: 'agent' })} reportError={reportError} /> : <div className="empty-content"><h1>对话不存在</h1><Button onClick={() => navigate({ page: 'home' })}>返回主页</Button></div> : route.page === 'home' ? <div className="home-page page-scroll"><div className="home-content">
       <section className="home-task"><h1>想让 Agent 做什么？</h1><PromptInput value={homeDraft} onValueChange={setHomeDraft} placeholder="描述任务，保存为新对话…" sendLabel="保存为新对话" onSend={() => void newConversation(targetVmId, homeDraft)} sendDisabled={!targetVmId || !owner || creatingConversation} footer={<><Badge variant="secondary">{vms.find(vm => vm.vm_id === targetVmId)?.name ?? '选择目标虚拟机'}</Badge><span className="home-draft-label">保存任务草稿</span></>} /><div className="target-vm-chips">{vms.map(vm => <Button key={vm.vm_id} size="sm" variant={targetVmId === vm.vm_id ? 'secondary' : 'ghost'} aria-pressed={targetVmId === vm.vm_id} onClick={() => setTargetVmId(vm.vm_id)}><span className={`status-dot ${vm.status.state === 'RUNNING' ? 'online' : ''}`} />{vm.name}</Button>)}</div></section>
       {!owner ? <section className="home-empty"><h2>后台未连接</h2><Button onClick={() => void connect()}>重新连接</Button></section> : !vms.length ? <section className="home-empty"><Monitor size={28} /><h2>还没有虚拟机</h2>{quickCreate}<Button variant="ghost" onClick={() => openCreate()}>创建虚拟机</Button></section> : <><section className="home-section"><div className="section-heading"><h2>运行中的虚拟机</h2><Button variant="ghost" size="sm" onClick={() => navigate({ page: 'vms' })}>全部虚拟机</Button></div>{vms.filter(vm => vm.status.state === 'RUNNING').length ? <div className="running-vms">{vms.filter(vm => vm.status.state === 'RUNNING').map(vm => <Card key={vm.vm_id} className="running-vm-card"><CardContent><Monitor size={22} /><div><strong>{vm.name}</strong><VmStatusBadge vm={vm} /><small>{vm.definition ? `${vm.definition.draft.vcpus} 核 / ${vm.definition.draft.memory_mib / 1024} GiB（已配置）` : '资源信息不可用'}</small></div><Button variant="outline" size="sm" onClick={() => openVm(vm)}>打开</Button></CardContent></Card>)}</div> : <p className="section-empty">没有运行中的虚拟机</p>}</section><section className="home-section"><h2>最近会话</h2>{visibleConversations.length ? <div className="home-recent">{[...visibleConversations].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 5).map(item => <Button key={item.id} variant="ghost" onClick={() => selectConversation(item)}><MessageSquare size={16} /><span>{item.title}</span><small>{vms.find(vm => vm.vm_id === item.vm_id)?.name}</small></Button>)}</div> : <p className="section-empty">暂无最近对话</p>}</section>{quickCreate}</>}
@@ -193,7 +224,7 @@ export default function App() {
   </DesktopShell>
   <CreateVm open={creating} source={createSource} onClose={() => setCreating(false)} profiles={profiles} defaultProfile={defaultProfile} advancedSupported={owner?.features.includes('vm-settings-v2') ?? false} onCreated={async id => { setCreating(false); await refresh(); setTargetVmId(id); navigate({ page: 'vms', vmId: id }) }} />
   {editing && <VmSettings vm={vms.find(vm => vm.vm_id === editing.vm_id) ?? editing} owner={owner} onClose={() => setEditing(null)} onSaved={refresh} />}
-  <Dialog open={!!confirm} onOpenChange={open => { if (!open && !busy) setConfirm(null) }}><DialogContent closeDisabled={!!busy}><DialogHeader><DialogTitle>{confirm?.action === 'delete' ? '删除虚拟机' : confirm?.action === 'force' ? '强制停止虚拟机' : '恢复初始状态'}</DialogTitle><DialogDescription>{confirm?.vm.name}：{confirm?.action === 'delete' ? '删除定义、受管理磁盘和全部对话。原始镜像不会被删除。' : confirm?.action === 'force' ? '立即停止运行，尚未保存的数据可能丢失。' : '丢弃当前磁盘修改，恢复初始状态。'}</DialogDescription></DialogHeader>{error && <p role="alert">{error}</p>}<DialogFooter><Button variant="secondary" disabled={!!busy} onClick={() => setConfirm(null)}>取消</Button><Button variant="destructive" disabled={!!busy} onClick={() => confirm && void execute(confirm.vm, confirm.action)}>{busy ? '处理中…' : '确认'}</Button></DialogFooter></DialogContent></Dialog>
+  <Dialog open={!!confirm} onOpenChange={open => { if (!open && !busy) setConfirm(null) }}><DialogContent closeDisabled={!!busy}><DialogHeader><DialogTitle>{confirm?.action === 'delete' ? '删除虚拟机' : confirm?.action === 'force' ? '强制停止虚拟机' : '恢复初始状态'}</DialogTitle><DialogDescription>{confirm?.vm.name}：{confirm?.action === 'delete' ? '删除定义、受管理磁盘和全部对话。原始镜像不会被删除。' : confirm?.action === 'force' ? `立即停止运行，尚未保存的数据可能丢失。${confirm.resumeExit ? '确认后将继续正常关闭其他虚拟机并退出 Palette。' : ''}` : '丢弃当前磁盘修改，恢复初始状态。'}</DialogDescription></DialogHeader>{error && <p role="alert">{error}</p>}<DialogFooter><Button variant="secondary" disabled={!!busy} onClick={() => setConfirm(null)}>取消</Button><Button variant="destructive" disabled={!!busy} onClick={() => confirm && void execute(confirm.vm, confirm.action, confirm.resumeExit)}>{busy ? '处理中…' : '确认'}</Button></DialogFooter></DialogContent></Dialog>
   <Dialog open={!!conversationDialog} onOpenChange={open => { if (!open && !dialogBusy) setConversationDialog(null) }}><DialogContent closeDisabled={dialogBusy}><DialogHeader><DialogTitle>{conversationDialog?.kind === 'rename' ? '重命名对话' : conversationDialog?.kind === 'clear' ? '清空草稿？' : '删除对话？'}</DialogTitle><DialogDescription>{conversationDialog?.kind === 'rename' ? '为这项任务设置一个标题。' : '此操作无法撤销，虚拟机与磁盘不受影响。'}</DialogDescription></DialogHeader>{conversationDialog?.kind === 'rename' && <Input autoFocus aria-label="对话标题" value={conversationTitle} maxLength={120} onChange={event => setConversationTitle(event.target.value)} onKeyDown={event => { if (event.key === 'Escape') setConversationDialog(null) }} />}<DialogFooter><Button variant="secondary" disabled={dialogBusy} onClick={() => setConversationDialog(null)}>取消</Button><Button disabled={dialogBusy || conversationDialog?.kind === 'rename' && !conversationTitle.trim()} variant={conversationDialog?.kind === 'rename' ? 'default' : 'destructive'} onClick={() => {
     const selected = conversationDialog
     if (!selected) return
@@ -202,7 +233,7 @@ export default function App() {
   }}>{dialogBusy ? '正在保存…' : conversationDialog?.kind === 'rename' ? '保存' : '确认'}</Button></DialogFooter></DialogContent></Dialog>
   <Dialog open={choosingVm} onOpenChange={setChoosingVm}><DialogContent><DialogHeader><DialogTitle>选择目标虚拟机</DialogTitle><DialogDescription>每个对话属于一台虚拟机。</DialogDescription></DialogHeader>{vms.map(vm => <Button key={vm.vm_id} variant="outline" disabled={creatingConversation} onClick={() => void newConversation(vm.vm_id, homeDraft)}><Monitor size={16} />{vm.name}<VmStatusBadge vm={vm} /></Button>)}{!vms.length && <Button disabled={!owner} onClick={() => { setChoosingVm(false); openCreate() }}>创建虚拟机</Button>}</DialogContent></Dialog>
   <Dialog open={commandOpen} onOpenChange={setCommandOpen}><DialogContent className="command-dialog"><DialogTitle className="sr-only">命令面板</DialogTitle><Command><CommandInput aria-label="搜索虚拟机和会话" placeholder="搜索虚拟机、会话或操作…" /><CommandList><CommandEmpty>没有找到匹配结果</CommandEmpty><CommandGroup heading="操作"><CommandItem onSelect={() => { setCommandOpen(false); void newConversation() }}>新对话</CommandItem><CommandItem onSelect={() => navigate({ page: 'vms' })}>虚拟机管理</CommandItem><CommandItem onSelect={() => navigate({ page: 'settings' })}>环境设置</CommandItem></CommandGroup><CommandGroup heading="虚拟机">{vms.map(vm => <CommandItem key={vm.vm_id} value={`vm ${vm.name} ${vm.vm_id}`} onSelect={() => openVm(vm)}><Monitor size={16} />{vm.name}</CommandItem>)}</CommandGroup><CommandGroup heading="对话">{conversations.conversations.map(item => <CommandItem key={item.id} value={`conversation ${item.id} ${item.title} ${vms.find(vm => vm.vm_id === item.vm_id)?.name ?? ''}`} onSelect={() => selectConversation(item)}>{item.pinned ? <Pin size={14} /> : <MessageSquare size={14} />}{item.title}<small>{vms.find(vm => vm.vm_id === item.vm_id)?.name}{item.archived ? '（已归档）' : ''}</small></CommandItem>)}</CommandGroup></CommandList></Command></DialogContent></Dialog>
-  <Dialog open={closing} onOpenChange={(open, details) => { if (!open) { if (submittingClose.current) details.cancel(); else void finishClose('cancel') } }}><DialogContent closeDisabled={!!closeBusy}><DialogHeader><DialogTitle>退出 Palette？</DialogTitle><DialogDescription>仅关闭窗口会保留后台和运行中的虚拟机。完全退出会先正常关闭所有虚拟机，再停止当前连接的后台。{owner?.owner_kind === 'embedded' && '后台由 MCP 会话托管，完全退出将结束托管服务并中断相关 MCP 连接。'}</DialogDescription></DialogHeader>{closeError && <p role="alert">{closeError}</p>}<DialogFooter><Button variant="ghost" disabled={!!closeBusy} onClick={() => void finishClose('cancel')}>取消</Button><Button variant="secondary" disabled={!!closeBusy} onClick={() => void finishClose('background')}>{closeBusy === 'background' ? '正在关闭…' : '仅关闭窗口'}</Button><Button disabled={!!closeBusy} onClick={() => void finishClose('shutdown')}>{closeBusy === 'shutdown' ? '正在退出…' : '完全退出'}</Button></DialogFooter></DialogContent></Dialog>
+  <Dialog open={closing} onOpenChange={(open, details) => { if (!open) { if (submittingClose.current) details.cancel(); else void finishClose('cancel') } }}><DialogContent closeDisabled={!!closeBusy}><DialogHeader><DialogTitle>退出 Palette？</DialogTitle><DialogDescription>仅关闭窗口会保留后台和运行中的虚拟机。完全退出会先正常关闭所有虚拟机，再停止当前连接的后台。{owner?.owner_kind === 'embedded' && '后台由 MCP 会话托管，完全退出将结束托管服务并中断相关 MCP 连接。'}</DialogDescription></DialogHeader>{closeError && <p role="alert">{closeError}</p>}{closeFailure && <Button variant="destructive" disabled={!!closeBusy} onClick={confirmForceExit}>强制停止此虚拟机并退出…</Button>}<DialogFooter><Button variant="ghost" disabled={!!closeBusy} onClick={() => void finishClose('cancel')}>取消</Button><Button variant="secondary" disabled={!!closeBusy} onClick={() => void finishClose('background')}>{closeBusy === 'background' ? '正在关闭…' : '仅关闭窗口'}</Button><Button disabled={!!closeBusy} onClick={() => void finishClose('shutdown')}>{closeBusy === 'shutdown' ? '正在退出…' : '完全退出'}</Button></DialogFooter></DialogContent></Dialog>
   <Toaster theme={theme} position="bottom-right" />
   </TooltipProvider>
 }

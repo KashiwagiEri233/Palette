@@ -102,6 +102,7 @@ class VmInstance:
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
     started_monotonic: float = field(default_factory=time.monotonic)
     stop_requested: bool = False
+    guest_shutdown: bool = False
     #: Host material the caller supplied for this instance. Kept so a reset rebuilds the
     #: instance that was asked for instead of quietly reverting to the profile's defaults.
     overrides: LaunchOverrides = field(default_factory=LaunchOverrides)
@@ -769,6 +770,12 @@ class VmManager:
             raise PaletteError(
                 ErrorCode.TIMEOUT,
                 "the guest did not shut down within the configured budget",
+                details={
+                    "operation": "guest-shutdown",
+                    "vm_id": instance.view.vm_id,
+                    "instance_id": instance.view.instance_id,
+                    "timeout_seconds": timeout,
+                },
             )
         logger.warning("force-killing QEMU for %s", instance.view.vm_id)
         with contextlib.suppress(ProcessLookupError):
@@ -904,10 +911,11 @@ class VmManager:
                 await self._finish_cleanup(self._release_controller(instance))
             return instance.view.controller_epoch
 
-    async def graceful_stop(self, vm_id: str) -> None:
+    async def graceful_stop(self, vm_id: str, *, expected_instance_id: str | None = None) -> None:
         """Desktop shutdown: a failed ACPI request must never turn into a kill."""
         async with self._lock:
             instance = self.get(vm_id)
+            self._check_identity(instance, expected_instance_id)
             if instance.process is None or instance.process.returncode is not None:
                 await self._finish_cleanup(self._stop_locked(instance, force=False))
                 return
@@ -1000,7 +1008,22 @@ class VmManager:
         if process is None:
             return
         code = await process.wait()
+        # Process exit and pipe delivery are independent on Windows. Drain QMP so
+        # a final guest SHUTDOWN cannot arrive after we report a crash.
+        if instance.qmp is not None:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    instance.qmp.wait_closed(),
+                    timeout=instance.profile.timeouts.qmp_command_seconds,
+                )
         if instance.stop_requested:
+            return
+        if instance.guest_shutdown and code == 0:
+            async with self._lock:
+                if self.find(instance.view.vm_id) is not instance or instance.stop_requested:
+                    return
+                await self._finish_cleanup(self._stop_locked(instance, force=False))
+                self._apply_retention(instance.view.vm_id, instance.profile)
             return
         logger.warning("QEMU for %s exited unexpectedly with %s", instance.view.vm_id, code)
         instance.view.state = str(VmState.FAILED)
@@ -1032,6 +1055,22 @@ class VmManager:
             )
 
     def _on_qmp_event(self, instance: VmInstance, name: str, data: dict[str, Any]) -> None:
+        if self.find(instance.view.vm_id) is not instance:
+            return
+        if (
+            name == "SHUTDOWN"
+            and data.get("guest") is True
+            and data.get("reason") == "guest-shutdown"
+        ):
+            instance.guest_shutdown = True
+            if not instance.stop_requested:
+                instance.view.state = str(VmState.STOPPING)
+                instance.view.qmp_ready = False
+                instance.view.screen_ready = False
+                instance.view.desktop_ready = None
+                if instance.controller is not None:
+                    instance.controller.invalidate(reason="the guest shut down")
+            return
         if (
             name != "RESET"
             or instance.stop_requested
@@ -1064,7 +1103,7 @@ class VmManager:
             )
 
     def _on_qmp_disconnect(self, instance: VmInstance, failure: BaseException | None) -> None:
-        if instance.stop_requested:
+        if instance.stop_requested or instance.guest_shutdown:
             return
         logger.warning("QMP channel for %s dropped: %s", instance.view.vm_id, failure)
         instance.view.qmp_ready = False

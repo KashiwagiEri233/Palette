@@ -60,6 +60,7 @@ class Lease:
     token: str = field(default_factory=lambda: secrets.token_hex(24))
     expires: float = field(default_factory=lambda: time.monotonic() + 3)
     state: Literal["held", "releasing", "faulted"] = "held"
+    acquiring: bool = False
     seq: int = 0
     receipts: OrderedDict[int, tuple[str, dict[str, Any]]] = field(default_factory=OrderedDict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -110,7 +111,11 @@ class ControlManager:
             if vm_id in self.leases:
                 raise PaletteError(ErrorCode.BUSY, "another operator holds this VM")
             lease = Lease(
-                vm_id, instance_id, instance.view.boot_epoch, instance.view.controller_epoch
+                vm_id,
+                instance_id,
+                instance.view.boot_epoch,
+                instance.view.controller_epoch,
+                acquiring=True,
             )
             self.leases[vm_id] = lease
             controller = self.service._controller(instance)
@@ -123,7 +128,11 @@ class ControlManager:
                         ErrorCode.QMP_UNAVAILABLE, "held inputs could not be released"
                     )
                 lease.expires = time.monotonic() + 3
+                # The watcher must not queue revocation while takeover has advanced
+                # the instance epoch but has not yet returned it to this lease.
+                lease.acquiring = False
             except BaseException:
+                lease.acquiring = False
                 if lease.state != "faulted":
                     self.leases.pop(vm_id, None)
                 raise
@@ -274,12 +283,16 @@ class ControlManager:
             await asyncio.sleep(0.25)
             for vm_id, lease in list(self.leases.items()):
                 instance = self.service.manager.find(vm_id)
-                if lease.state == "held" and (
-                    lease.expires <= time.monotonic()
-                    or instance is None
-                    or instance.view.instance_id != lease.instance_id
-                    or instance.view.boot_epoch != lease.boot_epoch
-                    or instance.view.controller_epoch != lease.controller_epoch
+                if (
+                    not lease.acquiring
+                    and lease.state == "held"
+                    and (
+                        lease.expires <= time.monotonic()
+                        or instance is None
+                        or instance.view.instance_id != lease.instance_id
+                        or instance.view.boot_epoch != lease.boot_epoch
+                        or instance.view.controller_epoch != lease.controller_epoch
+                    )
                 ):
                     with contextlib.suppress(PaletteError):
                         await self.revoke(vm_id)

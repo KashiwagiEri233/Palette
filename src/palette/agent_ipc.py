@@ -177,7 +177,11 @@ class AgentServer(OperatorServer):
                             )
                         info = await self.desktop.start(vm_id)
                     elif method == "stop":
-                        info = await self.desktop.stop(vm_id, force=parameters.get("force", False))
+                        info = await self.desktop.stop(
+                            vm_id,
+                            force=parameters.get("force", False),
+                            expected_instance_id=parameters.get("expected_instance_id"),
+                        )
                     else:
                         info = await self.desktop.reset(vm_id)
                     result = LifecycleResult(ok=True, **info)
@@ -403,9 +407,17 @@ class RemoteService(PaletteService):
         return LifecycleResult.model_validate(data)
 
     async def stop(
-        self, vm_id: str, *, force: bool = False, actor: Any = "agent"
+        self,
+        vm_id: str,
+        *,
+        force: bool = False,
+        actor: Any = "agent",
+        expected_instance_id: str | None = None,
     ) -> LifecycleResult:
-        data, _ = await self._call("stop", vm_id, {"force": force})
+        parameters: dict[str, Any] = {"force": force}
+        if expected_instance_id is not None:
+            parameters["expected_instance_id"] = expected_instance_id
+        data, _ = await self._call("stop", vm_id, parameters)
         return LifecycleResult.model_validate(data)
 
     async def reset(

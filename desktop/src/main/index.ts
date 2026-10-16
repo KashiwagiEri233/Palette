@@ -4,7 +4,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { call } from './ipc'
-import { RuntimeShutdown } from './shutdown'
+import { RuntimeShutdown, VmShutdownTimeout } from './shutdown'
 import type { DesktopMethod, OwnerInfo } from '../shared/types'
 import { workspaceMethods } from '../shared/workspace'
 import { ConversationRepository } from './conversations'
@@ -158,7 +158,13 @@ app.whenReady().then(async () => {
       throw new Error('不支持的会话操作')
     }
     const repository = conversations()
-    const result = await call(runtimeRoot, method, vmId, payload)
+    let expectedGeneration: string | undefined
+    if (method === 'vms.stop' && payload.expected_instance_id !== undefined) {
+      const owner = await call(runtimeRoot, 'hello')
+      if (!Array.isArray(owner.features) || !owner.features.includes('vm-stop-identity')) throw new Error('后台需要升级才能校验关机目标，请重新连接后台后重试')
+      expectedGeneration = String(owner.generation)
+    }
+    const result = await call(runtimeRoot, method, vmId, payload, expectedGeneration)
     if (method === 'control.acquire' && vmId) {
       leases.set(vmId, String(result.lease_id))
       if (!window.isFocused() || handlingClose) {
@@ -211,6 +217,9 @@ app.whenReady().then(async () => {
       if (choice === 'shutdown') await shutdown.stop(closingRuntime)
       allowedClose = true
       window.close()
+    } catch (error) {
+      if (error instanceof VmShutdownTimeout) return { shutdownTimeout: error.target }
+      throw error
     } finally {
       handlingClose = false
     }

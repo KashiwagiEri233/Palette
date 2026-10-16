@@ -160,6 +160,10 @@ The script writes `report.json`, `02-before.png`, `03-click.png`, and (after a d
 | **Close Window Only** | Close the GUI window and choose **Close Window Only** | `daemon` and VM stay running; MCP continues observing; reopening GUI reconnects to the same instance |
 | **Quit Completely** | Close the GUI window and choose **Quit Completely** | Gracefully shuts down running VMs, stops `daemon`, verifies process exit, and closes the window while preserving persistent disks |
 | **Shutdown failure** | Trigger **Quit Completely** when ACPI shutdown times out | Window remains open displaying the error with options to retry, cancel, or close window only |
+| **Confirmed recovery** | After a shutdown timeout, choose **Force Stop This VM and Quit…**; cancel once, then explicitly confirm | Cancel preserves the VM; confirmation stops only that instance, preserves disks, and continues graceful exit for other VMs. A replacement instance is rejected |
+| **Guest-initiated shutdown** | Shut down from inside the guest | A guest `SHUTDOWN` event followed by QEMU exit code 0 becomes `STOPPED`, releases resources, and retains persistent disks; panic or nonzero exit remains `FAILED` |
+
+Record QMP events, process exit code, elapsed time, and whether force was used. `POWERDOWN` only establishes that the power request was sent; it is not proof of a completed shutdown. A CLI stop that times out and then kills QEMU must not count as a graceful shutdown pass. Compare guest-agent shutdown and ACPI shutdown separately.
 
 ## 9. Offline Hardware Settings Verification
 

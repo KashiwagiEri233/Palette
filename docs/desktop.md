@@ -82,6 +82,7 @@ Persistent VM definitions are stored under `<runtime_root>/definitions/`. Writab
 The VM management list provides **Start / Shut Down**, **Restart**, **Pause**, **VM Settings**, and **Delete VM** directly in each row. Start changes to Shut Down while the VM is active; unavailable actions are disabled. Pause is shown but is not supported yet. **More** retains Force Stop and Restore Initial State. Deleting a VM still requires confirmation.
 
 * **Graceful Shutdown & Force Stop**: Normal shutdown sends an ACPI shutdown signal; if the guest does not power off within the timeout budget, Palette Desktop reports an error and leaves the VM running rather than silently killing it. **Force Stop** requires explicit confirmation.
+  The timeout message provides a **Force Stop…** action that opens this confirmation. Confirmation is tied to the original running instance: if another client has restarted the VM, Palette refuses to stop the replacement. A normal shutdown initiated inside the guest is recognized as **Stopped** once QEMU emits a guest shutdown event and exits successfully; a crash remains a failure.
 * **Restart**: Preserves all persistent disk changes and UEFI variables.
 * **Restore Initial State**: Discards all writable disk modifications and resets UEFI variables — image-backed VMs return to the clean read-only base image, and ISO-backed VMs return to a fresh blank disk.
 * **Delete VM**: Removes only managed files inside `.runtime/` that have no remaining dependents. Imported base images and external ISOs are **never** deleted.
@@ -93,7 +94,15 @@ Closing the Palette Desktop window always prompts **"Exit Palette?"** (even when
 * **Close Window Only**: Closes the Electron UI while leaving the background `daemon` and any running VMs active for MCP clients.
 * **Quit Completely**: Gracefully shuts down all running VMs owned by the connected backend, stops the backend owner, verifies process termination, and then closes the window (preserving VM definitions and persistent disks, and leaving other config roots untouched). If a guest shutdown or daemon stop fails, the window stays open with the error message so you can retry, cancel, or choose **Close Window Only**.
 
+If a VM operation is already in progress, **Quit Completely** asks you to wait instead of queuing another shutdown. You can still cancel or choose **Close Window Only**. After a shutdown failure, VM status refreshes even while the exit dialog is open; force stopping remains a separate confirmed action.
+
+When a guest times out during **Quit Completely**, **Force Stop This VM and Quit…** opens a separate confirmation naming the affected VM and warning about unsaved data. After confirmation, Palette stops that instance, continues graceful shutdown for the remaining VMs, and verifies backend termination. Cancelling the confirmation leaves the affected VM running. This recovery requires an updated backend advertising `vm-stop-identity`.
+
+ACPI shutdown depends on the guest's power-button handling. It is a different mechanism from an in-guest agent such as VMware Tools, and a guest that responds to one may not respond to the other. A timeout is not repaired by treating a blank display as shutdown or by claiming an automatic force stop was graceful.
+
 ## 3. Virtual Machine Hardware Settings
+
+On Windows, ISO, disk and firmware paths containing non-ASCII characters are loaded through a QEMU drive configuration encoded in the system code page. This avoids path corruption between command-line/JSON handling and Windows file APIs, while retaining read-only ISO access and explicit disk formats. Characters outside that code page produce a clear error before launch. This compatibility path does not establish support for arbitrary Unicode runtime directories or image backing chains.
 
 Open **VM Settings** directly from the VM management row, or from the VM's action menu or detail view, to configure hardware across six sections. **Settings are read-only while a VM is running**; stop the VM to edit and save changes for the next boot. Optimistic revision checks prevent concurrent sessions from overwriting each other, and leaving an unsaved form prompts you to save, discard, or keep editing.
 

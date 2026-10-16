@@ -543,16 +543,24 @@ class PaletteService:
         )
 
     async def stop(
-        self, vm_id: str, *, force: bool = False, actor: Actor = "operator"
+        self,
+        vm_id: str,
+        *,
+        force: bool = False,
+        actor: Actor = "operator",
+        expected_instance_id: str | None = None,
     ) -> LifecycleResult:
         if actor == "agent":
             self.control.require_agent(vm_id)
         else:
             await self.control.revoke(vm_id)
         instance = self.manager.get(vm_id)
+        self.manager._check_identity(instance, expected_instance_id)
         instance.policy.require_lifecycle("force_stop" if force else "stop", actor=actor)
         stopped = await self.manager.stop(
-            vm_id, force=force, expected_instance_id=instance.view.instance_id
+            vm_id,
+            force=force,
+            expected_instance_id=expected_instance_id or instance.view.instance_id,
         )
         return LifecycleResult(
             ok=True,

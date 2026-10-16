@@ -60,7 +60,7 @@ class RuntimeOwner:
             return {
                 "version": __version__,
                 "desktop_protocol": 1,
-                "features": ["vm-settings-v2", "disk-resize", "runtime-stop"],
+                "features": ["vm-settings-v2", "disk-resize", "runtime-stop", "vm-stop-identity"],
                 "owner_kind": self.kind,
                 "pid": os.getpid(),
                 "generation": self.operator.endpoint.generation,
@@ -112,7 +112,11 @@ class RuntimeOwner:
                 return await self.desktop.start(vm_id)
             return (await self.service.start(vm_id)).model_dump(mode="json")
         if method == "vms.stop":
-            return await self.desktop.stop(vm_id, force=payload.get("force", False))
+            return await self.desktop.stop(
+                vm_id,
+                force=payload.get("force", False),
+                expected_instance_id=payload.get("expected_instance_id"),
+            )
         if method == "vms.restart":
             return await self.desktop.restart(vm_id)
         if method == "vms.reset":
