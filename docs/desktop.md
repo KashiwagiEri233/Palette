@@ -25,15 +25,19 @@ The title bar and left icon rail share one background. VM navigation, chat, and 
 
 Each conversation permanently belongs to one VM; selecting it changes the displayed VM. Create, rename, pin, archive, delete, export, and search are supported. Drafts persist in local application data, isolated by configuration directory. Failed saves retain the current draft with a retry action. Search includes archived conversations.
 
-This delivery implements layout, conversation drafts, and human control. **Built-in Agent execution, credential entry, automatic approvals, and step replay are not connected yet.** Home's save action creates a draft conversation; chat send remains disabled. No simulated replies or model screenshot uploads occur. External MCP agents continue using the existing tool surface.
+The built-in pi coding-agent SDK runs in Electron main. Configure a provider/model and API Key under Settings → Agent, or select a custom OpenAI Chat Completions, Responses, or Anthropic Messages endpoint. A vision-capable model can observe and operate the conversation's VM; text-only models support chat. Starting a visual task sends its screenshots to the selected model service. Without configuration, Home continues saving task drafts.
+
+The chat supports streaming Markdown replies, including headings, lists, code blocks, quotes and tables, as well as Stop and manual/automatic context compaction. The conversation no longer shows a branch navigation button. Web links open in the system browser after validation; raw HTML and automatic remote image loading are disabled. Switching pages keeps tasks running. Human takeover stops the VM's built-in task before acquiring control. Only one Agent run may drive a VM at a time; other clients can still observe. Closing the app stops its Agent tasks while the background option keeps the daemon and VMs running. Interrupted tasks never resume automatically.
+
+API Keys are encrypted through the operating system's secure storage; when that facility is unavailable they are kept only in memory. Conversations use pi JSONL files in the configuration-scoped application data directory. The default tool-call limit is 100, configurable from 1 to 1000. Guest shell execution and file read/write/edit remain **unavailable adapter placeholders**; automatic approvals, step replay, OAuth and third-party extension installation are not implemented.
 
 Minimum window size is1100×700. Below1280px navigation becomes a VM icon strip; below1100 effective CSS pixels the workspace is a drawer. Drag separators or double-click to reset. Layout and light/dark/system preferences persist locally. Ctrl+N creates a conversation, Ctrl+K opens commands, Ctrl+B toggles navigation, and Ctrl+J toggles workspace; macOS uses Cmd equivalents. Ctrl+Alt releases human control, with Ctrl+Alt+G retained; the UI action is “结束控制”.
 
-See the [GUI and built-in Agent specification](desktop-agent-design.md) for subsequent targets; its proposed Agent capabilities are not shipped functionality.
+See the [GUI and built-in Agent specification](desktop-agent-design.md) for the broader target; its approval and replay interfaces remain design proposals.
 
 To run Palette Desktop from source, install:
 
-* **Node.js**: `22.12` or newer
+* **Node.js**: `22.19` or newer
 * **Python & Package Manager**: Python `3.12` or `3.13` and [uv](https://docs.astral.sh/uv/)
 * **QEMU**: `qemu-system-x86_64` or `qemu-system-aarch64` plus `qemu-img` matching your guest architecture
 
@@ -44,6 +48,8 @@ uv sync --locked
 npm --prefix desktop ci
 npm --prefix desktop run dev
 ```
+
+Development and production builds first compile the seven vendored pi packages from pinned sources and a checksummed model catalog. Normal builds do not read `ref/` or fetch a current model catalog. The renderer does not import the SDK. Model requests run in main; VM tools use the separately authenticated Agent IPC endpoint returned by backend `hello`, over Unix sockets or Windows named pipes. The backend must advertise `driver-claim-v1`; restart an older daemon before using visual tasks.
 
 To type-check, build for production, and preview locally:
 

@@ -20,6 +20,20 @@ vm_observe ──▶ 视觉分析与坐标决策 ──▶ vm_act(frame_id, requ
 
 ## 2. MCP 工具详解
 
+### `vm_list` —— 发现虚拟机
+
+选择虚拟机前调用 `vm_list({})`。返回 `ok`、`error` 和 `vms` 数组，覆盖所连接配置根下的
+Desktop 持久化定义（包括停机 VM）和运行时已知实例。没有虚拟机时返回 `vms: []`。
+
+每项包含 `vm_id`、`name`、`persistent`、`state`、`guest_arch`、`instance_id`、
+`screen_ready`、`control_owner`、`control_state` 和 `agent_driver_claimed`。
+名称属于不可信用户数据；结果不包含宿主路径、磁盘、Profile 配置或控制令牌。
+使用返回的 `vm_id` 调用 `vm_status` 和 `vm_observe`。
+
+列表查询不会启动 VM、截图或领取控制权。控制状态只是快照：人工控制租约或 Agent 驱动声明
+可能阻止后续写操作，所有动作仍受 Profile 策略和控制权检查约束。`screen_ready` 不代表
+桌面已经就绪。Desktop 内置 pi 仍绑定当前对话的 VM；此发现工具通过 MCP 暴露。
+
 ### 2.1 `vm_status` —— 查询状态与就绪层级
 
 报告虚拟机的生命周期状态、QMP 管理通道是否在线、屏幕是否有有效内容、当前控制权归属、Profile 授予的能力列表，以及服务端账本记录的当前按住的按键与鼠标按钮。

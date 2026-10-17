@@ -13,6 +13,7 @@ from .models import (
     Receipt,
     ReleaseResult,
     StatusResult,
+    VmListResult,
     WaitResult,
 )
 
@@ -21,6 +22,8 @@ Actor = Literal["agent", "operator"]
 
 class AgentService(Protocol):
     config: PaletteConfig
+
+    async def list_vms(self) -> VmListResult: ...
 
     async def status(self, vm_id: str, *, actor: Actor = "agent") -> StatusResult: ...
 

@@ -20,6 +20,7 @@ from palette.errors import ErrorCode, PaletteError
 from palette.operator import OperatorClient
 from palette.operator.protocol import DesktopCommand
 from palette.runtime import RuntimeOwner
+from palette.server import build_server
 from palette.service import PaletteService
 
 
@@ -432,3 +433,59 @@ async def test_daemon_shares_ipc_and_binary_agent_image(service: PaletteService)
         assert denied.value.code == ErrorCode.INVALID_ARGUMENT
     finally:
         await owner.close()
+
+
+async def test_mcp_discovers_persistent_and_runtime_vms_over_agent_ipc(
+    service: PaletteService,
+) -> None:
+    owner = RuntimeOwner(service, kind="daemon")
+    await owner.start()
+    try:
+        definition = await owner.desktop.create(draft(service))
+        vm_id = definition["vm_id"]
+        remote = RemoteService(service.config, owner.agent.endpoint)
+        server = build_server(remote)
+        result = await server._tool_manager.call_tool("vm_list", {}, None, convert_result=True)
+        assert not result.is_error
+        assert len(result.structured_content["vms"]) == 1
+        stopped = result.structured_content["vms"][0]
+        assert stopped == {
+            "vm_id": vm_id,
+            "name": "Workstation",
+            "persistent": True,
+            "state": "STOPPED",
+            "guest_arch": definition["profile"]["qemu"]["arch"],
+            "instance_id": None,
+            "screen_ready": False,
+            "control_owner": "agent",
+            "control_state": "available",
+            "agent_driver_claimed": False,
+        }
+        assert service.manager.known() == []
+        await owner.desktop.start(vm_id)
+        await remote.start("desktop")
+        listing = await remote.list_vms()
+        assert [vm.vm_id for vm in listing.vms] == sorted([vm_id, "desktop"])
+        assert all(vm.state == "RUNNING" for vm in listing.vms)
+        assert str(service.config.runtime_root) not in listing.model_dump_json()
+        assert str(service.config.profile("default").images.base) not in listing.model_dump_json()
+        with pytest.raises(PaletteError) as denied:
+            await remote._call("list_vms", None, {"actor": "operator"})
+        assert denied.value.code == ErrorCode.INVALID_ARGUMENT
+        with pytest.raises(PaletteError) as denied:
+            await remote._call("list_vms", vm_id, {})
+        assert denied.value.code == ErrorCode.INVALID_ARGUMENT
+    finally:
+        await owner.close()
+
+    restored = RuntimeOwner(PaletteService(service.config), kind="daemon")
+    await restored.start()
+    try:
+        listing = await RemoteService(service.config, restored.agent.endpoint).list_vms()
+        record = next(vm for vm in listing.vms if vm.vm_id == vm_id)
+        assert record.persistent
+        assert record.state == "STOPPED"
+        assert record.name == "Workstation"
+        assert restored.service.manager.known() == []
+    finally:
+        await restored.close()

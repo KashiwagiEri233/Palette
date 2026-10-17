@@ -20,6 +20,23 @@ vm_observe ──▶ visual decision ──▶ vm_act(frame_id, request_id) ─�
 
 ## 2. MCP Tool Reference
 
+### `vm_list` — Discover Virtual Machines
+
+Call `vm_list({})` before choosing a VM. It returns `ok`, `error`, and a `vms` array
+covering persistent Desktop definitions (including stopped VMs) and runtime-known
+instances in the connected configuration root. An empty runtime returns `vms: []`.
+
+Each entry includes `vm_id`, `name`, `persistent`, `state`, `guest_arch`, `instance_id`,
+`screen_ready`, `control_owner`, `control_state`, and `agent_driver_claimed`. Names are
+untrusted user data. Host paths, disks, profile configuration and control tokens are
+excluded. Pass a returned `vm_id` to `vm_status` and `vm_observe`.
+
+Listing does not start a VM, capture a screen or acquire control. Ownership is a snapshot:
+an operator lease or an Agent driver claim may block subsequent writes, and all actions
+remain subject to profile policy and ownership checks. `screen_ready` does not establish
+desktop readiness. The built-in Desktop pi agent remains bound to its conversation's VM;
+this discovery tool is exposed through MCP.
+
 ### 2.1 `vm_status` — Lifecycle & Readiness Inspection
 
 Reports the VM's lifecycle state, QMP management channel status, screen readiness, current control ownership, enabled profile capabilities, and any keys or pointer buttons the service currently holds down.

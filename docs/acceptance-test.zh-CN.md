@@ -16,7 +16,7 @@ npm --prefix desktop ci
 npm --prefix desktop run build
 ```
 
-* **前置组件**：Python `3.12`/`3.13`、`uv`、Node.js `22.12+`、匹配客户机架构的 QEMU 可执行文件与 UEFI 固件，以及可启动的桌面基础镜像（`qcow2`/`raw`）或系统安装 ISO。
+* **前置组件**：Python `3.12`/`3.13`、`uv`、Node.js `22.19+`、匹配客户机架构的 QEMU 可执行文件与 UEFI 固件，以及可启动的桌面基础镜像（`qcow2`/`raw`）或系统安装 ISO。
 * **目录与标识约定**：下文中 `CONFIG_ROOT` 表示包含 `palette.toml` 和 `profiles/` 的配置根目录；`VM_ID` 必须从 GUI 的“状态”页复制真实虚拟机 ID（如 `vm_489cdb67aca0`），不能用显示名称代替。
 * **证据存放**：所有测试报告与截图均保存在 `.runtime/acceptance/` 下，切勿向 Git 提交磁盘镜像、截图或连接凭据。
 
@@ -79,7 +79,8 @@ npm --prefix desktop run preview
 
 **通过标准**：
 
-* MCP 会话初始化成功，工具列表包含 `vm_status`、`vm_observe`、`vm_act`、`vm_wait`、`vm_release_inputs`。
+* MCP 会话初始化成功，工具列表包含 `vm_list`、`vm_status`、`vm_observe`、`vm_act`、`vm_wait`、`vm_release_inputs`。
+* `vm_list({})` 可发现持久化及运行时已知 VM ID（包括停机定义），不启动 VM、不领取控制权，也不返回宿主配置。
 * 调用 `vm_status({"vm_id": "VM_ID"})` 返回 `ok = true`、`state = "RUNNING"`，且 `instance_id` 与 GUI 状态页完全一致。
 * 调用 `vm_observe({"vm_id": "VM_ID"})`，确认模型实际收到了 PNG 图像（仅列出工具或仅看到 JSON 文本不算通过）。
 

@@ -77,7 +77,13 @@ class RuntimeOwner:
             return {
                 "version": __version__,
                 "desktop_protocol": 1,
-                "features": ["vm-settings-v2", "disk-resize", "runtime-stop", "vm-stop-identity"],
+                "features": [
+                    "vm-settings-v2",
+                    "disk-resize",
+                    "runtime-stop",
+                    "vm-stop-identity",
+                    "driver-claim-v1",
+                ],
                 "owner_kind": self.kind,
                 "pid": os.getpid(),
                 "generation": self.operator.endpoint.generation,

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, protocol, net, Menu } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, protocol, net, Menu, safeStorage, shell } from 'electron'
 import { spawn } from 'node:child_process'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path'
@@ -8,6 +8,9 @@ import { RuntimeShutdown, VmShutdownTimeout } from './shutdown'
 import type { DesktopMethod, OwnerInfo } from '../shared/types'
 import { workspaceMethods } from '../shared/workspace'
 import { ConversationRepository } from './conversations'
+import { agentMethods } from '../shared/agent'
+import { PiAgentService } from './pi-agent'
+import { externalLink } from '../shared/external-link'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const backendRoot = resolve(here, '../../..')
@@ -20,6 +23,24 @@ let connectionsInFlight = 0
 const shutdown = new RuntimeShutdown()
 const leases = new Map<string, string>()
 const repositories = new Map<string, ConversationRepository>()
+const agentServices = new Map<string, PiAgentService>()
+function agent(): PiAgentService {
+  const root = resolve(configRoot)
+  let service = agentServices.get(root)
+  if (!service) {
+    const repository = conversations()
+    service = new PiAgentService(app.getPath('userData'), root, () => runtimeRoot, {
+      available: () => safeStorage.isEncryptionAvailable() && (process.platform !== 'linux' || safeStorage.getSelectedStorageBackend() !== 'basic_text'),
+      encrypt: value => safeStorage.encryptString(value), decrypt: value => safeStorage.decryptString(value)
+    }, () => repository.list(), event => { if (!window.isDestroyed()) window.webContents.send('agent-event', event) })
+    agentServices.set(root, service)
+  }
+  return service
+}
+async function stopAgents(): Promise<void> {
+  for (const service of agentServices.values()) await service.close()
+  agentServices.clear()
+}
 function conversations(): ConversationRepository {
   const root = resolve(configRoot)
   let repository = repositories.get(root)
@@ -91,6 +112,7 @@ app.whenReady().then(async () => {
     width: 1440, height: 900, minWidth: 1100, minHeight: 700,
     title: 'Palette', backgroundColor: '#f7f6f5',
     titleBarStyle: process.platform === 'win32' ? 'hidden' : process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    ...(process.platform === 'darwin' ? { trafficLightPosition: { x: 12, y: 17 } } : {}),
     ...(process.platform === 'win32' ? { titleBarOverlay: { color: '#ffffff', symbolColor: '#252525', height: 48 } } : {}),
     webPreferences: { preload: join(here, '../preload/index.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true }
   })
@@ -124,11 +146,29 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('request', async (event, method: DesktopMethod, vmId?: string, payload: Record<string, unknown> = {}) => {
     trusted(event)
-    if ((!methods.has(method) && !workspaceMethods.has(method)) || (vmId !== undefined && !/^[A-Za-z0-9_.-]{1,128}$/.test(vmId)) || typeof payload !== 'object' || payload === null || Array.isArray(payload) || Buffer.byteLength(JSON.stringify(payload)) > 64 * 1024) throw new Error('请求无效')
+    if ((!methods.has(method) && !workspaceMethods.has(method) && !agentMethods.has(method)) || (vmId !== undefined && !/^[A-Za-z0-9_.-]{1,128}$/.test(vmId)) || typeof payload !== 'object' || payload === null || Array.isArray(payload) || Buffer.byteLength(JSON.stringify(payload)) > 64 * 1024) throw new Error('请求无效')
     if (handlingClose) throw new Error('正在退出，请稍候')
     const operation = String(method)
+    if (agentMethods.has(operation)) {
+      const service = agent()
+      if (operation === 'agent.settings.get') return service.settings()
+      if (operation === 'agent.settings.update') return service.updateSettings(payload.configuration)
+      if (operation === 'agent.credentials.set' || operation === 'agent.credentials.remove') return service.configureCredential(payload.providerId as string, operation.endsWith('.set') ? payload.key as string : null)
+      if (!vmId || typeof payload.conversationId !== 'string') throw new Error('会话参数无效')
+      if (operation === 'agent.snapshot') return service.snapshot(vmId, payload.conversationId)
+      if (operation === 'agent.start') return service.start(vmId, payload.conversationId, payload.text as string, payload.requestId as string)
+      if (operation === 'agent.stop') return service.stop(vmId, payload.conversationId)
+      if (operation === 'agent.compact') return service.compact(vmId, payload.conversationId)
+      if (operation === 'agent.tree.navigate') return service.navigate(vmId, payload.conversationId, payload.entryId as string)
+      throw new Error('不支持的 Agent 操作')
+    }
     if (operation === 'window.command') {
       if (payload.action === 'close') window.close()
+      else if (payload.action === 'open_external') {
+        const url = externalLink(payload.url)
+        if (!url) throw new Error('链接地址无效')
+        await shell.openExternal(url)
+      }
       else if (payload.action === 'menu') Menu.buildFromTemplate([
         { label: '文件', submenu: [{ label: '关闭窗口', click: () => window.close() }] },
         { label: '编辑', submenu: [{ role: 'undo', label: '撤销' }, { role: 'redo', label: '重做' }, { type: 'separator' }, { role: 'cut', label: '剪切' }, { role: 'copy', label: '复制' }, { role: 'paste', label: '粘贴' }, { role: 'selectAll', label: '全选' }] },
@@ -145,19 +185,31 @@ app.whenReady().then(async () => {
       const listed = await call(runtimeRoot, 'vms.list') as { vms: { vm_id: string }[] }
       if (!listed.vms.some(vm => vm.vm_id === vmId)) throw new Error('虚拟机不存在')
       if (operation === 'conversations.create') return repository.create(vmId, payload.requestId, payload.draft)
-      if (operation === 'conversations.update') return repository.update(vmId, payload.id, payload.revision, payload.patch)
-      if (operation === 'conversations.delete') { await repository.remove(vmId, payload.id, payload.revision); return { deleted: true } }
+      if (operation === 'conversations.update') {
+        if ((payload.patch as { archived?: boolean } | undefined)?.archived) await agentServices.get(resolve(configRoot))?.stopVm(vmId)
+        return repository.update(vmId, payload.id, payload.revision, payload.patch)
+      }
+      if (operation === 'conversations.delete') {
+        const service = agent()
+        await service.snapshot(vmId, payload.id as string)
+        await service.stop(vmId, payload.id as string)
+        await repository.remove(vmId, payload.id, payload.revision)
+        await service.remove(vmId, payload.id as string)
+        return { deleted: true }
+      }
       if (operation === 'conversations.export') {
         const item = (await repository.list()).find(item => item.id === payload.id && item.vm_id === vmId)
         if (!item) throw new Error('对话不存在')
         const destination = await dialog.showSaveDialog(window, { defaultPath: `${item.title.replace(/[\\/:*?"<>|]/g, '_')}.md`, filters: [{ name: 'Markdown', extensions: ['md'] }] })
         if (destination.canceled || !destination.filePath) return { saved: false }
-        await writeFile(destination.filePath, `# ${item.title}\n\n${item.draft}\n`, { mode: 0o600 })
+        const history = await agent().exportMarkdown(vmId, item.id)
+        await writeFile(destination.filePath, `${history}${item.draft ? `\n## 草稿\n\n${item.draft}\n` : ''}`, { mode: 0o600 })
         return { saved: true }
       }
       throw new Error('不支持的会话操作')
     }
     const repository = conversations()
+    if (vmId && ['control.acquire', 'vms.stop', 'vms.restart', 'vms.reset', 'vms.delete'].includes(operation)) await agentServices.get(resolve(configRoot))?.stopVm(vmId)
     let expectedGeneration: string | undefined
     if (method === 'vms.stop' && payload.expected_instance_id !== undefined) {
       const owner = await call(runtimeRoot, 'hello')
@@ -174,7 +226,7 @@ app.whenReady().then(async () => {
         } finally { throw new Error('窗口已失去焦点，请重新接管') }
       }
     }
-    if (method === 'vms.delete' && vmId) await repository.removeVm(vmId)
+    if (method === 'vms.delete' && vmId) { await agent().removeVm(vmId); await repository.removeVm(vmId) }
     if (method === 'control.release' && vmId) {
       if (result.release_confirmed !== true) throw new Error('输入释放尚未确认，已暂停写入；请检查虚拟机连接')
       leases.delete(vmId)
@@ -194,6 +246,7 @@ app.whenReady().then(async () => {
     if (result.canceled) return null
     if (handlingClose) throw new Error('正在退出，请稍候')
     await releaseAll()
+    await stopAgents()
     const previous = configRoot
     const previousRuntime = runtimeRoot
     try {
@@ -213,6 +266,7 @@ app.whenReady().then(async () => {
     const closingRuntime = runtimeRoot
     handlingClose = true
     try {
+      await stopAgents()
       await releaseAll()
       if (choice === 'shutdown') await shutdown.stop(closingRuntime)
       allowedClose = true

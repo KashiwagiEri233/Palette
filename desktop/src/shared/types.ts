@@ -1,4 +1,5 @@
 import type { WorkspaceMethod, WorkspaceRoutes } from './workspace'
+import type { AgentMethod, AgentRoutes, AgentEvent } from './agent'
 
 export type InputEvent =
   | { type: 'move'; x: number; y: number }
@@ -25,6 +26,8 @@ export interface DesktopApi {
   connect(): Promise<OwnerInfo>
   request(method: DesktopMethod, vmId?: string, payload?: Record<string, unknown>): Promise<unknown>
   request<K extends WorkspaceMethod>(method: K, vmId: string | undefined, payload: WorkspaceRoutes[K]['payload']): Promise<WorkspaceRoutes[K]['result']>
+  request<K extends AgentMethod>(method: K, vmId: string | undefined, payload: AgentRoutes[K]['payload']): Promise<AgentRoutes[K]['result']>
+  onAgentEvent(callback: (event: AgentEvent) => void): () => void
   chooseFile(source: 'image' | 'iso'): Promise<string | null>
   chooseRoot(): Promise<OwnerInfo | null>
   onClose(callback: () => void): () => void

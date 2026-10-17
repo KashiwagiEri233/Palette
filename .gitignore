@@ -49,3 +49,7 @@ desktop/node_modules/
 desktop/out/
 desktop/.cache/
 desktop/test-results/
+desktop/vendor/pi/node_modules/
+desktop/vendor/pi/packages/*/node_modules/
+desktop/vendor/pi/packages/*/dist/
+desktop/vendor/pi/packages/ai/src/providers/data/

@@ -357,6 +357,7 @@ async def test_real_serve_owns_cli_vms_until_exit(
         tools = json.loads(await asyncio.wait_for(process.stdout.readline(), 5))
         assert tools["id"] == 2
         names = {tool["name"] for tool in tools["result"]["tools"]}
+        assert "vm_list" in names
         assert "vm_status" in names
         assert "runtime.stop" not in names
         code, output, error = await cli(tmp_path, "start", "--profile", "default")

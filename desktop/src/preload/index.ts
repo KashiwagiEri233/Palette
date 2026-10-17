@@ -1,12 +1,14 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { DesktopApi, DesktopMethod } from '../shared/types'
 import type { WorkspaceMethod } from '../shared/workspace'
+import type { AgentMethod, AgentEvent } from '../shared/agent'
 
 const api: DesktopApi = {
   platform: process.platform,
   setWindowBackdrop: (opacity, background) => ipcRenderer.invoke('window-backdrop', opacity, background),
   connect: () => ipcRenderer.invoke('connect'),
-  request: (method: DesktopMethod | WorkspaceMethod, vmId?: string, payload?: Record<string, unknown>) => ipcRenderer.invoke('request', method, vmId, payload),
+  request: (method: DesktopMethod | WorkspaceMethod | AgentMethod, vmId?: string, payload?: Record<string, unknown>) => ipcRenderer.invoke('request', method, vmId, payload),
+  onAgentEvent: callback => { const listener = (_event: Electron.IpcRendererEvent, event: AgentEvent): void => callback(event); ipcRenderer.on('agent-event', listener); return () => ipcRenderer.removeListener('agent-event', listener) },
   chooseFile: source => ipcRenderer.invoke('choose-file', source),
   chooseRoot: () => ipcRenderer.invoke('choose-root'),
   onClose: callback => { const listener = (): void => callback(); ipcRenderer.on('close-request', listener); return () => ipcRenderer.removeListener('close-request', listener) },

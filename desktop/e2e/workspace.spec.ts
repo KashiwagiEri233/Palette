@@ -156,6 +156,7 @@ test('workspace navigation, persisted drafts, responsive panels, settings and co
     await vmHeading.hover()
     await expect(page.getByRole('button', { name: '在 工作区测试 下新建对话' })).toBeVisible()
     const verifyVmHeading = async () => {
+      await expect.poll(() => vmHeading.evaluate(element => getComputedStyle(element).backgroundColor)).not.toBe('rgba(0, 0, 0, 0)')
       const geometry = await vmHeading.evaluate(element => {
         const trigger = element.querySelector('.vm-group-toggle')!
         const actions = element.querySelector('.vm-group-quick')!
@@ -272,9 +273,11 @@ test('workspace navigation, persisted drafts, responsive panels, settings and co
     await page.getByRole('button', { name: '设置', exact: true }).click()
     await expect(page.locator('.settings-navigation')).toBeVisible()
     await page.getByRole('button', { name: 'Agent', exact: true }).click()
-    await expect(page.getByRole('combobox', { name: '模型提供方', exact: true })).toBeDisabled()
-    await expect(page.getByRole('combobox', { name: '模型提供方', exact: true })).toHaveText('未配置')
-    await expect(page.getByRole('combobox', { name: '模型', exact: true })).toBeDisabled()
+    await expect(page.getByRole('combobox', { name: '模型提供方', exact: true })).toBeEnabled()
+    await expect(page.getByRole('combobox', { name: '模型提供方', exact: true })).toHaveText('openai')
+    await expect(page.getByRole('combobox', { name: '模型', exact: true })).toBeEnabled()
+    await expect(page.getByRole('combobox', { name: '模型', exact: true })).toHaveText('选择模型')
+    await expect(page.getByText('未配置', { exact: true })).toBeVisible()
     await expect(page.getByRole('combobox', { name: '默认推理强度', exact: true })).toBeDisabled()
     await page.getByRole('button', { name: '外观', exact: true }).click()
     await page.getByRole('button', { name: '深色', exact: true }).click()

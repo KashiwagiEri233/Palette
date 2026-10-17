@@ -21,6 +21,7 @@ from .models import (
     Receipt,
     ReleaseResult,
     StatusResult,
+    VmListResult,
     WaitResult,
 )
 from .operator.client import OperatorClient
@@ -45,6 +46,7 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
 class AgentCommand(StrictModel):
     method: Literal[
+        "list_vms",
         "status",
         "observe_image",
         "act",
@@ -55,6 +57,9 @@ class AgentCommand(StrictModel):
         "start",
         "stop",
         "reset",
+        "driver_acquire",
+        "driver_heartbeat",
+        "driver_release",
     ]
     parameters: dict[str, Any]
 
@@ -65,6 +70,7 @@ class AgentRequest(StrictModel):
     token: str
     request_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     command: AgentCommand
+    claim_token: str | None = Field(default=None, pattern=r"^[a-f0-9]{48}$")
 
 
 class AgentResponse(Response):
@@ -103,7 +109,7 @@ class AgentServer:
             try:
                 response, image = await self.requests.execute(
                     request.request_id,
-                    request.command.model_dump_json(),
+                    request.command.model_dump_json() + (request.claim_token or ""),
                     lambda: self._execute_agent(request),
                 )
             except PaletteError as exc:
@@ -130,16 +136,36 @@ class AgentServer:
             await channel.close()
 
     async def _execute_agent(self, request: AgentRequest) -> tuple[AgentResponse, bytes]:
+        with self.service.driver.bind(request.claim_token):
+            return await self._execute_bound(request)
+
+    async def _execute_bound(self, request: AgentRequest) -> tuple[AgentResponse, bytes]:
         image = b""
         try:
             parameters = dict(request.command.parameters)
-            if "actor" in parameters or "vm_id" not in parameters:
-                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "invalid Agent parameters")
-            vm_id = parameters.pop("vm_id")
             method = request.command.method
+            if (
+                "actor" in parameters
+                or (method == "list_vms" and parameters)
+                or (method != "list_vms" and "vm_id" not in parameters)
+            ):
+                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "invalid Agent parameters")
+            vm_id = parameters.pop("vm_id", "")
             result: Any
             async with asyncio.timeout(self.endpoint.operation_timeout_seconds):
-                if method == "status":
+                if method == "list_vms":
+                    result = await self.service.list_vms()
+                elif method == "driver_acquire":
+                    result = await self.service.driver.acquire(vm_id, **parameters)
+                elif method == "driver_heartbeat":
+                    if parameters:
+                        raise ValueError("unexpected driver parameters")
+                    result = self.service.driver.heartbeat(vm_id)
+                elif method == "driver_release":
+                    if parameters:
+                        raise ValueError("unexpected driver parameters")
+                    result = await self.service.driver.release(vm_id)
+                elif method == "status":
                     result = await self.service.status(vm_id, **parameters)
                 elif method == "observe_image":
                     result, image = await self.service.observe_image(vm_id, **parameters)
@@ -171,7 +197,7 @@ class AgentServer:
                 generation=self.endpoint.generation,
                 request_id=request.request_id,
                 ok=True,
-                result=result.model_dump(mode="json"),
+                result=result if isinstance(result, dict) else result.model_dump(mode="json"),
                 image_bytes=len(image),
             ), image
         except (PaletteError, TypeError, ValueError) as exc:
@@ -222,7 +248,7 @@ class RemoteService:
         self.default_profile = default_profile
 
     async def _call(
-        self, method: str, vm_id: str, parameters: dict[str, Any]
+        self, method: str, vm_id: str | None, parameters: dict[str, Any]
     ) -> tuple[dict[str, Any], bytes | None]:
         endpoint = self.endpoint
         if IS_WINDOWS:
@@ -234,7 +260,10 @@ class RemoteService:
             reader, writer = await open_unix(endpoint.address)
             channel = UnixChannel(reader, writer)
         command = AgentCommand.model_validate(
-            {"method": method, "parameters": {"vm_id": vm_id, **parameters}}
+            {
+                "method": method,
+                "parameters": {**({"vm_id": vm_id} if vm_id is not None else {}), **parameters},
+            }
         )
         request = AgentRequest(
             generation=endpoint.generation,
@@ -275,6 +304,10 @@ class RemoteService:
             ) from exc
         finally:
             await channel.close()
+
+    async def list_vms(self) -> VmListResult:
+        data, _ = await self._call("list_vms", None, {})
+        return VmListResult.model_validate(data)
 
     async def status(self, vm_id: str, *, actor: Any = "agent") -> StatusResult:
         data, _ = await self._call("status", vm_id, {})

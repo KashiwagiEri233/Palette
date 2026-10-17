@@ -2,7 +2,7 @@
 
 **English** | [简体中文](desktop-agent-design.zh-CN.md)
 
-Design baseline 1.0, 2026-10-15. Audience: product, design, React/Electron, Python backend, and QA engineers. This is an implementation specification; the proposed Agent, approval system, and interfaces are not existing functionality. All product copy remains Simplified Chinese. The shared, type-checkable API draft is [desktop-agent-contract.ts](desktop-agent-contract.ts).
+Design baseline 1.0, 2026-10-15. Audience: product, design, React/Electron, Python backend, and QA engineers. This is the broader target specification. The built-in pi SDK now implements chat, model credentials, VM visual tools, context compaction and conversation branching; see the [Desktop guide](desktop.md) for the delivered boundary. Approval, replay and the full interface below remain proposals. All product copy remains Simplified Chinese. The shared, type-checkable API draft is [desktop-agent-contract.ts](desktop-agent-contract.ts).
 
 ## 0. Architecture and verified implementation boundaries
 

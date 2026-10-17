@@ -7,6 +7,7 @@ import contextlib
 import logging
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine
+from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -36,6 +37,7 @@ class Job:
     abort_reason: PaletteError | None = None
     abort_result: Callable[[PaletteError], Any] | None = None
     completed: Callable[[Any], None] | None = None
+    context: Context = field(default_factory=copy_context)
 
 
 class ActionScheduler:
@@ -183,7 +185,9 @@ class ActionScheduler:
                 guard_passed = True
                 return await current.runner()
 
-            task = asyncio.create_task(guarded_runner(), name=f"job-{job.label}")
+            task = asyncio.create_task(
+                guarded_runner(), name=f"job-{job.label}", context=job.context
+            )
             job.task = task
             timer = asyncio.get_running_loop().call_later(
                 self.profile.resources.max_action_seconds,

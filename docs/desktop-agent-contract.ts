@@ -1,4 +1,6 @@
-/** Design contract only. Not wired into the application. Both design documents share this draft. */
+/** Full target contract, including unimplemented approval/replay routes.
+ * The delivered pi integration uses desktop/src/shared/agent.ts; both design documents share this draft.
+ */
 export type Id = string
 export type IsoTime = string
 export type VmState = 'STOPPED' | 'STARTING' | 'RUNNING' | 'STOPPING' | 'PAUSED' | 'FAILED'

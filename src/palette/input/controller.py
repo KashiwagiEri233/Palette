@@ -461,9 +461,15 @@ class ActionController:
             payload["error_code"] = str(code)
         self._audit.record("guest.operation", **payload)
 
-    async def release_inputs(self) -> ReleaseResult:
+    async def release_inputs(self, *, guarded: bool = False) -> ReleaseResult:
         """Release every key and button the service believes it holds."""
-        job = self.scheduler.make_job(JobKind.RELEASE, "release", self._release_all)
+
+        async def release() -> ReleaseResult:
+            if guarded:
+                self._check_mutation()
+            return await self._release_all()
+
+        job = self.scheduler.make_job(JobKind.RELEASE, "release", release)
         with contextlib.suppress(PaletteError):
             return cast(
                 ReleaseResult,

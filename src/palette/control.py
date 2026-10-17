@@ -93,6 +93,7 @@ class ControlManager:
     def require_agent(self, vm_id: str) -> None:
         if vm_id in self.leases:
             raise PaletteError(ErrorCode.BUSY, "this VM is under operator control")
+        self.service.driver.require(vm_id)
 
     def validate(self, vm_id: str, token: str) -> Lease:
         lease = self.leases.get(vm_id)
@@ -115,6 +116,10 @@ class ControlManager:
             self.service.manager.operations.require_accepting()
             instance = await self.service.manager.require_running(vm_id)
             self.service.require_instance_id(instance, instance_id)
+            if not await self.service.driver.revoke(vm_id):
+                raise PaletteError(
+                    ErrorCode.QMP_UNAVAILABLE, "Agent input release was not confirmed"
+                )
             if vm_id in self.leases:
                 raise PaletteError(ErrorCode.BUSY, "another operator holds this VM")
             lease = Lease(
@@ -176,6 +181,12 @@ class ControlManager:
         expected_instance_id: str | None = None,
     ) -> bool:
         async with self.service.manager.operations.hold(vm_id), self._operations.hold(vm_id):
+            if (
+                expected_lease is None
+                and expected_instance_id is None
+                and not await self.service.driver.revoke(vm_id)
+            ):
+                return False
             lease = self.leases.get(vm_id)
             if (expected_lease is not None and lease is not expected_lease) or (
                 expected_instance_id is not None

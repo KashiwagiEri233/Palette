@@ -55,7 +55,10 @@ def markdown_files(root: pathlib.Path) -> list[pathlib.Path]:
     """
     tracked = _git_tracked_markdown(root)
     if tracked is not None:
-        return [root / relative for relative in tracked]
+        # Vendored upstream documentation retains its original language and links.
+        return [
+            root / relative for relative in tracked if not relative.startswith("desktop/vendor/")
+        ]
     return sorted(
         path for path in root.rglob("*.md") if not any(part in SKIP_DIRS for part in path.parts)
     )

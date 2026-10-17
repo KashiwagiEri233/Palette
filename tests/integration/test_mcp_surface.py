@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import asdict
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from palette.config import GuestToolsConfig, PaletteConfig
+from palette.errors import ErrorCode, PaletteError
 from palette.models import ACTION_TYPES
 from palette.server import build_server
 from palette.service import PaletteService
@@ -36,6 +38,7 @@ def server(service: PaletteService):
 class TestRegistration:
     def test_the_visual_and_lifecycle_tools_are_registered(self, server) -> None:
         assert tool_names(server) == {
+            "vm_list",
             "vm_status",
             "vm_observe",
             "vm_act",
@@ -94,6 +97,8 @@ class TestRegistration:
         tools = {tool.name: tool for tool in server._tool_manager.list_tools()}
         assert tools["vm_observe"].annotations.read_only_hint is True
         assert tools["vm_status"].annotations.read_only_hint is True
+        assert tools["vm_list"].annotations.read_only_hint is True
+        assert not tools["vm_list"].parameters.get("required")
         assert tools["vm_act"].annotations.read_only_hint is False
         assert tools["vm_reset"].annotations.destructive_hint is True
 
@@ -108,9 +113,53 @@ class TestRegistration:
         assert "vm_observe" in text
         assert "ASCII" in text
         assert "STALE_FRAME" in text
+        assert "vm_list" in text
 
 
 class TestObservationTools:
+    async def test_list_returns_an_empty_success_without_known_vms(self, server) -> None:
+        result = await call(server, "vm_list")
+        assert result.is_error is False
+        assert result.structured_content == {"ok": True, "error": None, "vms": []}
+
+    async def test_list_reports_structured_service_errors(
+        self, server, service: PaletteService, monkeypatch
+    ) -> None:
+        async def unavailable():
+            raise PaletteError(ErrorCode.STATE_CONFLICT, "runtime is unavailable")
+
+        monkeypatch.setattr(service, "list_vms", unavailable)
+        result = await call(server, "vm_list")
+        assert result.is_error
+        assert result.structured_content["ok"] is False
+        assert result.structured_content["error"]["code"] == "STATE_CONFLICT"
+        assert result.structured_content["vms"] == []
+
+    async def test_list_observes_control_ownership_without_changing_it(
+        self, server, service: PaletteService, running_vm
+    ) -> None:
+        claim = await service.driver.acquire(
+            "desktop", instance_id=running_vm.view.instance_id, run_id="discovery"
+        )
+        before = asdict(running_vm.view)
+        result = await call(server, "vm_list")
+        record = result.structured_content["vms"][0]
+        assert record["vm_id"] == "desktop"
+        assert record["state"] == "RUNNING"
+        assert record["persistent"] is False
+        assert record["agent_driver_claimed"] is True
+        assert record["control_owner"] == "agent"
+        assert asdict(running_vm.view) == before
+        assert service.driver.claims["desktop"].token == claim["claim_token"]
+        lease = await service.control.acquire("desktop", running_vm.view.instance_id)
+        result = await call(server, "vm_list")
+        record = result.structured_content["vms"][0]
+        assert record["control_owner"] == "operator"
+        assert record["control_state"] == "held"
+        assert record["agent_driver_claimed"] is False
+        assert service.control.leases["desktop"].token == lease["lease_id"]
+        await service.control.release("desktop", lease["lease_id"])
+
     async def test_status_returns_a_structured_summary(self, server, running_vm) -> None:
         result = await call(server, "vm_status", vm_id="desktop")
         assert result.is_error is False

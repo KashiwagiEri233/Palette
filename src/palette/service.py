@@ -39,7 +39,9 @@ from .models import (
     Receipt,
     ReleaseResult,
     StatusResult,
+    VmListResult,
     VmStatus,
+    VmSummary,
     WaitResult,
 )
 from .policy import Policy, validate_identifier
@@ -71,6 +73,9 @@ class PaletteService:
         from .control import ControlManager
 
         self.control = ControlManager(self)
+        from .driver import DriverManager
+
+        self.driver = DriverManager(self)
         from .lifecycle import LifecycleService
 
         self.lifecycle = LifecycleService(self)
@@ -80,6 +85,7 @@ class PaletteService:
     async def startup(self) -> None:
         self.config.runtime_root.mkdir(parents=True, exist_ok=True)
         self.control.start()
+        self.driver.start()
 
     async def shutdown(self) -> None:
         from .cleanup import close_all, join_cleanup
@@ -87,7 +93,12 @@ class PaletteService:
         if self._shutdown_task is None:
             self._shutdown_task = asyncio.create_task(
                 close_all(
-                    (self.manager.operations.seal, self.control.close, self.manager.shutdown)
+                    (
+                        self.manager.operations.seal,
+                        self.driver.close,
+                        self.control.close,
+                        self.manager.shutdown,
+                    )
                 ),
                 name="service-shutdown",
             )
@@ -121,9 +132,35 @@ class PaletteService:
                 f"VM {instance.view.vm_id!r} has no active session",
                 details={"state": str(instance.state)},
             )
+        instance.controller.mutation_guard = lambda: self.control.require_agent(instance.view.vm_id)
         return instance.controller
 
     # -- observation ------------------------------------------------------------------
+    async def list_vms(self) -> VmListResult:
+        desktop = self.lifecycle.desktop
+        definitions = desktop.definitions if desktop is not None else {}
+        records: list[VmSummary] = []
+        for vm_id in sorted(set(definitions) | set(self.manager.known())):
+            definition = definitions.get(vm_id)
+            instance = self.manager.find(vm_id)
+            lease = self.control.leases.get(vm_id)
+            profile = instance.profile if instance else definition.profile if definition else None
+            records.append(
+                VmSummary(
+                    vm_id=vm_id,
+                    name=definition.draft.name if definition else vm_id,
+                    persistent=definition is not None,
+                    state=str(instance.state) if instance else "STOPPED",
+                    guest_arch=profile.qemu.arch if profile else None,
+                    instance_id=instance.view.instance_id if instance else None,
+                    screen_ready=instance.view.screen_ready if instance else False,
+                    control_owner="operator" if lease else "agent",
+                    control_state=lease.state if lease else "available",
+                    agent_driver_claimed=vm_id in self.driver.claims,
+                )
+            )
+        return VmListResult(ok=True, vms=records)
+
     async def status(self, vm_id: str, *, actor: Actor = "agent") -> StatusResult:
         from .platforms import execution_info
 
@@ -343,7 +380,7 @@ class PaletteService:
                 release_confirmed=False,
                 note="this VM has no active input session; nothing is held by this service",
             )
-        result = await controller.release_inputs()
+        result = await controller.release_inputs(guarded=True)
         self.record_event(
             "release_inputs",
             vm_id,

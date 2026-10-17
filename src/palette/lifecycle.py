@@ -24,6 +24,7 @@ class LifecycleService:
         self.config = service.config
         self.manager = service.manager
         self.control = service.control
+        self.driver = service.driver
         self.audit = service.audit
         self.desktop: DesktopManager | None = None
 
@@ -271,6 +272,10 @@ class LifecycleService:
         """
         async with self.manager.operations.hold(vm_id):
             instance = self.manager.get(vm_id)
+            if not await self.driver.revoke(vm_id):
+                raise PaletteError(
+                    ErrorCode.QMP_UNAVAILABLE, "Agent input release was not confirmed"
+                )
             epoch = await self.manager.take_control(
                 vm_id, expected_instance_id=instance.view.instance_id
             )

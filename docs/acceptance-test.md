@@ -16,7 +16,7 @@ npm --prefix desktop ci
 npm --prefix desktop run build
 ```
 
-* **Prerequisites**: Python `3.12`/`3.13`, `uv`, Node.js `22.12+`, a QEMU binary and firmware matching the guest ISA, and a bootable desktop base image (`qcow2`/`raw`) or installer ISO.
+* **Prerequisites**: Python `3.12`/`3.13`, `uv`, Node.js `22.19+`, a QEMU binary and firmware matching the guest ISA, and a bootable desktop base image (`qcow2`/`raw`) or installer ISO.
 * **Identifiers**: Below, `CONFIG_ROOT` denotes the directory holding `palette.toml` and `profiles/`. Always copy `VM_ID` from the GUI **Status** view (e.g., `vm_489cdb67aca0`), never the human-readable display name.
 * **Evidence Storage**: Store test reports and screenshots under `.runtime/acceptance/`. Never commit disk images, screenshots, or connection tokens to Git.
 
@@ -79,7 +79,8 @@ Configure an MCP client that supports `stdio` and forwards `ImageContent` blocks
 
 **Pass Criteria**:
 
-* Initialization succeeds and exposes `vm_status`, `vm_observe`, `vm_act`, `vm_wait`, and `vm_release_inputs`.
+* Initialization succeeds and exposes `vm_list`, `vm_status`, `vm_observe`, `vm_act`, `vm_wait`, and `vm_release_inputs`.
+* `vm_list({})` discovers persistent and runtime-known VM IDs, including stopped definitions, without starting VMs, acquiring control or returning host configuration.
 * `vm_status({"vm_id": "VM_ID"})` returns `ok = true`, `state = "RUNNING"`, and the exact same `instance_id` shown in the GUI.
 * `vm_observe({"vm_id": "VM_ID"})` delivers an actual PNG image to the agent, not just JSON metadata.
 
