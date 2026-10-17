@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readdir, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type AgentSession, type ExtensionFactory } from '@earendil-works/pi-coding-agent'
+import { calculateContextTokens, createAgentSession, DefaultResourceLoader, estimateTokens, ModelRuntime, SessionManager, SettingsManager, type AgentSession, type ExtensionFactory } from '@earendil-works/pi-coding-agent'
 import type { TextContent, ImageContent } from '@earendil-works/pi-ai'
 import { Type } from 'typebox'
 import type { Conversation } from '../shared/workspace'
-import { activeRun, type AgentConfiguration, type AgentSettings, type AgentView, type AgentSnapshot, type AgentEvent, type AgentRunView, type AgentMessageView, type AgentTreeEntry, type AgentApiKind } from '../shared/agent'
+import { activeRun, type AgentConfiguration, type AgentSettings, type AgentView, type AgentSnapshot, type AgentEvent, type AgentRunView, type AgentMessageView, type AgentTreeEntry, type AgentApiKind, type AgentContextUsage } from '../shared/agent'
 import { AgentClient, type AgentReply } from './agent-client'
 import { AgentCredentials, atomicJson, readJson, type SecretEncryption } from './agent-storage'
 import { UnavailableGuestProgramming } from './guest-programming'
@@ -387,7 +387,39 @@ export class PiAgentService {
     const record = await this.load(id, vmId)
     return { streamEpoch: this.streamEpoch, seq: this.seq, view: await this.view(record) }
   }
+  private async contextUsage(record: SessionRecord): Promise<AgentContextUsage | null> {
+    const live = record.session?.getContextUsage()
+    if (live) return live
+    const configuration = await this.configuration()
+    if (!configuration.modelId) return null
+    const contextWindow = configuration.custom ? configuration.contextWindow
+      : (await this.models()).getModel(configuration.providerId, configuration.modelId)?.contextWindow
+    if (!contextWindow) return null
+    // Restore usage from pi's projected branch without starting an executable session.
+    const branch = record.manager.getBranch()
+    let lastCompaction = -1
+    let lastInvalidation = -1
+    branch.forEach((entry, index) => {
+      if (entry.type === 'compaction') lastCompaction = index
+      if (entry.type === 'compaction' || entry.type === 'context_edit') lastInvalidation = index
+    })
+    const positions = new Map(branch.map((entry, index) => [entry.id, index]))
+    let tokens = 0
+    let measured = false
+    for (const entry of record.manager.buildSessionProjection().entries) {
+      for (const message of entry.messages) {
+        if ((positions.get(entry.sourceEntry.id) ?? -1) > lastInvalidation && message.role === 'assistant'
+          && !['error', 'aborted'].includes(message.stopReason) && calculateContextTokens(message.usage) > 0) {
+          tokens = calculateContextTokens(message.usage)
+          measured = true
+        } else tokens += estimateTokens(message)
+      }
+    }
+    if (lastCompaction >= 0 && !measured) return { tokens: null, contextWindow, percent: null }
+    return { tokens, contextWindow, percent: tokens / contextWindow * 100 }
+  }
   private async view(record: SessionRecord): Promise<AgentView> {
+    const contextUsage = await this.contextUsage(record)
     const run = record.run ? { ...record.run } : null
     const compacting = record.compacting
     const messages: AgentMessageView[] = []
@@ -412,7 +444,7 @@ export class PiAgentService {
     const tree: AgentTreeEntry[] = record.manager.getEntries().filter(entry => entry.type === 'compaction' || entry.type === 'message' && ['user', 'assistant', 'toolResult'].includes(entry.message.role)).map(entry => ({
       id: entry.id, parentId: entry.parentId, label: entry.type === 'message' ? `${entry.message.role === 'user' ? '用户' : entry.message.role === 'assistant' ? '助手' : '工具'}：${toText('content' in entry.message ? entry.message.content : '').slice(0, 70)}` : '上下文压缩', active: active.has(entry.id)
     }))
-    const view: AgentView = { conversationId: record.conversation.id, run, messages, tree, compacting }
+    const view: AgentView = { conversationId: record.conversation.id, run, messages, tree, compacting, contextUsage }
     return JSON.parse(await this.credentials.redact(JSON.stringify(view))) as AgentView
   }
   private schedulePublish(record: SessionRecord): void {

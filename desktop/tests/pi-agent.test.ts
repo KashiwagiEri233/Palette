@@ -33,6 +33,7 @@ async function environment() {
   const requests: Record<string, unknown>[] = []
   let slow = false
   let fail = false
+  let measuredUsage = false
   const server = createServer(async (request, response) => {
     let body = ''
     for await (const data of request) body += data
@@ -41,7 +42,7 @@ async function environment() {
     expect(request.headers.authorization).toBe('Bearer test-secret')
     if (fail) { response.writeHead(401, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: { message: 'test-secret unauthorized' } })); return }
     response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' })
-    const chunk = (delta: unknown, finishReason: string | null = null) => response.write(`data: ${JSON.stringify({ id: 'chatcmpl-palette', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`)
+    const chunk = (delta: unknown, finishReason: string | null = null) => response.write(`data: ${JSON.stringify({ id: 'chatcmpl-palette', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta, finish_reason: finishReason }], ...(measuredUsage && finishReason === 'stop' ? { usage: { prompt_tokens: 2048, completion_tokens: 128, total_tokens: 2176 } } : {}) })}\n\n`)
     chunk({ role: 'assistant' })
     if (slow) { chunk({ content: '开始执行' }); return }
     const tools = payload.messages.filter((message: { role: string }) => message.role === 'tool').length
@@ -70,7 +71,7 @@ async function environment() {
   const configuration: AgentConfiguration = { providerId: 'custom', modelId: 'fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${address.port}/v1`, custom: true, contextWindow: 128000, maxTokens: 1024, vision: true, reasoning: false, thinkingLevel: 'off', maxSteps: 100 }
   await service.updateSettings(configuration)
   await service.configureCredential('palette-custom', 'test-secret')
-  return { root, id, service, create, conversations, client, requests, events, configuration, slow: () => { slow = true }, fail: () => { fail = true },
+  return { root, id, service, create, conversations, client, requests, events, configuration, slow: () => { slow = true }, fail: () => { fail = true }, measure: () => { measuredUsage = true },
     close: async () => { await service.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); await rm(root, { recursive: true, force: true }) } }
 }
 async function settled(service: PiAgentService, id: string) {
@@ -85,6 +86,8 @@ async function settled(service: PiAgentService, id: string) {
 it('runs the real SDK through VM tools, persists history and reopens its tree', async () => {
   const test = await environment()
   try {
+    test.measure()
+    expect((await test.service.snapshot('vm', test.id)).view.contextUsage).toEqual({ tokens: 0, contextWindow: 128000, percent: 0 })
     const requestId = randomUUID()
     const accepted = await test.service.start('vm', test.id, 'visual task', requestId)
     expect(await test.service.start('vm', test.id, 'visual task', requestId)).toEqual(accepted)
@@ -96,6 +99,8 @@ it('runs the real SDK through VM tools, persists history and reopens its tree', 
     expect(test.requests).toHaveLength(3)
     expect(result.view.messages.filter(message => message.role === 'assistant').map(message => message.text)).toContain('任务完成')
     expect(result.view.run?.stepCount).toBe(2)
+    expect(result.view.contextUsage).toMatchObject({ tokens: 2176, contextWindow: 128000 })
+    expect(result.view.contextUsage!.percent).toBeCloseTo(1.7)
     const names = ((test.requests[0].tools ?? []) as { function: { name: string } }[]).map(tool => tool.function.name)
     expect(names.sort()).toEqual(['act', 'observe', 'release_inputs', 'status', 'wait'])
     expect(JSON.stringify(result)).not.toContain('test-secret')
@@ -110,6 +115,7 @@ it('runs the real SDK through VM tools, persists history and reopens its tree', 
     try {
       const snapshot = await reopened.snapshot('vm', test.id)
       expect(snapshot.view.messages).toEqual(result.view.messages)
+      expect(snapshot.view.contextUsage).toEqual(result.view.contextUsage)
       expect(snapshot.view.tree.length).toBeGreaterThan(1)
       const user = snapshot.view.tree.find(entry => entry.label.startsWith('用户'))!
       const branch = await reopened.navigate('vm', test.id, user.id)
@@ -179,6 +185,7 @@ it('compacts real SDK history and retains earlier conversation branches', async 
     const result = await test.service.compact('vm', test.id)
     expect(result.view.messages.some(message => message.role === 'system' && message.text === '上下文已压缩')).toBe(true)
     expect(result.view.tree.length).toBeGreaterThan(before.view.tree.length)
+    expect(result.view.contextUsage).toEqual({ tokens: null, contextWindow: 12000, percent: null })
     expect(test.client.calls).toHaveLength(0)
     const branch = await test.service.navigate('vm', test.id, before.view.tree.find(entry => entry.label.startsWith('用户'))!.id)
     expect(branch.editorText).toContain('Message 0')

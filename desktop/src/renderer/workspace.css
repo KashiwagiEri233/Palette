@@ -55,6 +55,17 @@ button:disabled { cursor: default; }
 .agent-composer-controls > button { flex-shrink: 0; }
 .agent-composer-options { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; font-size: 12px; }
 .agent-composer-options [data-slot=badge] { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.agent-composer-actions { display: flex; align-items: center; gap: 4px; margin-left: auto; min-width: 0; }
+.conversation-composer .agent-composer-options { flex: 1; flex-wrap: nowrap; overflow: hidden; }
+.conversation-composer .agent-composer-options > button { flex-shrink: 0; }
+.agent-composer-actions > .context-usage-trigger { flex-shrink: 0; }
+.composer-model-select { min-width: 0; padding-inline: 8px; }
+.composer-model-select > span { max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+.composer-model-select > svg { flex-shrink: 0; }
+.context-usage-popover { max-width: calc(100vw - 32px); }
+.context-usage-compacting { animation: spin 1s linear infinite; }
+@media (prefers-reduced-motion: reduce) { .context-usage-compacting { animation: none; } }
+@media (max-width: 600px) { .composer-model-select > span { max-width: 96px; } .conversation-composer .agent-composer-options [data-slot=badge] { max-width: 80px; } }
 .home-draft-label { color: var(--muted-foreground); font-size: 12px; }
 .target-vm-chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 12px; }
 .target-vm-chips button { font-size: 12px; height: 32px; gap: 8px; }
@@ -141,7 +152,7 @@ button:disabled { cursor: default; }
 .agent-capability-switch[data-checked] > span { background: var(--primary-foreground); }
 .agent-key-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; min-width: 0; }
 .agent-key-controls input { flex: 1 1 180px; }
-.agent-settings-actions, .agent-history-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.agent-settings-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .agent-settings-actions > span { flex: 1; color: var(--muted-foreground); font-size: 13px; }
 .agent-timeline { width: 100%; max-width: 760px; margin: 0 auto; padding: 24px; }
 .agent-message { padding: 12px 0; overflow-wrap: anywhere; }
@@ -179,7 +190,6 @@ button:disabled { cursor: default; }
 .agent-message-tool, .agent-message-system { color: var(--muted-foreground); font-size: 13px; }
 .agent-run-status { padding: 8px 24px; color: var(--muted-foreground); font-size: 12px; }
 .agent-run-status p { color: var(--destructive); margin-top: 4px; }
-.agent-history-actions { justify-content: flex-start; padding: 0 24px 20px; margin-top: 0; }
 .environment-results h2 { margin-bottom: 16px; }
 .command-dialog { padding: 0; gap: 0; overflow: hidden; }
 .command-dialog [cmdk-input-wrapper] { padding-right: 52px; }

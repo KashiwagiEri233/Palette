@@ -20,6 +20,7 @@ import type { LayoutPreferences } from '@/lib/layout'
 import { activeRun } from '../../shared/agent'
 import { useAgent, useAgentSettings } from '../lib/use-agent'
 import { MessageMarkdown } from './MessageMarkdown'
+import { ContextUsage } from './ContextUsage'
 
 interface Props {
   conversation: Conversation
@@ -91,7 +92,7 @@ export function ConversationPage(props: Props) {
     composer={<div className="conversation-composer">
       {vm && vm.status.state !== 'RUNNING' && <div className="composer-notice"><span>虚拟机未运行</span><Button variant="ghost" size="sm" disabled={props.busy || ['STARTING', 'STOPPING', 'PAUSED'].includes(vm.status.state)} onClick={() => props.onAction(vm, 'start')}>启动</Button></div>}
       {!configured && <div className="composer-notice"><span>Agent 尚未配置</span><Button variant="ghost" size="sm" onClick={props.onAgentSettings}>前往设置</Button></div>}
-      <PromptInput value={props.conversation.draft} onValueChange={value => props.onDraft(props.conversation.id, value)} onSend={() => void send()} running={running} onStop={() => { void window.palette.request('agent.stop', props.conversation.vm_id, { conversationId: props.conversation.id }).then(refresh).catch(props.reportError) }} sendDisabled={!configured || sending || operationBusy || !!view?.compacting || !!settings?.configuration.vision && vm?.status.state !== 'RUNNING'} disabled={props.conversation.archived || !vm || sending} footer={<><IconButton label="附加文件（尚不可用）" disabled><Plus size={16} /></IconButton><Badge variant="secondary">{vm?.name ?? '虚拟机不可用'}</Badge><Button variant="ghost" size="sm" onClick={props.onAgentSettings}>{settings?.configuration.modelId || '选择模型'}<ChevronDown size={12} /></Button></>} />
+      <PromptInput value={props.conversation.draft} onValueChange={value => props.onDraft(props.conversation.id, value)} onSend={() => void send()} running={running} onStop={() => { void window.palette.request('agent.stop', props.conversation.vm_id, { conversationId: props.conversation.id }).then(refresh).catch(props.reportError) }} sendDisabled={!configured || sending || operationBusy || !!view?.compacting || !!settings?.configuration.vision && vm?.status.state !== 'RUNNING'} disabled={props.conversation.archived || !vm || sending} footer={<><IconButton label="附加文件（尚不可用）" disabled><Plus size={16} /></IconButton><Badge variant="secondary">{vm?.name ?? '虚拟机不可用'}</Badge></>} actions={<><ContextUsage usage={view?.contextUsage} compacting={operationBusy || !!view?.compacting} compactDisabled={running || !view?.messages.length || !!props.conversation.archived || !configured} onCompact={() => void compact()} /><Button variant="ghost" size="sm" className="composer-model-select" aria-label="选择模型" onClick={props.onAgentSettings}><span>{settings?.configuration.modelId || '选择模型'}</span><ChevronDown size={12} /></Button></>} />
       <div className="composer-caption" role="status">{props.conversation.archived ? '已归档的对话为只读' : props.draftState === 'error' ? <>草稿保存失败 <Button variant="ghost" size="sm" onClick={props.onRetrySave}>重试保存</Button></> : props.draftState === 'saving' ? '正在保存草稿…' : '草稿已保存在本机'}</div>
     </div>}>
     <ScrollArea className="conversation-scroll">
@@ -99,7 +100,6 @@ export function ConversationPage(props: Props) {
         {view.messages.map(message => <article key={message.id} className={`agent-message agent-message-${message.role}`} data-message-role={message.role}><span className="agent-message-label">{message.role === 'user' ? '你' : message.role === 'assistant' ? 'Palette' : message.toolName ?? '系统'}</span>{message.text && ['user', 'assistant'].includes(message.role) ? <MessageMarkdown text={message.text} onError={props.reportError} /> : <div className="agent-message-text">{message.text || (message.status === 'streaming' ? '正在回复…' : message.status === 'error' ? '回复已中断' : '')}</div>}{message.status === 'error' && <span className="field-hint">回复未完成</span>}</article>)}
       </div> : <EmptyState variant="plain" heading="h1" className="conversation-empty" icon={<Sparkles size={22} />} title={props.conversation.archived ? '对话已归档' : '开始一项新任务'} description={props.conversation.archived ? '可以从搜索中找到此对话。' : '描述任务，或在右侧接管虚拟机。'} />}
       <div className="agent-run-status" role="status">{view?.compacting ? '正在压缩上下文…' : view?.run ? `${({ starting: '正在启动', running: '正在执行', stopping: '正在停止', completed: '已完成', cancelled: '已停止', failed: '执行失败', interrupted: '任务已中断' })[view.run.state]} · ${view.run.stepCount} 次工具调用` : ''}{view?.run?.error && <p>{view.run.error}</p>}</div>
-      {!!view?.messages.length && <div className="agent-history-actions"><Button size="sm" variant="ghost" disabled={running || operationBusy || view.compacting || props.conversation.archived || !configured} onClick={() => void compact()}>压缩上下文</Button></div>}
     </ScrollArea>
   </AgentChat>
 

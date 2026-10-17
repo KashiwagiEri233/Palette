@@ -35,12 +35,18 @@ export interface AgentRunView {
   error?: string
 }
 export interface AgentTreeEntry { id: string; parentId: string | null; label: string; active: boolean }
+export interface AgentContextUsage {
+  tokens: number | null
+  contextWindow: number
+  percent: number | null
+}
 export interface AgentView {
   conversationId: string
   run: AgentRunView | null
   messages: AgentMessageView[]
   tree: AgentTreeEntry[]
   compacting: boolean
+  contextUsage: AgentContextUsage | null
 }
 export interface AgentSnapshot { streamEpoch: string; seq: number; view: AgentView }
 export interface AgentEvent extends AgentSnapshot { runId: string | null }
