@@ -3,20 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import math
-import os
 import secrets
 import uuid
-from collections import OrderedDict
-from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Self
 
+from ..cleanup import close_all
 from ..config import PaletteConfig
 from ..errors import ErrorCode, PaletteError
-from ..models import ErrorPayload
+from ..models import ErrorPayload, LifecycleResult
 from ..service import PaletteService
+from .listener import LocalListener
 from .paths import IS_WINDOWS, RuntimeLease, RuntimePaths
 from .protocol import (
     MAX_CLIENTS,
@@ -37,10 +36,10 @@ from .protocol import (
     receive_frame,
     send_frame,
 )
-from .unix import UnixChannel
+from .requests import RequestRegistry
 
 if TYPE_CHECKING:
-    from .windows import WindowsListener
+    pass
 
 logger = logging.getLogger("palette.operator")
 
@@ -78,15 +77,9 @@ class OperatorServer:
             token=secrets.token_hex(32),
             operation_timeout_seconds=operation_budget(service.config),
         )
-        self._unix: asyncio.AbstractServer | None = None
-        self._pipe: WindowsListener | None = None
-        self._accept_task: asyncio.Task[None] | None = None
-        self._handlers: set[asyncio.Task[None]] = set()
-        self._requests: OrderedDict[str, tuple[str, asyncio.Task[Response]]] = OrderedDict()
-        self._closing = False
-        self._socket_identity: tuple[int, int] | None = None
-        self.desktop_route: Any = None
-        self.desktop_manager: Any = None
+        self.listener = LocalListener(self.paths, self.endpoint, self._handle)
+        self.requests = RequestRegistry[Response](pending_limit=MAX_CLIENTS, retained_limit=128)
+        self.desktop_route: Callable[[DesktopCommand], Awaitable[dict[str, Any]]] | None = None
 
     def acquire(self) -> None:
         """Acquire before service startup; retain until service shutdown has completed."""
@@ -95,55 +88,10 @@ class OperatorServer:
     async def start(self) -> None:
         self.acquire()
         try:
-            if IS_WINDOWS:
-                from .windows import WindowsListener
-
-                self._pipe = WindowsListener(self.endpoint.address)
-                self._accept_task = asyncio.create_task(
-                    self._accept_pipes(), name="operator-accept"
-                )
-            else:
-                self.paths.remove_stale_socket(self.endpoint.generation)
-                start_unix: Any = getattr(asyncio, "start_unix_server", None)
-                self._unix = await start_unix(
-                    self._accept_unix,
-                    path=self.endpoint.address,
-                    limit=256 * 1024,
-                    backlog=MAX_CLIENTS,
-                )
-                path = Path(self.endpoint.address)
-                os.chmod(path, 0o600)
-                info = path.stat()
-                self._socket_identity = (info.st_dev, info.st_ino)
-            self.paths.publish(self.endpoint)
+            await self.listener.start()
         except BaseException:
-            await self.stop()
             self.release()
             raise
-
-    def _accept_unix(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        self._schedule(UnixChannel(reader, writer))
-
-    async def _accept_pipes(self) -> None:
-        if self._pipe is None:
-            return
-        while True:
-            if self._closing:
-                return
-            try:
-                channel = await self._pipe.accept()
-            except OSError:
-                logger.info("operator pipe accept stopped")
-                return
-            self._schedule(channel)
-
-    def _schedule(self, channel: Channel) -> None:
-        if self._closing or len(self._handlers) >= MAX_CLIENTS:
-            task = asyncio.create_task(channel.close(), name="operator-reject")
-        else:
-            task = asyncio.create_task(self._handle(channel), name="operator-client")
-        self._handlers.add(task)
-        task.add_done_callback(self._handlers.discard)
 
     async def _handle(self, channel: Channel) -> None:
         try:
@@ -168,35 +116,14 @@ class OperatorServer:
             await channel.close()
 
     async def _execute_once(self, request: Request) -> Response:
-        fingerprint = request.command.model_dump_json()
-        previous = self._requests.get(request.request_id)
-        if previous is not None:
-            if previous[0] != fingerprint:
-                return self._failure(
-                    request.request_id,
-                    PaletteError(
-                        ErrorCode.REQUEST_ID_CONFLICT, "operator request_id has different arguments"
-                    ),
-                )
-            return await asyncio.shield(previous[1])
-        if sum(not task.done() for _, task in self._requests.values()) >= MAX_CLIENTS:
-            return self._failure(
+        try:
+            return await self.requests.execute(
                 request.request_id,
-                PaletteError(ErrorCode.BUSY, "the operator request limit has been reached"),
+                request.command.model_dump_json(),
+                lambda: self._dispatch(request),
             )
-        task = asyncio.create_task(
-            self._dispatch(request), name=f"operator-{request.command.method}"
-        )
-        self._requests[request.request_id] = (fingerprint, task)
-        task.add_done_callback(lambda _: self._trim_requests())
-        return await asyncio.shield(task)
-
-    def _trim_requests(self) -> None:
-        for key, (_, task) in list(self._requests.items()):
-            if len(self._requests) <= 128:
-                break
-            if task.done():
-                self._requests.pop(key, None)
+        except PaletteError as exc:
+            return self._failure(request.request_id, exc)
 
     def _failure(self, request_id: str, error: PaletteError) -> Response:
         return Response(
@@ -242,35 +169,6 @@ class OperatorServer:
             desktop_result: dict[str, Any] = await self.desktop_route(command)
             return desktop_result
         if isinstance(command, Start):
-            if (
-                self.desktop_manager is not None
-                and command.vm_id in self.desktop_manager.definitions
-            ):
-                if (
-                    command.profile_id is not None
-                    and command.profile_id
-                    != self.desktop_manager.get(command.vm_id).draft.profile_id
-                ):
-                    raise PaletteError(
-                        ErrorCode.INVALID_ARGUMENT,
-                        "persistent VM profile is configured by the desktop definition",
-                    )
-                if any(
-                    value is not None
-                    for value in (
-                        command.image,
-                        command.image_format,
-                        command.iso,
-                        command.extra_disks,
-                        command.qemu_args,
-                    )
-                ):
-                    raise PaletteError(
-                        ErrorCode.INVALID_ARGUMENT,
-                        "persistent storage is configured by the desktop definition",
-                    )
-                started: dict[str, Any] = await self.desktop_manager.start(command.vm_id)
-                return {"ok": True, **started}
             result = await self.service.start(
                 command.vm_id,
                 actor="operator",
@@ -281,31 +179,15 @@ class OperatorServer:
                 extra_disks=command.extra_disks,
                 qemu_args=command.qemu_args,
             )
-            return result.model_dump(mode="json")
+            return self._lifecycle_payload(command.vm_id, result)
         if isinstance(command, Stop):
-            if (
-                self.desktop_manager is not None
-                and command.vm_id in self.desktop_manager.definitions
-            ):
-                stopped: dict[str, Any] = await self.desktop_manager.stop(
-                    command.vm_id, force=command.force
-                )
-                return {"ok": True, **stopped}
-            return (
-                await self.service.stop(command.vm_id, force=command.force, actor="operator")
-            ).model_dump(mode="json")
+            result = await self.service.stop(command.vm_id, force=command.force, actor="operator")
+            return self._lifecycle_payload(command.vm_id, result)
         if isinstance(command, Reset):
-            if (
-                self.desktop_manager is not None
-                and command.vm_id in self.desktop_manager.definitions
-            ):
-                reset: dict[str, Any] = await self.desktop_manager.reset(command.vm_id)
-                return {"ok": True, **reset}
-            return (
-                await self.service.reset(
-                    command.vm_id, profile_id=command.profile_id, actor="operator"
-                )
-            ).model_dump(mode="json")
+            result = await self.service.reset(
+                command.vm_id, profile_id=command.profile_id, actor="operator"
+            )
+            return self._lifecycle_payload(command.vm_id, result)
         if isinstance(command, Status):
             return (await self.service.status(command.vm_id)).model_dump(mode="json")
         if isinstance(command, EmergencyStop):
@@ -315,40 +197,14 @@ class OperatorServer:
             return {"vm_id": command.vm_id, "controller_epoch": epoch}
         raise PaletteError(ErrorCode.INVALID_ARGUMENT, "unknown operator command")
 
-    async def stop(self) -> None:
-        self._closing = True
-        self.paths.retire(self.endpoint.generation)
-        if self._unix is not None:
-            self._unix.close()
-            await self._unix.wait_closed()
-            self._unix = None
-        if self._pipe is not None:
-            await self._pipe.close()
-            self._pipe = None
-        if self._accept_task is not None:
-            self._accept_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._accept_task
-            self._accept_task = None
-        tasks = set(self._handlers) | {
-            task for _, task in self._requests.values() if not task.done()
-        }
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._requests.clear()
-        self._remove_socket()
+    def _lifecycle_payload(self, vm_id: str, result: LifecycleResult) -> dict[str, Any]:
+        # The legacy operator protocol omits unset optional fields for definitions.
+        return result.model_dump(
+            mode="json", exclude_unset=self.service.lifecycle.is_persistent(vm_id)
+        )
 
-    def _remove_socket(self) -> None:
-        if self._socket_identity is None:
-            return
-        path = Path(self.endpoint.address)
-        with contextlib.suppress(FileNotFoundError):
-            info = path.lstat()
-            if (info.st_dev, info.st_ino) == self._socket_identity:
-                path.unlink()
-        self._socket_identity = None
+    async def stop(self) -> None:
+        await close_all((self.listener.close, self.requests.close))
 
     def release(self) -> None:
         self.lease.release()

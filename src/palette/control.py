@@ -9,12 +9,15 @@ import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
+from .cleanup import close_all, join_cleanup
 from .errors import ErrorCode, PaletteError
 from .input.keyboard import QCODES
+from .operations import VmOperations
 
 if TYPE_CHECKING:
     from .service import PaletteService
@@ -70,8 +73,9 @@ class ControlManager:
     def __init__(self, service: PaletteService) -> None:
         self.service = service
         self.leases: dict[str, Lease] = {}
-        self._lock = asyncio.Lock()
+        self._operations = VmOperations()
         self._watcher: asyncio.Task[None] | None = None
+        self._revocations: dict[str, asyncio.Task[None]] = {}
 
     def start(self) -> None:
         if self._watcher is None or self._watcher.done():
@@ -82,8 +86,9 @@ class ControlManager:
             self._watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._watcher
-        for vm_id in list(self.leases):
-            await self.revoke(vm_id)
+        if self._revocations:
+            await asyncio.gather(*list(self._revocations.values()), return_exceptions=True)
+        await close_all(partial(self.revoke, vm_id) for vm_id in list(self.leases))
 
     def require_agent(self, vm_id: str) -> None:
         if vm_id in self.leases:
@@ -105,9 +110,11 @@ class ControlManager:
         return lease
 
     async def acquire(self, vm_id: str, instance_id: str) -> dict[str, Any]:
-        async with self._lock:
+        self.service.manager.operations.require_accepting()
+        async with self.service.manager.operations.hold(vm_id), self._operations.hold(vm_id):
+            self.service.manager.operations.require_accepting()
             instance = await self.service.manager.require_running(vm_id)
-            self.service._require_instance_id(instance, instance_id)
+            self.service.require_instance_id(instance, instance_id)
             if vm_id in self.leases:
                 raise PaletteError(ErrorCode.BUSY, "another operator holds this VM")
             lease = Lease(
@@ -118,7 +125,7 @@ class ControlManager:
                 acquiring=True,
             )
             self.leases[vm_id] = lease
-            controller = self.service._controller(instance)
+            controller = self.service.controller_for(instance)
             controller.mutation_guard = lambda: self.require_agent(vm_id)
             try:
                 lease.controller_epoch = await self.service.take_control(vm_id, reason="operator")
@@ -151,34 +158,53 @@ class ControlManager:
         return {"expires_after_ms": 3000}
 
     async def release(self, vm_id: str, token: str) -> dict[str, Any]:
-        lease = self.leases.get(vm_id)
-        if lease is None:
-            return {"release_confirmed": True}
-        if not secrets.compare_digest(lease.token, token):
-            raise PaletteError(ErrorCode.POLICY_DENIED, "this lease belongs to another operator")
-        return {"release_confirmed": await self.revoke(vm_id)}
-
-    async def revoke(self, vm_id: str) -> bool:
-        async with self._lock:
+        async with self.service.manager.operations.hold(vm_id):
             lease = self.leases.get(vm_id)
             if lease is None:
+                return {"release_confirmed": True}
+            if not secrets.compare_digest(lease.token, token):
+                raise PaletteError(
+                    ErrorCode.POLICY_DENIED, "this lease belongs to another operator"
+                )
+            return {"release_confirmed": await self.revoke(vm_id, expected_lease=lease)}
+
+    async def revoke(
+        self,
+        vm_id: str,
+        *,
+        expected_lease: Lease | None = None,
+        expected_instance_id: str | None = None,
+    ) -> bool:
+        async with self.service.manager.operations.hold(vm_id), self._operations.hold(vm_id):
+            lease = self.leases.get(vm_id)
+            if (expected_lease is not None and lease is not expected_lease) or (
+                expected_instance_id is not None
+                and lease is not None
+                and lease.instance_id != expected_instance_id
+            ):
                 return True
-            lease.state = "releasing"
-            instance = self.service.manager.find(vm_id)
-            if instance is None or instance.view.instance_id != lease.instance_id:
-                self.leases.pop(vm_id, None)
-                return True
-            instance.view.controller_epoch += 1
-            controller = instance.controller
-            confirmed = True
-            if controller is not None:
-                result = await asyncio.shield(controller.emergency_release())
-                confirmed = result.release_confirmed
-            if confirmed or instance.process is None or instance.process.returncode is not None:
-                self.leases.pop(vm_id, None)
-            else:
-                lease.state = "faulted"
-            return confirmed
+            return await join_cleanup(asyncio.create_task(self._revoke_locked(vm_id)))
+
+    async def _revoke_locked(self, vm_id: str) -> bool:
+        lease = self.leases.get(vm_id)
+        if lease is None:
+            return True
+        lease.state = "releasing"
+        instance = self.service.manager.find(vm_id)
+        if instance is None or instance.view.instance_id != lease.instance_id:
+            self.leases.pop(vm_id, None)
+            return True
+        instance.view.controller_epoch += 1
+        controller = instance.controller
+        confirmed = True
+        if controller is not None:
+            result = await controller.emergency_release()
+            confirmed = result.release_confirmed
+        if confirmed or instance.process is None or instance.process.returncode is not None:
+            self.leases.pop(vm_id, None)
+        else:
+            lease.state = "faulted"
+        return confirmed
 
     async def input(
         self,
@@ -196,6 +222,7 @@ class ControlManager:
         fingerprint = json.dumps([display_epoch, width, height, events], sort_keys=True)
         lease = self.validate(vm_id, token)
         async with lease.lock:
+            self.validate(vm_id, token)
             previous = lease.receipts.get(seq)
             if previous is not None:
                 if fingerprint != previous[0]:
@@ -265,11 +292,12 @@ class ControlManager:
                             ErrorCode.STALE_FRAME, "the display changed during input"
                         )
 
-                action_seq = await self.service._controller(instance).operator_input(
+                action_seq = await self.service.controller_for(instance).operator_input(
                     qmp_events, check
                 )
             except BaseException:
-                await asyncio.shield(self.revoke(vm_id))
+                lease.state = "releasing"
+                await join_cleanup(asyncio.create_task(self.revoke(vm_id, expected_lease=lease)))
                 raise
             result = {"seq": seq, "action_seq": action_seq, "effect_state": "submitted"}
             lease.seq = seq
@@ -285,6 +313,7 @@ class ControlManager:
                 instance = self.service.manager.find(vm_id)
                 if (
                     not lease.acquiring
+                    and vm_id not in self._revocations
                     and lease.state == "held"
                     and (
                         lease.expires <= time.monotonic()
@@ -294,5 +323,18 @@ class ControlManager:
                         or instance.view.controller_epoch != lease.controller_epoch
                     )
                 ):
-                    with contextlib.suppress(PaletteError):
-                        await self.revoke(vm_id)
+                    self._revocations[vm_id] = asyncio.create_task(
+                        self._expire(vm_id, lease), name="lease-expiry"
+                    )
+
+    async def _expire(self, vm_id: str, lease: Lease) -> None:
+        try:
+            async with self.service.manager.operations.hold(vm_id):
+                if self.leases.get(vm_id) is not lease:
+                    return
+                try:
+                    self.validate(vm_id, lease.token)
+                except PaletteError:
+                    await self.revoke(vm_id, expected_lease=lease)
+        finally:
+            self._revocations.pop(vm_id, None)

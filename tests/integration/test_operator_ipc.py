@@ -233,7 +233,7 @@ async def test_closing_owner_cancels_partial_clients_and_allows_restart(
         await channel.close()
     async with OperatorServer(service) as replacement:
         assert replacement.endpoint.generation != owner.endpoint.generation
-        assert not replacement._handlers
+        assert not replacement.listener.handlers
 
 
 async def test_mcp_cancel_scope_does_not_skip_vm_or_endpoint_cleanup(

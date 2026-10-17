@@ -33,12 +33,15 @@ from typing import Any
 from ..audit import AuditLog
 from ..capture.base import CaptureBackend
 from ..capture.qmp import QmpCaptureBackend
+from ..cleanup import join_cleanup
 from ..config import PaletteConfig, Profile
 from ..errors import ErrorCode, PaletteError
 from ..guest_tools.base import DisabledGuestToolBackend, GuestToolBackend
 from ..guest_tools.bridge import BridgeGuestToolBackend, GuestToolTransport
-from ..input.controller import ActionController, InstanceView
+from ..input.controller import ActionController
+from ..input.state import InstanceView
 from ..models import ErrorPayload
+from ..operations import VmOperations
 from ..platforms import execution_info, validate_target
 from ..policy import PathGuard, Policy, validate_identifier
 from ..qmp.client import QmpClient
@@ -49,15 +52,22 @@ from .launcher import (
     LaunchPlan,
     build_launch_plan,
     locate_binary,
-    probe_binary,
+    probe_binary_async,
     require_accelerator,
     resolve_firmware,
     spawn_qemu,
 )
 from .managed import ManagedProcess
 from .process_guard import ProcessGuard, create_process_guard
+from .storage import VmStorage
 
 logger = logging.getLogger("palette.vm")
+
+
+class ShutdownMode(StrEnum):
+    GRACEFUL = "graceful"
+    WITH_FALLBACK = "with_fallback"
+    FORCE = "force"
 
 
 class VmState(StrEnum):
@@ -145,15 +155,19 @@ class VmManager:
         audit: AuditLog | None = None,
         guest_tool_transport_factory: object | None = None,
     ) -> None:
+        from ..vm_settings import CapabilityProbe
+
         self.config = config
+        self.probe = CapabilityProbe(config.host)
         self.audit = audit
         self._instances: dict[str, VmInstance] = {}
         self._boot_epochs: dict[str, int] = {}
-        self._lock = asyncio.Lock()
+        self.operations = VmOperations()
         self._runtime_stopping = False
         self._cleanup_waiters: set[asyncio.Task[Any]] = set()
         self._guest_tool_transport_factory = guest_tool_transport_factory
-        self.persistent_roots: set[Path] = set()
+        self.storage = VmStorage(config)
+        self.persistent_roots = self.storage.persistent_roots
         self.console_enabled = False
 
     # -- lookup ----------------------------------------------------------------------
@@ -170,6 +184,15 @@ class VmManager:
 
     def find(self, vm_id: str) -> VmInstance | None:
         return self._instances.get(vm_id)
+
+    def forget(self, vm_id: str) -> None:
+        instance = self.find(vm_id)
+        if instance is not None and (
+            instance.state not in {VmState.STOPPED, VmState.FAILED}
+            or (instance.process is not None and instance.process.returncode is None)
+        ):
+            raise PaletteError(ErrorCode.STATE_CONFLICT, "the VM still owns runtime resources")
+        self._instances.pop(vm_id, None)
 
     def known(self) -> list[str]:
         return sorted(self._instances)
@@ -197,23 +220,26 @@ class VmManager:
     ) -> VmInstance:
         validate_identifier(vm_id, what="vm_id")
         profile = profile_override or self.config.profile(profile_id)
-        async with self._lock:
-            self._require_accepting_starts()
-            existing = self._instances.get(vm_id)
-            if existing is not None and existing.state in {
-                VmState.RUNNING,
-                VmState.STARTING,
-                VmState.PAUSED,
-            }:
-                raise PaletteError(ErrorCode.VM_ALREADY_RUNNING, f"VM {vm_id!r} is already running")
-            try:
-                if existing is not None:
-                    await self._finish_cleanup(self._stop_locked(existing, force=True))
-                return await self._start_locked(
-                    vm_id, profile, overrides or LaunchOverrides(), storage, on_storage_ready
-                )
-            finally:
-                self._apply_retention(vm_id, profile)
+        with self.storage.protect(profile, overrides or LaunchOverrides(), storage):
+            async with self.operations.hold(vm_id, starting=True):
+                self._require_accepting_starts()
+                existing = self._instances.get(vm_id)
+                if existing is not None and existing.state in {
+                    VmState.RUNNING,
+                    VmState.STARTING,
+                    VmState.PAUSED,
+                }:
+                    raise PaletteError(
+                        ErrorCode.VM_ALREADY_RUNNING, f"VM {vm_id!r} is already running"
+                    )
+                try:
+                    if existing is not None:
+                        await self._finish_cleanup(self._stop_locked(existing, force=True))
+                    return await self._start_locked(
+                        vm_id, profile, overrides or LaunchOverrides(), storage, on_storage_ready
+                    )
+                finally:
+                    self._apply_retention(vm_id, profile)
 
     async def _start_locked(
         self,
@@ -223,140 +249,143 @@ class VmManager:
         storage: InstancePaths | None = None,
         on_storage_ready: Callable[[VmInstance], None] | None = None,
     ) -> VmInstance:
-        self._require_accepting_starts()
-        validate_target(profile)
-        guard_root = PathGuard(self.config.runtime_root)
-        policy = Policy(profile, guard_root)
-        policy.require_network_supported()
+        with self.storage.protect(profile, overrides, storage):
+            self._require_accepting_starts()
+            validate_target(profile)
+            guard_root = PathGuard(self.config.runtime_root)
+            policy = Policy(profile, guard_root)
+            policy.require_network_supported()
 
-        binary = locate_binary(profile, self.config.host)
-        if binary is None:
-            raise PaletteError(
-                ErrorCode.QEMU_NOT_FOUND,
-                "no QEMU system emulator was found; install it or set qemu.binary in the profile",
-                details={"profile": profile.profile_id},
-            )
-        probe = probe_binary(binary, timeout=20.0, prefix=profile.qemu.argv_prefix)
-        if not probe.found:
-            raise PaletteError(
-                ErrorCode.QEMU_NOT_FOUND,
-                "the QEMU executable could not be identified",
-                details={"error": probe.error},
-            )
-        if (
-            profile.qemu.version_pin
-            and probe.version
-            and not probe.version.startswith(profile.qemu.version_pin)
-        ):
-            raise PaletteError(
-                ErrorCode.PRECONDITION_FAILED,
-                "the installed QEMU version does not match the profile's pinned version",
-                details={"installed": probe.version, "pinned": profile.qemu.version_pin},
-            )
-        accelerator = require_accelerator(profile, probe)
-        profile = resolve_firmware(profile, binary)
-        if profile.audio.enabled:
-            from ..vm_settings import CapabilityProbe
-
-            capabilities = await CapabilityProbe(self.config.host).get(profile)
-            if not capabilities["audio_available"]:
+            binary = locate_binary(profile, self.config.host)
+            if binary is None:
                 raise PaletteError(
-                    ErrorCode.UNSUPPORTED_CAPABILITY, "当前 QEMU 缺少输出声卡或宿主音频后端"
+                    ErrorCode.QEMU_NOT_FOUND,
+                    "no QEMU system emulator was found; install it or set qemu.binary in the profile",
+                    details={"profile": profile.profile_id},
                 )
-            profile = profile.model_copy(
-                update={
-                    "audio": profile.audio.model_copy(
-                        update={"backend": capabilities["audio_backend"]}
+            probe = await probe_binary_async(binary, timeout=20.0, prefix=profile.qemu.argv_prefix)
+            if not probe.found:
+                raise PaletteError(
+                    ErrorCode.QEMU_NOT_FOUND,
+                    "the QEMU executable could not be identified",
+                    details={"error": probe.error},
+                )
+            if (
+                profile.qemu.version_pin
+                and probe.version
+                and not probe.version.startswith(profile.qemu.version_pin)
+            ):
+                raise PaletteError(
+                    ErrorCode.PRECONDITION_FAILED,
+                    "the installed QEMU version does not match the profile's pinned version",
+                    details={"installed": probe.version, "pinned": profile.qemu.version_pin},
+                )
+            accelerator = require_accelerator(profile, probe)
+            profile = resolve_firmware(profile, binary)
+            if profile.audio.enabled:
+                capabilities = await self.probe.get(profile)
+                if not capabilities["audio_available"]:
+                    raise PaletteError(
+                        ErrorCode.UNSUPPORTED_CAPABILITY, "当前 QEMU 缺少输出声卡或宿主音频后端"
                     )
-                }
+                profile = profile.model_copy(
+                    update={
+                        "audio": profile.audio.model_copy(
+                            update={"backend": capabilities["audio_backend"]}
+                        )
+                    }
+                )
+
+            images = ImageManager(
+                guard_root,
+                profile,
+                max_overlay_bytes=profile.resources.max_overlay_bytes,
+                max_overlays=profile.retention.max_overlays,
+                keep_overlays=profile.retention.keep_overlays,
             )
+            self._check_free_space(profile)
 
-        images = ImageManager(
-            guard_root,
-            profile,
-            max_overlay_bytes=profile.resources.max_overlay_bytes,
-            max_overlays=profile.retention.max_overlays,
-            keep_overlays=profile.retention.keep_overlays,
-        )
-        self._check_free_space(profile)
+            instance_id = f"inst_{uuid.uuid4().hex[:12]}"
+            boot_epoch = self._boot_epochs.get(vm_id, 0) + 1
+            self._boot_epochs[vm_id] = boot_epoch
+            if storage is not None:
+                guard_root.assert_managed(storage.overlay)
+                if images.read_manifest(vm_id, storage.instance_id) is None:
+                    raise PaletteError(
+                        ErrorCode.IMAGE_INVALID, "persistent storage manifest is invalid"
+                    )
+                await images.inspect_image(storage.overlay, image_format="qcow2")
+            paths = images.allocate_instance(vm_id, instance_id)
+            if storage is not None:
+                paths.overlay = storage.overlay
+                paths.hardware_vars = storage.hardware_vars
 
-        instance_id = f"inst_{uuid.uuid4().hex[:12]}"
-        boot_epoch = self._boot_epochs.get(vm_id, 0) + 1
-        self._boot_epochs[vm_id] = boot_epoch
-        if storage is not None:
-            guard_root.assert_managed(storage.overlay)
-            if images.read_manifest(vm_id, storage.instance_id) is None:
-                raise PaletteError(
-                    ErrorCode.IMAGE_INVALID, "persistent storage manifest is invalid"
-                )
-            await images.inspect_image(storage.overlay, image_format="qcow2")
-        paths = images.allocate_instance(vm_id, instance_id)
-        if storage is not None:
-            paths.overlay = storage.overlay
-            paths.hardware_vars = storage.hardware_vars
-
-        view = InstanceView(
-            vm_id=vm_id,
-            instance_id=instance_id,
-            profile_id=profile.profile_id,
-            display_id=profile.devices.display_id,
-            head=profile.devices.head,
-            boot_epoch=boot_epoch,
-            state=str(VmState.STARTING),
-            started_at=datetime.now().astimezone(),
-        )
-        instance = VmInstance(
-            view=view,
-            profile=profile,
-            policy=policy,
-            paths=paths,
-            cleanup_root=paths.root,
-            overrides=overrides,
-            persistent_storage=storage is not None,
-        )
-        self._instances[vm_id] = instance
-
-        try:
-            async with asyncio.timeout(profile.timeouts.startup_seconds):
-                await self._provision(
-                    instance,
-                    images,
-                    profile,
-                    binary,
-                    accelerator,
-                    overrides,
-                    storage,
-                    on_storage_ready,
-                )
-        except asyncio.CancelledError:
-            await self._finish_cleanup(self._rollback_start(instance, images))
-            raise
-        except TimeoutError:
-            error = PaletteError(ErrorCode.TIMEOUT, "VM provisioning exceeded its startup budget")
-            view.last_error = ErrorPayload(**error.as_payload())
-            await self._finish_cleanup(self._rollback_start(instance, images))
-            raise error from None
-        except PaletteError as exc:
-            view.last_error = ErrorPayload(**exc.as_payload())
-            await self._finish_cleanup(self._rollback_start(instance, images))
-            raise
-        except Exception as exc:
-            logger.exception("unexpected failure starting %s", vm_id)
-            error = PaletteError(ErrorCode.STARTUP_FAILED, f"startup failed: {type(exc).__name__}")
-            view.last_error = ErrorPayload(**error.as_payload())
-            await self._finish_cleanup(self._rollback_start(instance, images))
-            raise error from exc
-
-        if self.audit:
-            self.audit.record(
-                "vm.started",
+            view = InstanceView(
                 vm_id=vm_id,
                 instance_id=instance_id,
                 profile_id=profile.profile_id,
-                accelerator=accelerator,
+                display_id=profile.devices.display_id,
+                head=profile.devices.head,
                 boot_epoch=boot_epoch,
+                state=str(VmState.STARTING),
+                started_at=datetime.now().astimezone(),
             )
-        return instance
+            instance = VmInstance(
+                view=view,
+                profile=profile,
+                policy=policy,
+                paths=paths,
+                cleanup_root=paths.root,
+                overrides=overrides,
+                persistent_storage=storage is not None,
+            )
+            self._instances[vm_id] = instance
+
+            try:
+                async with asyncio.timeout(profile.timeouts.startup_seconds):
+                    await self._provision(
+                        instance,
+                        images,
+                        profile,
+                        binary,
+                        accelerator,
+                        overrides,
+                        storage,
+                        on_storage_ready,
+                    )
+            except asyncio.CancelledError:
+                await self._finish_cleanup(self._rollback_start(instance, images))
+                raise
+            except TimeoutError:
+                error = PaletteError(
+                    ErrorCode.TIMEOUT, "VM provisioning exceeded its startup budget"
+                )
+                view.last_error = ErrorPayload(**error.as_payload())
+                await self._finish_cleanup(self._rollback_start(instance, images))
+                raise error from None
+            except PaletteError as exc:
+                view.last_error = ErrorPayload(**exc.as_payload())
+                await self._finish_cleanup(self._rollback_start(instance, images))
+                raise
+            except Exception as exc:
+                logger.exception("unexpected failure starting %s", vm_id)
+                error = PaletteError(
+                    ErrorCode.STARTUP_FAILED, f"startup failed: {type(exc).__name__}"
+                )
+                view.last_error = ErrorPayload(**error.as_payload())
+                await self._finish_cleanup(self._rollback_start(instance, images))
+                raise error from exc
+
+            if self.audit:
+                self.audit.record(
+                    "vm.started",
+                    vm_id=vm_id,
+                    instance_id=instance_id,
+                    profile_id=profile.profile_id,
+                    accelerator=accelerator,
+                    boot_epoch=boot_epoch,
+                )
+            return instance
 
     async def _finish_cleanup(self, operation: Coroutine[Any, Any, None]) -> None:
         """Finish owned-resource cleanup even if the requesting task is cancelled again."""
@@ -364,16 +393,8 @@ class VmManager:
         if waiter is not None:
             self._cleanup_waiters.add(waiter)
         task = asyncio.create_task(operation, name="vm-cleanup")
-        cancelled = False
         try:
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    cancelled = True
-            task.result()
-            if cancelled:
-                raise asyncio.CancelledError
+            await join_cleanup(task)
         finally:
             if waiter is not None:
                 self._cleanup_waiters.discard(waiter)
@@ -664,7 +685,7 @@ class VmManager:
 
     # -- stop ------------------------------------------------------------------------
     @staticmethod
-    def _check_identity(
+    def check_identity(
         instance: VmInstance | None, expected_instance_id: str | None, expect_absent: bool = False
     ) -> None:
         if (expect_absent and instance is not None) or (
@@ -675,6 +696,16 @@ class VmManager:
                 ErrorCode.STATE_CONFLICT, "the VM changed during lifecycle authorization"
             )
 
+    async def shutdown_instance(
+        self, vm_id: str, *, mode: ShutdownMode, expected_instance_id: str | None = None
+    ) -> None:
+        if mode is ShutdownMode.GRACEFUL:
+            await self.graceful_stop(vm_id, expected_instance_id=expected_instance_id)
+        else:
+            await self.stop(
+                vm_id, force=mode is ShutdownMode.FORCE, expected_instance_id=expected_instance_id
+            )
+
     async def stop(
         self,
         vm_id: str,
@@ -683,9 +714,9 @@ class VmManager:
         keep_instance: bool = True,
         expected_instance_id: str | None = None,
     ) -> VmInstance:
-        async with self._lock:
+        async with self.operations.hold(vm_id):
             instance = self.get(vm_id)
-            self._check_identity(instance, expected_instance_id)
+            self.check_identity(instance, expected_instance_id)
             try:
                 await self._finish_cleanup(self._stop_locked(instance, force=force))
             finally:
@@ -744,7 +775,7 @@ class VmManager:
             instance.view.state = str(VmState.FAILED)
             raise
         instance.transition(VmState.STOPPED)
-        images = self._images(instance.profile)
+        images = self.images_for(instance.profile)
         if instance.paths.manifest.exists():
             images.update_manifest(instance.paths, {"state": "STOPPED", "process_exited": True})
         if self.audit:
@@ -850,10 +881,10 @@ class VmManager:
         to the base), then start a fresh instance with a new identifier and boot epoch.
         """
         validate_identifier(vm_id, what="vm_id")
-        async with self._lock:
+        async with self.operations.hold(vm_id, starting=True):
             self._require_accepting_starts()
             instance = self.find(vm_id)
-            self._check_identity(instance, expected_instance_id, expect_absent)
+            self.check_identity(instance, expected_instance_id, expect_absent)
             profile = instance.profile if instance is not None else self.config.profile(profile_id)
             overrides = instance.overrides if instance is not None else LaunchOverrides()
             try:
@@ -869,42 +900,16 @@ class VmManager:
             finally:
                 self._apply_retention(vm_id, profile)
 
-    def _images(self, profile: Profile) -> ImageManager:
-        return ImageManager(
-            PathGuard(self.config.runtime_root),
-            profile,
-            max_overlays=profile.retention.max_overlays,
-            keep_overlays=profile.retention.keep_overlays,
-        )
+    def images_for(self, profile: Profile) -> ImageManager:
+        return self.storage.images_for(profile)
 
     def _apply_retention(self, vm_id: str, profile: Profile) -> None:
-        keep = {
-            instance.view.instance_id
-            for instance in self._instances.values()
-            if instance.view.vm_id == vm_id
-            and (
-                instance.state not in {VmState.STOPPED, VmState.FAILED}
-                or (instance.process is not None and instance.process.returncode is None)
-            )
-        }
-        protected: list[Path] = list(self.persistent_roots)
-        for instance in self._instances.values():
-            if instance.process is not None and instance.process.returncode is None:
-                protected.append(instance.paths.root)
-                protected.append(instance.paths.overlay)
-                protected.append(instance.overrides.image or Path(instance.profile.images.base))
-                protected.extend(Path(volume.path) for volume in instance.overrides.volumes)
-        try:
-            self._images(profile).prune_instances(
-                vm_id, keep_instance_ids=keep, protected_paths=tuple(protected)
-            )
-        except (PaletteError, OSError) as exc:
-            logger.warning("retention deferred for %s: %s", vm_id, type(exc).__name__)
+        self.storage.prune(vm_id, profile, list(self._instances.values()))
 
     async def take_control(self, vm_id: str, *, expected_instance_id: str | None = None) -> int:
-        async with self._lock:
+        async with self.operations.hold(vm_id):
             instance = self.get(vm_id)
-            self._check_identity(instance, expected_instance_id)
+            self.check_identity(instance, expected_instance_id)
             instance.view.controller_epoch += 1
             if instance.controller is not None:
                 instance.controller.invalidate(reason="control changed hands")
@@ -913,9 +918,9 @@ class VmManager:
 
     async def graceful_stop(self, vm_id: str, *, expected_instance_id: str | None = None) -> None:
         """Desktop shutdown: a failed ACPI request must never turn into a kill."""
-        async with self._lock:
+        async with self.operations.hold(vm_id):
             instance = self.get(vm_id)
-            self._check_identity(instance, expected_instance_id)
+            self.check_identity(instance, expected_instance_id)
             if instance.process is None or instance.process.returncode is not None:
                 await self._finish_cleanup(self._stop_locked(instance, force=False))
                 return
@@ -954,26 +959,28 @@ class VmManager:
         return stopped
 
     def _require_accepting_starts(self) -> None:
-        if self._runtime_stopping:
+        if self._runtime_stopping or self.operations.closing:
             raise PaletteError(ErrorCode.STATE_CONFLICT, "the runtime is stopping")
 
     async def prepare_runtime_stop(self) -> None:
         """Seal the start gate only when every QEMU process has actually exited."""
-        async with self._lock:
-            if any(
-                instance.process is not None and instance.process.returncode is None
-                for instance in self._instances.values()
-            ):
-                raise PaletteError(
-                    ErrorCode.STATE_CONFLICT,
-                    "virtual machines are still running; shut them down before exiting",
-                )
-            self._runtime_stopping = True
+        if self.operations.starting or any(
+            instance.process is not None and instance.process.returncode is None
+            for instance in self._instances.values()
+        ):
+            raise PaletteError(
+                ErrorCode.STATE_CONFLICT,
+                "virtual machines are still running; shut them down before exiting",
+            )
+        self._runtime_stopping = True
+        self.operations.closing = True
 
     async def shutdown(self) -> None:
         await self._finish_cleanup(self._shutdown_all())
 
     async def _shutdown_all(self) -> None:
+        await self.operations.seal()
+        await self.probe.close()
         failure: Exception | None = None
         for vm_id in list(self._instances):
             try:
@@ -1019,7 +1026,7 @@ class VmManager:
         if instance.stop_requested:
             return
         if instance.guest_shutdown and code == 0:
-            async with self._lock:
+            async with self.operations.hold(instance.view.vm_id):
                 if self.find(instance.view.vm_id) is not instance or instance.stop_requested:
                     return
                 await self._finish_cleanup(self._stop_locked(instance, force=False))
@@ -1091,7 +1098,7 @@ class VmManager:
             )
         self._refresh_guest_tools(instance)
         with contextlib.suppress(PaletteError, OSError):
-            self._images(instance.profile).update_manifest(
+            self.images_for(instance.profile).update_manifest(
                 instance.paths, {"host_boot_epoch": epoch}
             )
         if self.audit:

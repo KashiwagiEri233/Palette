@@ -95,15 +95,37 @@ class CapabilityProbe:
     def __init__(self, host: HostConfig) -> None:
         self.host = host
         self.cache: dict[tuple[str, ...], dict[str, Any]] = {}
+        self._pending: dict[tuple[str, ...], asyncio.Task[dict[str, Any]]] = {}
 
     async def get(self, profile: Profile) -> dict[str, Any]:
         binary = locate_binary(profile, self.host)
         if binary is None:
             return self._empty("未找到 QEMU; 请先配置运行环境")
         key = (binary, *profile.qemu.argv_prefix, profile.qemu.arch, profile.devices.display_model)
-        if key not in self.cache:
-            self.cache[key] = await self._probe(profile, binary)
-        return self.cache[key]
+        if key in self.cache:
+            return self.cache[key]
+        task = self._pending.get(key)
+        if task is None:
+            task = asyncio.create_task(self._probe(profile, binary), name="hardware-probe")
+            self._pending[key] = task
+
+            def completed(done: asyncio.Task[dict[str, Any]]) -> None:
+                self._pending.pop(key, None)
+                if not done.cancelled() and done.exception() is None:
+                    result = done.result()
+                    if result["available"]:
+                        self.cache[key] = result
+
+            task.add_done_callback(completed)
+        return await asyncio.shield(task)
+
+    async def close(self) -> None:
+        tasks = list(self._pending.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._pending.clear()
 
     @staticmethod
     def _empty(reason: str) -> dict[str, Any]:

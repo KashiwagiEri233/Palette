@@ -29,6 +29,7 @@ from typing import Any
 from . import __version__
 from .audit import AuditLog
 from .config import PaletteConfig, find_config_root, load_config
+from .contracts import AgentService
 from .errors import ErrorCode, PaletteError
 from .operator import OperatorClient
 from .platforms import execution_info, validate_target
@@ -238,7 +239,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         if config.host.audit_enabled
         else NullAuditLog()
     )
-    service = PaletteService(config, audit=audit)
+    service: AgentService = PaletteService(config, audit=audit)
     if not args.standalone:
         from .agent_ipc import RemoteService, discover
         from .operator.protocol import Endpoint

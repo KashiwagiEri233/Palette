@@ -6,11 +6,11 @@ import asyncio
 import secrets
 import struct
 import uuid
-from collections import OrderedDict
 from typing import Any, Literal
 
 from pydantic import Field
 
+from .cleanup import close_all
 from .config import PaletteConfig
 from .errors import ErrorCode, PaletteError
 from .models import (
@@ -24,6 +24,7 @@ from .models import (
     WaitResult,
 )
 from .operator.client import OperatorClient
+from .operator.listener import LocalListener
 from .operator.paths import IS_WINDOWS, RuntimePaths
 from .operator.protocol import (
     Channel,
@@ -34,6 +35,7 @@ from .operator.protocol import (
     receive_frame,
     send_frame,
 )
+from .operator.requests import RequestRegistry
 from .operator.server import OperatorServer
 from .operator.unix import UnixChannel
 from .service import PaletteService
@@ -69,25 +71,25 @@ class AgentResponse(Response):
     image_bytes: int = Field(default=0, ge=0, le=MAX_IMAGE_BYTES)
 
 
-class AgentServer(OperatorServer):
-    def __init__(
-        self, service: PaletteService, operator: OperatorServer, desktop: Any = None
-    ) -> None:
-        super().__init__(service)
-        self.desktop = desktop
+class AgentServer:
+    def __init__(self, service: PaletteService, operator: OperatorServer) -> None:
+        self.service = service
         self.paths = RuntimePaths(service.config.runtime_root / ".agent-ipc")
-        self.endpoint = self.endpoint.model_copy(
-            update={"address": self.paths.address(self.endpoint.generation)}
+        generation = uuid.uuid4().hex
+        self.endpoint = operator.endpoint.model_copy(
+            update={
+                "address": self.paths.address(generation),
+                "generation": generation,
+                "token": secrets.token_hex(32),
+            }
         )
-        self._agent_requests: OrderedDict[
-            str, tuple[str, asyncio.Task[tuple[AgentResponse, bytes]]]
-        ] = OrderedDict()
+        self.listener = LocalListener(self.paths, self.endpoint, self._handle)
+        self.requests = RequestRegistry[tuple[AgentResponse, bytes]](
+            pending_limit=8, retained_limit=4
+        )
 
-    def acquire(self) -> None:
-        self.paths.prepare()
-
-    def release(self) -> None:
-        pass
+    async def start(self) -> None:
+        await self.listener.start()
 
     async def _handle(self, channel: Channel) -> None:
         try:
@@ -98,26 +100,23 @@ class AgentServer(OperatorServer):
                 request.token, self.endpoint.token
             ):
                 return
-            fingerprint = request.command.model_dump_json()
-            cached = self._agent_requests.get(request.request_id)
-            if cached is not None and cached[0] != fingerprint:
-                raise PaletteError(ErrorCode.REQUEST_ID_CONFLICT, "Agent request arguments changed")
-            if cached is None:
-                if sum(not task.done() for _, task in self._agent_requests.values()) >= 8:
-                    raise PaletteError(ErrorCode.BUSY, "Agent request capacity reached")
-                task = asyncio.create_task(self._execute_agent(request))
-                self._agent_requests[request.request_id] = (fingerprint, task)
-                task.add_done_callback(lambda _: self._trim_agent_requests())
-            else:
-                task = cached[1]
-            response, image = await asyncio.shield(task)
-            await send_frame(channel, response)
-            await channel.write(struct.pack(">I", len(image)) + image)
-            for key, (_, completed) in list(self._agent_requests.items()):
-                if len(self._agent_requests) <= 4:
-                    break
-                if completed.done():
-                    self._agent_requests.pop(key, None)
+            try:
+                response, image = await self.requests.execute(
+                    request.request_id,
+                    request.command.model_dump_json(),
+                    lambda: self._execute_agent(request),
+                )
+            except PaletteError as exc:
+                response = AgentResponse(
+                    generation=self.endpoint.generation,
+                    request_id=request.request_id,
+                    ok=False,
+                    error=ErrorPayload(**exc.as_payload()),
+                )
+                image = b""
+            async with asyncio.timeout(10):
+                await send_frame(channel, response)
+                await channel.write(struct.pack(">I", len(image)) + image)
         except (
             OSError,
             EOFError,
@@ -130,13 +129,6 @@ class AgentServer(OperatorServer):
         finally:
             await channel.close()
 
-    def _trim_agent_requests(self) -> None:
-        for key, (_, task) in list(self._agent_requests.items()):
-            if len(self._agent_requests) <= 4:
-                break
-            if task.done():
-                self._agent_requests.pop(key, None)
-
     async def _execute_agent(self, request: AgentRequest) -> tuple[AgentResponse, bytes]:
         image = b""
         try:
@@ -147,45 +139,7 @@ class AgentServer(OperatorServer):
             method = request.command.method
             result: Any
             async with asyncio.timeout(self.endpoint.operation_timeout_seconds):
-                if (
-                    self.desktop is not None
-                    and vm_id in self.desktop.definitions
-                    and method in {"start", "stop", "reset"}
-                ):
-                    self.service.control.require_agent(vm_id)
-                    definition = self.desktop.get(vm_id)
-                    from .policy import PathGuard, Policy
-
-                    policy = Policy(definition.profile, PathGuard(self.service.config.runtime_root))
-                    policy.require_lifecycle(
-                        "force_stop" if method == "stop" and parameters.get("force") else method,
-                        actor="agent",
-                    )
-                    if method == "start":
-                        if parameters.get("profile_id") not in (None, definition.draft.profile_id):
-                            raise PaletteError(
-                                ErrorCode.INVALID_ARGUMENT,
-                                "persistent VM profile is configured by the operator",
-                            )
-                        if any(
-                            parameters.get(key) is not None
-                            for key in ("image", "image_format", "iso", "extra_disks", "qemu_args")
-                        ):
-                            raise PaletteError(
-                                ErrorCode.INVALID_ARGUMENT,
-                                "persistent VM storage is configured by the operator",
-                            )
-                        info = await self.desktop.start(vm_id)
-                    elif method == "stop":
-                        info = await self.desktop.stop(
-                            vm_id,
-                            force=parameters.get("force", False),
-                            expected_instance_id=parameters.get("expected_instance_id"),
-                        )
-                    else:
-                        info = await self.desktop.reset(vm_id)
-                    result = LifecycleResult(ok=True, **info)
-                elif method == "status":
+                if method == "status":
                     result = await self.service.status(vm_id, **parameters)
                 elif method == "observe_image":
                     result, image = await self.service.observe_image(vm_id, **parameters)
@@ -243,19 +197,21 @@ class AgentServer(OperatorServer):
                     ).as_payload()
                 ),
             ), b""
+        except Exception:
+            return AgentResponse(
+                generation=self.endpoint.generation,
+                request_id=request.request_id,
+                ok=False,
+                error=ErrorPayload(
+                    **PaletteError(ErrorCode.INTERNAL_ERROR, "Agent operation failed").as_payload()
+                ),
+            ), b""
 
     async def stop(self) -> None:
-        for _, task in self._agent_requests.values():
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(
-            *(task for _, task in self._agent_requests.values()), return_exceptions=True
-        )
-        self._agent_requests.clear()
-        await super().stop()
+        await close_all((self.listener.close, self.requests.close))
 
 
-class RemoteService(PaletteService):
+class RemoteService:
     """MCP adapter; never owns or shuts down the VM service."""
 
     def __init__(
@@ -298,10 +254,10 @@ class RemoteService(PaletteService):
                 or response.generation != endpoint.generation
             ):
                 raise ValueError("Agent response identity mismatch")
-            size = struct.unpack(">I", await channel.readexactly(4))[0]
-            if size != response.image_bytes or size > MAX_IMAGE_BYTES:
-                raise ValueError("Agent image length mismatch")
             async with asyncio.timeout(10):
+                size = struct.unpack(">I", await channel.readexactly(4))[0]
+                if size != response.image_bytes or size > MAX_IMAGE_BYTES:
+                    raise ValueError("Agent image length mismatch")
                 image = await channel.readexactly(size)
             if response.error is not None:
                 raise PaletteError(

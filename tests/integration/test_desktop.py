@@ -55,11 +55,9 @@ async def test_runtime_stop_requires_exited_processes_and_seals_starts(
             with pytest.raises(PaletteError):
                 await client.call("daemon.stop")
         await owner.desktop.stop(vm_id)
-        async with service.manager._lock:
-            stop = asyncio.create_task(owner.route(DesktopCommand(method="runtime.stop")))
-            await asyncio.sleep(0)
-            start = asyncio.create_task(service.manager.start(vm_id))
-            await asyncio.sleep(0)
+        stop = asyncio.create_task(owner.route(DesktopCommand(method="runtime.stop")))
+        await asyncio.sleep(0)
+        start = asyncio.create_task(service.manager.start(vm_id))
         assert await stop == {"stopping": True}
         with pytest.raises(PaletteError) as sealed:
             await start
@@ -262,8 +260,8 @@ async def test_display_ticket_is_single_use_and_disconnect_releases(
     revoked = asyncio.Event()
     original_revoke = service.control.revoke
 
-    async def revoke(vm_id: str) -> bool:
-        confirmed = await original_revoke(vm_id)
+    async def revoke(vm_id: str, **kwargs) -> bool:
+        confirmed = await original_revoke(vm_id, **kwargs)
         revoked.set()
         return confirmed
 

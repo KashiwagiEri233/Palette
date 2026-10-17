@@ -15,6 +15,7 @@
 | --- | --- |
 | [项目总览 (../README.zh-CN.md)](../README.zh-CN.md) · [English](../README.md) | 架构全景、核心特性、快速开始与安全默认开关速览 |
 | [桌面应用指南 (desktop.zh-CN.md)](desktop.zh-CN.md) · [English](desktop.md) | Palette Desktop 源码运行、持久虚拟机创建、离线硬件配置、只读画面网关、人工独占接管与共用后台 |
+| [后端资源所有权与并发](backend-architecture.zh-CN.md) · [English](backend-architecture.md) | 应用职责、按 VM 并发、磁盘引用与取消后的资源清理 |
 | [桌面 GUI 与内置 Agent 设计规范 (desktop-agent-design.zh-CN.md)](desktop-agent-design.zh-CN.md) · [English](desktop-agent-design.md) | 待实现的四区布局、组件状态、接管与审批时序、类型化 IPC 草案、主题 token 和分阶段验收 |
 | [Agent 与客户端用户指南 (user-guide.zh-CN.md)](user-guide.zh-CN.md) · [English](user-guide.md) | 面向 Agent 与 MCP 客户端开发者：10 个 MCP 工具契约、`vm_observe → vm_act` 工作循环、帧代次防抖、文本规则与错误码恢复 |
 | [宿主机运维指南 (operator.zh-CN.md)](operator.zh-CN.md) · [English](operator.md) | 面向宿主机管理员：环境检查、`daemon` 与 `serve` 协同、Profile 配置、生命周期控制、紧急停止、保留策略与故障恢复 |
@@ -35,9 +36,9 @@
 | --- | --- |
 | `src/palette/cli.py` | 运维 CLI 入口：`doctor`、`serve`、`daemon`、`config` 与 `vm` 生命周期命令 |
 | `src/palette/server.py` | MCP 工具表面：工具注册、输入输出 Schema、`ImageContent` 与结构化错误封装 |
-| `src/palette/service.py` | 核心业务协调器：权限策略检查、每 VM 串行动作队列、帧代次校验、生命周期与审计记录 |
+| `src/palette/service.py` / `contracts.py` / `lifecycle.py` | 本地/远程业务接口、观察与动作编排及统一生命周期规则 |
 | `src/palette/runtime.py` | 共享 `RuntimeOwner`：统一托管 `OperatorServer`、`DesktopManager`、`DisplayGateway` 与 MCP 远程代理 |
-| `src/palette/desktop.py` | 持久虚拟机定义管理（`<runtime>/definitions`）、受管磁盘安全扩容、硬件设置应用与恢复初始状态 |
+| `src/palette/desktop.py` / `definitions.py` / `persistent_storage.py` | 持久化 VM 设置、定义原子存储、磁盘扩容与恢复 |
 | `src/palette/vm_settings.py` | 强类型虚拟机硬件配置模型（CPU/内存/磁盘/启动/显示/网络/音频）与本机 QEMU 能力探测 |
 | `src/palette/display.py` | 仅监听本机的 WebSocket RFB 只读画面网关：一次性显示票据验证与客户端写入消息过滤 |
 | `src/palette/control.py` | 人机独占控制权租约管理：3 秒心跳续期、`controller_epoch` 演进与输入释放联动 |

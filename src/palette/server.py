@@ -26,6 +26,7 @@ from anyio import CancelScope
 from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 
+from .contracts import AgentService
 from .errors import ErrorCode, PaletteError
 from .models import (
     Action,
@@ -69,17 +70,16 @@ Things that will save you time:
 """
 
 
-def build_server(service: PaletteService) -> MCPServer:
+def build_server(service: AgentService) -> MCPServer:
     """Wire the service into an MCP server. All authorization stays server-side."""
 
     stopping = asyncio.Event()
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[dict[str, Any]]:
-        from .agent_ipc import RemoteService
         from .runtime import RuntimeOwner
 
-        if isinstance(service, RemoteService):
+        if not isinstance(service, PaletteService):
             yield {}
             return
         owner = RuntimeOwner(service)
@@ -106,7 +106,7 @@ def build_server(service: PaletteService) -> MCPServer:
     return server
 
 
-def register_baseline_tools(server: MCPServer, service: PaletteService) -> None:
+def register_baseline_tools(server: MCPServer, service: AgentService) -> None:
     @server.tool(
         name="vm_status",
         title="VM status",
@@ -229,7 +229,7 @@ def register_baseline_tools(server: MCPServer, service: PaletteService) -> None:
         return _success(result, is_error=not result.ok)
 
 
-def register_lifecycle_tools(server: MCPServer, service: PaletteService) -> None:
+def register_lifecycle_tools(server: MCPServer, service: AgentService) -> None:
     """Expose lifecycle tools. Their presence is not permission: each call is gated by
     the trusted profile, so an agent cannot authorise itself by calling the tool."""
 
@@ -306,7 +306,7 @@ def register_lifecycle_tools(server: MCPServer, service: PaletteService) -> None
         return _success(result)
 
 
-def register_guest_tools(server: MCPServer, service: PaletteService) -> None:
+def register_guest_tools(server: MCPServer, service: AgentService) -> None:
     """Register the retained guest enhancement tools.
 
     They are registered only when a profile enables the channel, and every call still

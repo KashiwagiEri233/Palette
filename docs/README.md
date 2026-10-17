@@ -15,6 +15,7 @@ Two core invariants run through every page:
 | --- | --- |
 | [Project Overview (../README.md)](../README.md) · [简体中文](../README.zh-CN.md) | Architecture overview, key features, quick start, and safety default switches |
 | [Desktop Guide (desktop.md)](desktop.md) · [简体中文](desktop.zh-CN.md) | Running Palette Desktop from source, persistent VM creation, offline hardware settings, read-only RFB gateway, human takeover, and shared daemon usage |
+| [Backend Ownership & Concurrency](backend-architecture.md) · [简体中文](backend-architecture.zh-CN.md) | Application boundaries, per-VM operations, disk references and cancellation-safe cleanup |
 | [Desktop GUI and Built-in Agent Design (desktop-agent-design.md)](desktop-agent-design.md) · [简体中文](desktop-agent-design.zh-CN.md) | Proposed four-region layouts, component states, takeover/approval sequences, typed IPC draft, theme tokens, and staged acceptance |
 | [Agent \& Client User Guide (user-guide.md)](user-guide.md) · [简体中文](user-guide.zh-CN.md) | For agent and MCP client authors: the 10 MCP tools, `vm_observe → vm_act` loop, frame epoch guards, text rules, and error recovery |
 | [Operator Runbook (operator.md)](operator.md) · [简体中文](operator.zh-CN.md) | For host administrators: host probing, `daemon` vs `serve`, profiles, lifecycle commands, emergency stop, retention, and fault recovery |
@@ -35,9 +36,9 @@ Two core invariants run through every page:
 | --- | --- |
 | `src/palette/cli.py` | Operator CLI entry point: `doctor`, `serve`, `daemon`, `config`, and `vm` lifecycle commands |
 | `src/palette/server.py` | MCP tool surface: tool registration, input/output schemas, `ImageContent` encoding, and structured errors |
-| `src/palette/service.py` | Core coordinator: policy checks, per-VM serialized action queue, frame epoch guards, lifecycle, and auditing |
+| `src/palette/service.py` / `contracts.py` / `lifecycle.py` | Typed local/remote business interface, observation/action orchestration and shared lifecycle rules |
 | `src/palette/runtime.py` | Shared `RuntimeOwner`: hosts `OperatorServer`, `DesktopManager`, `DisplayGateway`, and MCP remote proxying |
-| `src/palette/desktop.py` | Persistent VM definitions (`<runtime>/definitions`), safe offline disk expansion, hardware settings, and initial-state reset |
+| `src/palette/desktop.py` / `definitions.py` / `persistent_storage.py` | Persistent VM settings, atomic definition storage, disk expansion and recovery |
 | `src/palette/vm_settings.py` | Typed VM hardware configuration models (CPU/RAM/disk/boot/display/network/audio) and local QEMU capability probing |
 | `src/palette/display.py` | Localhost-only WebSocket RFB read-only display gateway with one-time tickets and client write filtering |
 | `src/palette/control.py` | Human-agent exclusive control lease manager: 3-second heartbeat renewal, `controller_epoch` bumps, and input release |

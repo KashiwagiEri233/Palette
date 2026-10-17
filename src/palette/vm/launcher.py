@@ -239,6 +239,37 @@ def probe_binary(
     return probe
 
 
+async def probe_binary_async(
+    binary: str, *, timeout: float = 20.0, prefix: Sequence[str] = ()
+) -> QemuProbe:
+    """Probe without blocking other VMs; run_tool owns cancellation and reaping."""
+    probe = QemuProbe(binary=binary)
+    launch = [binary, *prefix]
+    try:
+        code, output, _ = await run_tool([*launch, "--version"], timeout=timeout)
+        if code:
+            probe.error = f"--version exited with {code}"
+            return probe
+        match = _VERSION_RE.search(output)
+        probe.found = True
+        probe.version = (
+            match.group(1) if match else output.splitlines()[0].strip() if output else None
+        )
+        code, output, _ = await run_tool([*launch, "-accel", "help"], timeout=timeout)
+        if not code:
+            probe.accelerators = sorted(
+                {
+                    line.strip()
+                    for line in output.splitlines()
+                    if line.strip() and not line.strip().startswith("Accelerators")
+                }
+            )
+    except (OSError, TimeoutError, PaletteError) as exc:
+        if not probe.found:
+            probe.error = type(exc).__name__
+    return probe
+
+
 def require_accelerator(profile: Profile, probe: QemuProbe) -> str:
     """Return the accelerator to use, or fail loudly.
 
