@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { ImperativePanelHandle } from 'react-resizable-panels'
-import { MoreHorizontal, PanelRightClose, PanelRightOpen, Plus, Sparkles, ChevronDown, Monitor } from '@/components/icons/workbench'
+import { MoreHorizontal, PanelRightClose, PanelRightOpen, Plus, Sparkles, Monitor } from '@/components/icons/workbench'
 import { Card, CardHeader } from '@/components/ui/card'
 import { EmptyState } from '@/components/ui/empty-state'
 import { AgentChat } from '@/components/ui/agent-chat'
@@ -17,10 +17,11 @@ import { useViewportWidth } from './DesktopShell'
 import type { Conversation } from '../../shared/workspace'
 import type { VmRecord } from '../../shared/types'
 import type { LayoutPreferences } from '@/lib/layout'
-import { activeRun } from '../../shared/agent'
+import { activeRun, type AgentConfiguration } from '../../shared/agent'
 import { useAgent, useAgentSettings } from '../lib/use-agent'
 import { MessageMarkdown } from './MessageMarkdown'
 import { ContextUsage } from './ContextUsage'
+import { ModelSelector } from './ModelSelector'
 
 interface Props {
   conversation: Conversation
@@ -43,17 +44,31 @@ interface Props {
 
 export function ConversationPage(props: Props) {
   const { snapshot, refresh } = useAgent(props.conversation.vm_id, props.conversation.id, props.reportError)
-  const { settings } = useAgentSettings()
+  const { settings, reload } = useAgentSettings()
+  const [changingModel, setChangingModel] = useState(false)
+  const modelUpdate = useRef(false)
   const [sending, setSending] = useState(false)
   const [operationBusy, setOperationBusy] = useState(false)
   const view = snapshot?.view
   const running = activeRun(view?.run)
   const configured = !!settings?.credentialConfigured && !!settings.configuration.modelId
   const send = async () => {
-    if (sending || running) return
+    if (sending || running || modelUpdate.current) return
     setSending(true)
     try { await props.onSend(props.conversation.draft); await refresh() }
     catch (error) { props.reportError(error) } finally { setSending(false) }
+  }
+  const selectModel = async (configuration: AgentConfiguration) => {
+    if (modelUpdate.current || sending || running || operationBusy || view?.compacting) return false
+    modelUpdate.current = true
+    setChangingModel(true)
+    try {
+      await window.palette.request('agent.settings.update', undefined, { configuration })
+      await reload()
+      window.dispatchEvent(new Event('palette-agent-settings'))
+      return true
+    } catch (error) { props.reportError(error); return false }
+    finally { modelUpdate.current = false; setChangingModel(false) }
   }
   const compact = async () => {
     setOperationBusy(true)
@@ -92,7 +107,7 @@ export function ConversationPage(props: Props) {
     composer={<div className="conversation-composer">
       {vm && vm.status.state !== 'RUNNING' && <div className="composer-notice"><span>虚拟机未运行</span><Button variant="ghost" size="sm" disabled={props.busy || ['STARTING', 'STOPPING', 'PAUSED'].includes(vm.status.state)} onClick={() => props.onAction(vm, 'start')}>启动</Button></div>}
       {!configured && <div className="composer-notice"><span>Agent 尚未配置</span><Button variant="ghost" size="sm" onClick={props.onAgentSettings}>前往设置</Button></div>}
-      <PromptInput value={props.conversation.draft} onValueChange={value => props.onDraft(props.conversation.id, value)} onSend={() => void send()} running={running} onStop={() => { void window.palette.request('agent.stop', props.conversation.vm_id, { conversationId: props.conversation.id }).then(refresh).catch(props.reportError) }} sendDisabled={!configured || sending || operationBusy || !!view?.compacting || !!settings?.configuration.vision && vm?.status.state !== 'RUNNING'} disabled={props.conversation.archived || !vm || sending} footer={<><IconButton label="附加文件（尚不可用）" disabled><Plus size={16} /></IconButton><Badge variant="secondary">{vm?.name ?? '虚拟机不可用'}</Badge></>} actions={<><ContextUsage usage={view?.contextUsage} compacting={operationBusy || !!view?.compacting} compactDisabled={running || !view?.messages.length || !!props.conversation.archived || !configured} onCompact={() => void compact()} /><Button variant="ghost" size="sm" className="composer-model-select" aria-label="选择模型" onClick={props.onAgentSettings}><span>{settings?.configuration.modelId || '选择模型'}</span><ChevronDown size={12} /></Button></>} />
+      <PromptInput value={props.conversation.draft} onValueChange={value => props.onDraft(props.conversation.id, value)} onSend={() => void send()} running={running} onStop={() => { void window.palette.request('agent.stop', props.conversation.vm_id, { conversationId: props.conversation.id }).then(refresh).catch(props.reportError) }} sendDisabled={!configured || sending || changingModel || operationBusy || !!view?.compacting || !!settings?.configuration.vision && vm?.status.state !== 'RUNNING'} disabled={props.conversation.archived || !vm || sending} footer={<><IconButton label="附加文件（尚不可用）" disabled><Plus size={16} /></IconButton><Badge variant="secondary">{vm?.name ?? '虚拟机不可用'}</Badge></>} actions={<><ContextUsage usage={view?.contextUsage} compacting={operationBusy || !!view?.compacting} compactDisabled={running || changingModel || !view?.messages.length || !!props.conversation.archived || !configured} onCompact={() => void compact()} /><ModelSelector onSettings={props.onAgentSettings} settings={settings} disabled={running || sending || changingModel || operationBusy || !!view?.compacting || !!props.conversation.archived} onSelect={selectModel} /></>} />
       <div className="composer-caption" role="status">{props.conversation.archived ? '已归档的对话为只读' : props.draftState === 'error' ? <>草稿保存失败 <Button variant="ghost" size="sm" onClick={props.onRetrySave}>重试保存</Button></> : props.draftState === 'saving' ? '正在保存草稿…' : '草稿已保存在本机'}</div>
     </div>}>
     <ScrollArea className="conversation-scroll">

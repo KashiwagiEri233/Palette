@@ -68,9 +68,9 @@ async function environment() {
   const events: AgentEvent[] = []
   const create = (scope = 'configuration') => new PiAgentService(root, join(root, scope), () => root, encryption, async () => conversations, event => events.push(event), async () => client)
   const service = create()
-  const configuration: AgentConfiguration = { providerId: 'custom', modelId: 'fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${address.port}/v1`, custom: true, contextWindow: 128000, maxTokens: 1024, vision: true, reasoning: false, thinkingLevel: 'off', maxSteps: 100 }
+  const configuration: AgentConfiguration = { providerId: 'custom-fixture', modelId: 'fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${address.port}/v1`, custom: true, contextWindow: 128000, maxTokens: 1024, vision: true, reasoning: false, thinkingLevel: 'off', maxSteps: 100 }
+  await service.saveProvider({ id: configuration.providerId, name: 'Fixture', api: configuration.api, baseUrl: configuration.baseUrl, models: [{ ...configuration, id: configuration.modelId, name: configuration.modelId }] }, 'test-secret')
   await service.updateSettings(configuration)
-  await service.configureCredential('palette-custom', 'test-secret')
   return { root, id, service, create, conversations, client, requests, events, configuration, slow: () => { slow = true }, fail: () => { fail = true }, measure: () => { measuredUsage = true },
     close: async () => { await service.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); await rm(root, { recursive: true, force: true }) } }
 }
@@ -130,6 +130,9 @@ it('stops a slow response, rejects same-VM competition and never dispatches late
   try {
     test.slow()
     await test.service.start('vm', test.id, 'slow task', randomUUID())
+    await expect(test.service.saveProvider({ id: test.configuration.providerId, name: 'Busy', api: test.configuration.api, baseUrl: test.configuration.baseUrl, models: [] })).rejects.toThrow('停止运行中的任务')
+    await expect(test.service.deleteProvider(test.configuration.providerId)).rejects.toThrow('停止运行中的任务')
+    await expect(test.service.configureCredential(test.configuration.providerId, null)).rejects.toThrow('停止运行中的任务')
     test.conversations.push({ ...test.conversations[0], id: randomUUID() })
     await expect(test.service.start('vm', test.conversations[1].id, 'competing task', randomUUID())).rejects.toThrow('已有运行中的任务')
     await new Promise(resolve => setTimeout(resolve, 80))
@@ -176,7 +179,7 @@ it.each(['limit', 'unknown'])('halts the SDK tool loop on %s without replaying i
 it('compacts real SDK history and retains earlier conversation branches', async () => {
   const test = await environment()
   try {
-    await test.service.updateSettings({ ...test.configuration, vision: false, contextWindow: 12000 })
+    await test.service.saveProvider({ id: test.configuration.providerId, name: 'Fixture', api: test.configuration.api, baseUrl: test.configuration.baseUrl, models: [{ ...test.configuration, id: test.configuration.modelId, name: test.configuration.modelId, vision: false, contextWindow: 12000 }] })
     for (let i = 0; i < 3; i++) {
       await test.service.start('vm', test.id, `Message ${i}: ${'context '.repeat(1000)}`, randomUUID())
       expect((await settled(test.service, test.id)).view.run?.state).toBe('completed')

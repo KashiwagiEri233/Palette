@@ -47,7 +47,7 @@ function SelectScrollUpButton({
 }: WithClassName<SelectPrimitive.ScrollUpArrow.Props>) {
   return (
     <SelectPrimitive.ScrollUpArrow
-      className={cn("top-0 flex w-full cursor-default items-center justify-center py-1", className)}
+      className={cn("inset-x-0 top-0 z-10 flex cursor-default items-center justify-center bg-popover py-1", className)}
       {...props}
     >
       <NavArrowDownIcon aria-hidden="true" className="h-4 w-4 rotate-180" />
@@ -62,7 +62,7 @@ function SelectScrollDownButton({
 }: WithClassName<SelectPrimitive.ScrollDownArrow.Props>) {
   return (
     <SelectPrimitive.ScrollDownArrow
-      className={cn("bottom-0 flex w-full cursor-default items-center justify-center py-1", className)}
+      className={cn("inset-x-0 bottom-0 z-10 flex cursor-default items-center justify-center bg-popover py-1", className)}
       {...props}
     >
       <NavArrowDownIcon aria-hidden="true" className="h-4 w-4" />
@@ -102,7 +102,7 @@ function SelectContent({
           data-slot="select-popup"
           style={{ ...cashmereGrainStyle, ...style }}
           className={cn(
-            "relative z-50 max-h-96 min-w-[8rem] overflow-hidden",
+            "relative z-50 flex max-h-[min(24rem,var(--available-height))] min-w-[8rem] flex-col overflow-hidden",
             "rounded-xl border border-border",
             "bg-popover text-popover-foreground",
             "[box-shadow:var(--shadow-l)]",
@@ -118,9 +118,9 @@ function SelectContent({
           <SelectScrollUpButton />
           <SelectPrimitive.List
             className={cn(
-              "p-1",
+              "min-h-0 overflow-y-auto p-1",
               !alignItemWithTrigger &&
-                "max-h-[var(--available-height)] w-full min-w-[var(--anchor-width)] overflow-y-auto"
+                "w-full min-w-[var(--anchor-width)]"
             )}
           >
             {children}

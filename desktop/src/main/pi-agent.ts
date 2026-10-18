@@ -5,14 +5,15 @@ import { calculateContextTokens, createAgentSession, DefaultResourceLoader, esti
 import type { TextContent, ImageContent } from '@earendil-works/pi-ai'
 import { Type } from 'typebox'
 import type { Conversation } from '../shared/workspace'
-import { activeRun, type AgentConfiguration, type AgentSettings, type AgentView, type AgentSnapshot, type AgentEvent, type AgentRunView, type AgentMessageView, type AgentTreeEntry, type AgentApiKind, type AgentContextUsage } from '../shared/agent'
+import { activeRun, type AgentConfiguration, type AgentSettings, type AgentView, type AgentSnapshot, type AgentEvent, type AgentRunView, type AgentMessageView, type AgentTreeEntry, type AgentApiKind, type AgentContextUsage, type AgentModelDefinition, type AgentModelDiscovery, type AgentModel } from '../shared/agent'
 import { AgentClient, type AgentReply } from './agent-client'
 import { AgentCredentials, atomicJson, readJson, type SecretEncryption } from './agent-storage'
 import { UnavailableGuestProgramming } from './guest-programming'
 import { BackendError } from './ipc'
+import { AgentProviderStore, agentApis as apis, defaultConfiguration, validateAgentConfiguration, validateProvider, validateKey, validateBaseUrl, type AgentProviderState } from './agent-providers'
+import { discoverAgentModels } from './agent-model-discovery'
+export { validateAgentConfiguration } from './agent-providers'
 
-const apis = new Set<AgentApiKind>(['openai-completions', 'openai-responses', 'anthropic-messages', 'google-generative-ai'])
-const defaultConfiguration: AgentConfiguration = { providerId: 'openai', modelId: '', api: 'openai-responses', baseUrl: '', custom: false, contextWindow: 128000, maxTokens: 8192, vision: true, reasoning: false, thinkingLevel: 'medium', maxSteps: 100 }
 const validId = (value: unknown): value is string => typeof value === 'string' && value !== '.' && value !== '..' && /^[\w.-]{1,128}$/.test(value)
 const running = (record: SessionRecord): boolean => activeRun(record.run) || record.compacting
 interface RunRecord { run: AgentRunView | null; requestId?: string; textHash?: string }
@@ -33,24 +34,6 @@ interface SessionRecord {
   stopRequested: boolean
   settings?: AgentConfiguration
 }
-export function validateAgentConfiguration(value: unknown): AgentConfiguration {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Agent 设置无效')
-  const item = value as AgentConfiguration
-  if (!validId(item.providerId) || typeof item.modelId !== 'string' || !item.modelId.trim() || item.modelId.length > 256 || !apis.has(item.api)
-    || typeof item.baseUrl !== 'string' || item.baseUrl.length > 2048 || typeof item.custom !== 'boolean'
-    || !Number.isInteger(item.contextWindow) || item.contextWindow < 1024 || item.contextWindow > 10_000_000
-    || !Number.isInteger(item.maxTokens) || item.maxTokens < 1 || item.maxTokens > item.contextWindow
-    || !Number.isInteger(item.maxSteps) || item.maxSteps < 1 || item.maxSteps > 1000
-    || typeof item.vision !== 'boolean' || typeof item.reasoning !== 'boolean'
-    || !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(item.thinkingLevel)) throw new Error('Agent 设置无效')
-  if (item.custom || item.baseUrl) {
-    let url: URL
-    try { url = new URL(item.baseUrl) } catch { throw new Error('模型地址无效') }
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash || url.search) throw new Error('模型地址必须是不含凭据和查询参数的 HTTP(S) 地址')
-  }
-  return { providerId: item.providerId, modelId: item.modelId.trim(), api: item.api, baseUrl: item.baseUrl.replace(/\/$/, ''), custom: item.custom, contextWindow: item.contextWindow, maxTokens: item.maxTokens, vision: item.vision, reasoning: item.reasoning, thinkingLevel: item.thinkingLevel, maxSteps: item.maxSteps }
-}
-
 /** Palette metadata owns identity; pi owns transcript, compaction and branching. */
 export class PiAgentService {
   readonly streamEpoch = randomUUID()
@@ -64,12 +47,14 @@ export class PiAgentService {
   private gate: Promise<unknown> = Promise.resolve()
   private catalog?: Promise<ModelRuntime>
   private closing = false
+  private readonly providerStore: AgentProviderStore
   constructor(userData: string, readonly configRoot: string, private readonly runtimeRoot: () => string,
     encryption: SecretEncryption, private readonly conversationList: () => Promise<Conversation[]>,
     private readonly emit: (event: AgentEvent) => void,
     private readonly connectClient: (root: string) => Promise<AgentClient> = AgentClient.discover) {
     this.directory = join(userData, 'workspaces', createHash('sha256').update(resolve(configRoot)).digest('hex'), 'agent')
     this.credentials = new AgentCredentials(join(this.directory, 'credentials.json'), encryption)
+    this.providerStore = new AgentProviderStore(this.directory)
   }
   private serialize<T>(work: () => Promise<T>): Promise<T> {
     const result = this.gate.then(work)
@@ -79,40 +64,121 @@ export class PiAgentService {
   private models(): Promise<ModelRuntime> {
     return this.catalog ??= ModelRuntime.create({ credentials: this.credentials, modelsPath: null, allowModelNetwork: false, refreshOnCreate: false })
   }
+  private assertEditable(): void {
+    if ([...this.records.values()].some(running)) throw new Error('请先停止运行中的任务再修改模型设置')
+  }
+  private invalidateSessions(): void {
+    this.catalog = undefined
+    for (const record of this.records.values()) { record.session?.dispose(); record.session = undefined }
+  }
+  private async catalogModels(): Promise<AgentModel[]> {
+    return (await this.models()).getModels().filter(model => apis.has(model.api as AgentApiKind) && !['github-copilot', 'openai-codex', 'openai-chatgpt', 'radius'].includes(model.provider))
+      .map(model => ({ providerId: model.provider, id: model.id, name: model.name, api: model.api as AgentApiKind, baseUrl: model.baseUrl, vision: model.input.includes('image'), reasoning: model.reasoning, contextWindow: model.contextWindow, maxTokens: model.maxTokens }))
+  }
+  private async resolveConfiguration(configuration: AgentConfiguration, state: AgentProviderState): Promise<AgentConfiguration> {
+    if (!configuration.modelId) return { ...defaultConfiguration, thinkingLevel: configuration.thinkingLevel, maxSteps: configuration.maxSteps }
+    const custom = state.providers.find(provider => provider.id === configuration.providerId)
+    const definition = custom?.models.find(model => model.id === configuration.modelId)
+    const model = custom ? definition && { ...definition, api: custom.api, baseUrl: custom.baseUrl }
+      : (await this.catalogModels()).find(model => model.providerId === configuration.providerId && model.id === configuration.modelId)
+    if (!model) throw new Error('模型不存在，请重新选择模型')
+    return { providerId: configuration.providerId, modelId: model.id, api: model.api, baseUrl: model.baseUrl, custom: !!custom, contextWindow: model.contextWindow, maxTokens: model.maxTokens, vision: model.vision, reasoning: model.reasoning, thinkingLevel: configuration.thinkingLevel, maxSteps: configuration.maxSteps }
+  }
   private async configuration(): Promise<AgentConfiguration> {
-    const saved = await readJson<AgentConfiguration | null>(join(this.directory, 'settings.json'), null)
-    return saved ? validateAgentConfiguration(saved) : { ...defaultConfiguration }
+    const state = await this.providerStore.load()
+    if (!state.configuration.modelId) return state.configuration
+    if (!(await this.credentials.read(state.configuration.providerId))) return { ...defaultConfiguration, thinkingLevel: state.configuration.thinkingLevel, maxSteps: state.configuration.maxSteps }
+    return this.resolveConfiguration(state.configuration, state)
   }
   async settings(): Promise<AgentSettings> {
+    const state = await this.providerStore.load()
     const configuration = await this.configuration()
-    const catalog = await this.models()
-    const models = catalog.getModels().filter(model => apis.has(model.api as AgentApiKind) && !['github-copilot', 'openai-codex', 'openai-chatgpt', 'radius'].includes(model.provider)).map(model => ({ providerId: model.provider, id: model.id, name: model.name, api: model.api as AgentApiKind, baseUrl: model.baseUrl, vision: model.input.includes('image'), reasoning: model.reasoning, contextWindow: model.contextWindow, maxTokens: model.maxTokens }))
-    return { configuration, credentialConfigured: !!(await this.credentials.read(configuration.custom ? 'palette-custom' : configuration.providerId)), credentialPersistent: this.credentials.persistent,
-      providers: [...new Set(models.map(model => model.providerId))].sort().map(id => ({ id, name: id })), models,
+    const builtin = await this.catalogModels()
+    const credentialIds = new Set((await this.credentials.list()).map(item => item.providerId))
+    const models: AgentModel[] = [...builtin, ...state.providers.flatMap(provider => provider.models.map(model => ({ ...model, providerId: provider.id, api: provider.api, baseUrl: provider.baseUrl })))]
+    const providers = [...new Set(builtin.map(model => model.providerId))].sort().map(id => ({ id, name: id, custom: false, credentialConfigured: credentialIds.has(id), managed: state.builtinProviderIds.includes(id) || credentialIds.has(id), modelCount: builtin.filter(model => model.providerId === id).length }))
+    return { configuration, credentialConfigured: !!configuration.modelId && credentialIds.has(configuration.providerId), credentialPersistent: this.credentials.persistent,
+      providers: [...providers, ...state.providers.map(provider => ({ id: provider.id, name: provider.name, api: provider.api, baseUrl: provider.baseUrl, custom: true, managed: true, credentialConfigured: credentialIds.has(provider.id), modelCount: provider.models.length }))], models,
       guestProgramming: { available: false, reason: '客户机命令执行和文件读写通道未接入' } }
   }
   updateSettings(value: unknown): Promise<AgentSettings> {
     return this.serialize(async () => {
-      if ([...this.records.values()].some(running)) throw new Error('请先停止运行中的任务再修改模型设置')
-      const configuration = validateAgentConfiguration(value)
-      if (!configuration.custom && !(await this.models()).getModel(configuration.providerId, configuration.modelId)) throw new Error('模型不存在，请选择目录中的模型或使用自定义端点')
-      await atomicJson(join(this.directory, 'settings.json'), configuration)
-      for (const record of this.records.values()) { record.session?.dispose(); record.session = undefined }
+      this.assertEditable()
+      const state = await this.providerStore.load()
+      const requested = validateAgentConfiguration(value)
+      const configuration = await this.resolveConfiguration(requested, state)
+      if (configuration.modelId && !(await this.credentials.read(configuration.providerId))) throw new Error('请先为提供商配置 API Key')
+      await this.providerStore.save({ ...state, configuration })
+      this.invalidateSessions()
+      return this.settings()
+    })
+  }
+  saveProvider(value: unknown, key?: string): Promise<AgentSettings> {
+    return this.serialize(async () => {
+      this.assertEditable()
+      const provider = validateProvider(value, true)
+      if (key !== undefined) validateKey(key)
+      const state = await this.providerStore.load()
+      if (provider.id === 'palette-custom' && !state.providers.some(item => item.id === provider.id)) throw new Error('旧版提供商标识不可用于新建')
+      const providers = [...state.providers.filter(item => item.id !== provider.id), provider]
+      let configuration = state.configuration
+      if (configuration.providerId === provider.id && configuration.modelId) {
+        configuration = provider.models.some(model => model.id === configuration.modelId)
+          ? await this.resolveConfiguration(configuration, { ...state, providers })
+          : { ...defaultConfiguration, thinkingLevel: configuration.thinkingLevel, maxSteps: configuration.maxSteps }
+      }
+      const previous = key !== undefined ? await this.credentials.read(provider.id) : undefined
+      if (key !== undefined) await this.credentials.modify(provider.id, async () => ({ type: 'api_key', key }))
+      try { await this.providerStore.save({ ...state, providers, configuration }) }
+      catch (error) {
+        if (key !== undefined) { if (previous) await this.credentials.modify(provider.id, async () => previous); else await this.credentials.delete(provider.id) }
+        throw error
+      }
+      this.invalidateSessions()
+      return this.settings()
+    })
+  }
+  deleteProvider(providerId: string): Promise<AgentSettings> {
+    return this.serialize(async () => {
+      this.assertEditable()
+      const state = await this.providerStore.load()
+      if (!state.providers.some(provider => provider.id === providerId)) throw new Error('自定义提供商不存在')
+      const previous = await this.credentials.read(providerId)
+      await this.credentials.delete(providerId)
+      try {
+        await this.providerStore.save({ ...state, providers: state.providers.filter(provider => provider.id !== providerId), configuration: state.configuration.providerId === providerId ? { ...defaultConfiguration, thinkingLevel: state.configuration.thinkingLevel, maxSteps: state.configuration.maxSteps } : state.configuration })
+      } catch (error) { if (previous) await this.credentials.modify(providerId, async () => previous); throw error }
+      this.invalidateSessions()
       return this.settings()
     })
   }
   configureCredential(providerId: string, key: string | null): Promise<{ configured: boolean; persistent: boolean }> {
     return this.serialize(async () => {
-      if (!validId(providerId) || (key !== null && (typeof key !== 'string' || !key.trim() || key.length > 8192 || /[\r\n\0]/.test(key)))) throw new Error('凭据参数无效')
-      if ([...this.records.values()].some(running)) throw new Error('请先停止运行中的任务再更改凭据')
-      const allowed = (await this.settings()).providers.some(item => item.id === providerId) || providerId === 'palette-custom'
-      if (!allowed) throw new Error('模型提供方无效')
+      this.assertEditable()
+      if (key !== null) validateKey(key)
+      const state = await this.providerStore.load()
+      if (!(await this.settings()).providers.some(item => item.id === providerId)) throw new Error('模型提供方无效')
+      const previous = await this.credentials.read(providerId)
       if (key === null) await this.credentials.delete(providerId)
       else await this.credentials.modify(providerId, async () => ({ type: 'api_key', key }))
-      this.catalog = undefined
-      for (const record of this.records.values()) { record.session?.dispose(); record.session = undefined }
+      try {
+        await this.providerStore.save({ ...state, builtinProviderIds: state.providers.some(provider => provider.id === providerId) ? state.builtinProviderIds : [...new Set([...state.builtinProviderIds, providerId])], configuration: key === null && state.configuration.providerId === providerId ? { ...defaultConfiguration, thinkingLevel: state.configuration.thinkingLevel, maxSteps: state.configuration.maxSteps } : state.configuration })
+      } catch (error) { if (previous) await this.credentials.modify(providerId, async () => previous); else await this.credentials.delete(providerId); throw error }
+      this.invalidateSessions()
       return { configured: key !== null, persistent: this.credentials.persistent }
     })
+  }
+  async discoverModels(input: AgentModelDiscovery): Promise<{ models: AgentModelDefinition[] }> {
+    if (!input || typeof input !== 'object') throw new Error('模型发现参数无效')
+    const state = await this.providerStore.load()
+    const baseUrl = validateBaseUrl(input.baseUrl)
+    // A saved secret may only be sent to the endpoint it was saved for.
+    const provider = state.providers.find(provider => provider.id === input.providerId)
+    if (input.key !== undefined) validateKey(input.key)
+    const saved = input.key === undefined && provider && provider.api === input.api && provider.baseUrl === baseUrl ? await this.credentials.read(provider.id) : undefined
+    const key = input.key ?? (saved?.type === 'api_key' ? saved.key : undefined)
+    if (!key) throw new Error('请填写 API Key；修改端点后需重新输入密钥以获取模型')
+    return discoverAgentModels(input, key)
   }
   private async load(id: string, vmId: string): Promise<SessionRecord> {
     if (!validId(id) || !validId(vmId)) throw new Error('会话参数无效')
@@ -144,7 +210,8 @@ export class PiAgentService {
   }
   private async prepare(record: SessionRecord, configuration: AgentConfiguration): Promise<void> {
     if (record.session) return
-    const provider = configuration.custom ? 'palette-custom' : configuration.providerId
+    if (!configuration.modelId) throw new Error('请先选择可用模型')
+    const provider = configuration.providerId
     const credential = await this.credentials.read(provider)
     if (credential?.type !== 'api_key' || !credential.key) throw new Error('请先配置 API Key')
     const modelRuntime = await ModelRuntime.create({ credentials: this.credentials, modelsPath: null, refreshOnCreate: false, allowModelNetwork: false })

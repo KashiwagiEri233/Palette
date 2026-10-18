@@ -146,13 +146,16 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('request', async (event, method: DesktopMethod, vmId?: string, payload: Record<string, unknown> = {}) => {
     trusted(event)
-    if ((!methods.has(method) && !workspaceMethods.has(method) && !agentMethods.has(method)) || (vmId !== undefined && !/^[A-Za-z0-9_.-]{1,128}$/.test(vmId)) || typeof payload !== 'object' || payload === null || Array.isArray(payload) || Buffer.byteLength(JSON.stringify(payload)) > 64 * 1024) throw new Error('请求无效')
+    if ((!methods.has(method) && !workspaceMethods.has(method) && !agentMethods.has(method)) || (vmId !== undefined && !/^[A-Za-z0-9_.-]{1,128}$/.test(vmId)) || typeof payload !== 'object' || payload === null || Array.isArray(payload) || Buffer.byteLength(JSON.stringify(payload)) > (String(method) === 'agent.providers.save' ? 1024 * 1024 : 64 * 1024)) throw new Error('请求无效')
     if (handlingClose) throw new Error('正在退出，请稍候')
     const operation = String(method)
     if (agentMethods.has(operation)) {
       const service = agent()
       if (operation === 'agent.settings.get') return service.settings()
       if (operation === 'agent.settings.update') return service.updateSettings(payload.configuration)
+      if (operation === 'agent.providers.save') return service.saveProvider(payload.provider, payload.key as string | undefined)
+      if (operation === 'agent.providers.delete') return service.deleteProvider(payload.providerId as string)
+      if (operation === 'agent.models.discover') return service.discoverModels(payload as unknown as import('../shared/agent').AgentModelDiscovery)
       if (operation === 'agent.credentials.set' || operation === 'agent.credentials.remove') return service.configureCredential(payload.providerId as string, operation.endsWith('.set') ? payload.key as string : null)
       if (!vmId || typeof payload.conversationId !== 'string') throw new Error('会话参数无效')
       if (operation === 'agent.snapshot') return service.snapshot(vmId, payload.conversationId)
