@@ -189,7 +189,7 @@ app.whenReady().then(async () => {
       if (!listed.vms.some(vm => vm.vm_id === vmId)) throw new Error('虚拟机不存在')
       if (operation === 'conversations.create') return repository.create(vmId, payload.requestId, payload.draft)
       if (operation === 'conversations.update') {
-        if ((payload.patch as { archived?: boolean } | undefined)?.archived) await agentServices.get(resolve(configRoot))?.stopVm(vmId)
+        if ((payload.patch as { archived?: boolean } | undefined)?.archived === true) await agentServices.get(resolve(configRoot))?.stop(vmId, payload.id as string)
         return repository.update(vmId, payload.id, payload.revision, payload.patch)
       }
       if (operation === 'conversations.delete') {

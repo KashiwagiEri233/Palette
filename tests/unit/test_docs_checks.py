@@ -49,3 +49,26 @@ def test_other_pages_still_require_translation(tmp_path: Path, relative: str) ->
     assert any(
         "Chinese counterpart" in problem for problem in CHECKER["check_pairing"](tmp_path, [path])
     )
+
+
+@pytest.mark.parametrize("tracked", [True, False])
+def test_markdown_enumeration_excludes_only_upstream_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tracked: bool
+) -> None:
+    owned = ["README.md", "docs/user-guide.md", "docs/ref/guide.md", "desktop/vendor-notes.md"]
+    upstream = ["ref/pi/README.md", "ref/pi/.pi/prompts/cl.md", "desktop/vendor/pi/README.md"]
+    for relative in owned + upstream:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Documentation\n", encoding="utf-8")
+
+    monkeypatch.setitem(
+        CHECKER["markdown_files"].__globals__,
+        "_git_tracked_markdown",
+        lambda _root: sorted(owned + upstream) if tracked else None,
+    )
+    files = CHECKER["markdown_files"](tmp_path)
+    assert sorted(path.relative_to(tmp_path).as_posix() for path in files) == sorted(owned)
+    problems = CHECKER["check_pairing"](tmp_path, files)
+    assert len(problems) == len(owned)
+    assert all("no Chinese counterpart" in problem for problem in problems)

@@ -16,6 +16,7 @@
 
 # --- Local upstream source used only for architecture/API research --------------------
 /.references/
+/ref/
 
 # --- Python ---------------------------------------------------------------------------
 __pycache__/

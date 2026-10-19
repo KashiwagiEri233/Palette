@@ -24,6 +24,9 @@ SKIP_DIRS = frozenset(
     {".git", ".venv", ".references", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
 )
 
+#: Upstream source snapshots keep their own documentation conventions.
+UPSTREAM_PREFIXES = ("desktop/vendor/", "ref/")
+
 #: Development plans and coding-agent rules are not bilingual user documentation.
 #: Their UTF-8, code fences and relative links are still checked.
 UNPAIRED = frozenset(
@@ -47,8 +50,8 @@ def markdown_files(root: pathlib.Path) -> list[pathlib.Path]:
     Enumerated through git rather than by walking the tree, because most of what sits under
     the working directory is not documentation: ``.runtime/`` holds instance overlays, audit
     trails and test screenshots, and ``.references/`` is a third-party checkout. All of it is
-    ignored, so "tracked by git" is exactly the set a reader will ever see — and it keeps a
-    scratch note from being held to the bilingual rule.
+    ignored, so git provides the candidate set without holding scratch notes to the bilingual
+    rule. Upstream source snapshots are excluded from both enumeration paths.
 
     Falls back to a filtered walk outside a git work tree, so the script still works if it is
     ever copied somewhere on its own.
@@ -57,10 +60,13 @@ def markdown_files(root: pathlib.Path) -> list[pathlib.Path]:
     if tracked is not None:
         # Vendored upstream documentation retains its original language and links.
         return [
-            root / relative for relative in tracked if not relative.startswith("desktop/vendor/")
+            root / relative for relative in tracked if not relative.startswith(UPSTREAM_PREFIXES)
         ]
     return sorted(
-        path for path in root.rglob("*.md") if not any(part in SKIP_DIRS for part in path.parts)
+        path
+        for path in root.rglob("*.md")
+        if not any(part in SKIP_DIRS for part in path.parts)
+        and not path.relative_to(root).as_posix().startswith(UPSTREAM_PREFIXES)
     )
 
 

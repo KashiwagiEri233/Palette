@@ -1,4 +1,4 @@
-import { it, expect } from 'vitest'
+import { it, expect, vi } from 'vitest'
 import { createServer } from 'node:http'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -15,6 +15,7 @@ const pixel = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQ
 class FakeClient extends AgentClient {
   readonly calls: string[] = []
   unknownAction = false
+  actionResult?: Record<string, unknown>
   constructor() { super({ address: 'unused', generation: '', token: '', operation_timeout_seconds: 1 }) }
   override async request(method: string, _vm: string, parameters: Record<string, unknown> = {}, _claim?: string, signal?: AbortSignal): Promise<AgentReply> {
     signal?.throwIfAborted()
@@ -24,6 +25,7 @@ class FakeClient extends AgentClient {
     if (method === 'driver_release') return { result: { release_confirmed: true }, image: Buffer.alloc(0) }
     if (method === 'act') expect(parameters).toMatchObject({ instance_id: 'instance', frame_id: 'frame', action: { type: 'click', x: 0, y: 0 } })
     if (method === 'act' && this.unknownAction) return { result: { ok: false, error: { code: 'ACTION_OUTCOME_UNKNOWN', message: 'unknown' } }, image: Buffer.alloc(0) }
+    if (method === 'act' && this.actionResult) return { result: this.actionResult, image: Buffer.alloc(0) }
     return { result: { ok: true, frame: { instance_id: 'instance', frame_id: 'frame', width: 1, height: 1 } }, image: pixel }
   }
 }
@@ -163,17 +165,122 @@ it('validates custom endpoints and bounds before saving configuration', () => {
   expect(() => validateAgentConfiguration({})).toThrow('设置无效')
 })
 
-it.each(['limit', 'unknown'])('halts the SDK tool loop on %s without replaying input', async mode => {
+it.each(['limit', 'unknown', 'timeout'])('halts the SDK tool loop on %s without replaying input', async mode => {
   const test = await environment()
   try {
     if (mode === 'limit') await test.service.updateSettings({ ...test.configuration, maxSteps: 1 })
-    else test.client.unknownAction = true
+    else if (mode === 'unknown') test.client.unknownAction = true
+    else test.client.actionResult = { ok: false, effect_state: 'unknown', error: { code: 'TIMEOUT', message: 'QMP confirmation timed out' } }
     await test.service.start('vm', test.id, 'visual task', randomUUID())
     const result = await settled(test.service, test.id)
     expect(result.view.run?.state).toBe('cancelled')
     expect(result.view.run?.error).toContain(mode === 'limit' ? '最大工具调用次数' : '操作结果未知')
     expect(test.client.calls.filter(method => method === 'act')).toHaveLength(mode === 'limit' ? 0 : 1)
+    expect(test.requests).toHaveLength(2)
+    expect(test.client.calls.filter(method => method === 'driver_release')).toHaveLength(1)
+    expect(test.client.calls.at(-1)).toBe('driver_release')
   } finally { await test.close() }
+}, 20000)
+
+it('lets the SDK handle a failure that explicitly sent no input', async () => {
+  const test = await environment()
+  try {
+    test.client.actionResult = { ok: false, effect_state: 'not_sent', error: { code: 'STALE_FRAME', message: 'Observe again' } }
+    await test.service.start('vm', test.id, 'visual task', randomUUID())
+    const result = await settled(test.service, test.id)
+    expect(result.view.run?.state).toBe('completed')
+    expect(result.view.run?.error).toBeUndefined()
+    expect(test.requests).toHaveLength(3)
+    expect(test.client.calls.filter(method => method === 'act')).toHaveLength(1)
+    expect(test.client.calls.filter(method => method === 'driver_release')).toHaveLength(1)
+  } finally { await test.close() }
+}, 20000)
+
+it.each(['archive', 'delete'])('does not stop another session on the same VM during %s', async operation => {
+  const test = await environment()
+  try {
+    const old = { ...test.conversations[0], id: randomUUID() }
+    test.conversations.push(old)
+    await test.service.snapshot('vm', old.id)
+    test.slow()
+    const accepted = await test.service.start('vm', test.id, 'slow task', randomUUID())
+    await vi.waitFor(() => expect(test.requests).toHaveLength(1))
+    await test.service.stop('vm', old.id)
+    if (operation === 'archive') old.archived = true
+    else {
+      test.conversations.splice(test.conversations.indexOf(old), 1)
+      await test.service.remove('vm', old.id)
+      await expect(readdir(join(test.service.directory, 'sessions', old.id))).rejects.toMatchObject({ code: 'ENOENT' })
+    }
+    expect((await test.service.snapshot('vm', test.id)).view.run).toMatchObject({ id: accepted.runId, state: 'running' })
+    expect(test.client.calls).not.toContain('driver_release')
+    expect(test.client.calls.filter(method => method === 'driver_acquire')).toHaveLength(1)
+    if (operation === 'archive') {
+      await expect(test.service.start('vm', old.id, 'archived task', randomUUID())).rejects.toThrow('已归档对话为只读')
+    }
+  } finally { await test.close() }
+}, 20000)
+
+it.each(['archive', 'delete', 'remove'])('stops and releases only the target running session on %s', async operation => {
+  const test = await environment()
+  try {
+    test.slow()
+    await test.service.start('vm', test.id, 'slow task', randomUUID())
+    await vi.waitFor(() => expect(test.requests).toHaveLength(1))
+    if (operation !== 'remove') {
+      expect((await test.service.stop('vm', test.id)).view.run?.state).toBe('cancelled')
+      if (operation === 'archive') test.conversations[0].archived = true
+      else test.conversations.splice(0, 1)
+    }
+    if (operation !== 'archive') {
+      await test.service.remove('vm', test.id)
+      await expect(readdir(join(test.service.directory, 'sessions', test.id))).rejects.toMatchObject({ code: 'ENOENT' })
+    } else {
+      expect((await test.service.snapshot('vm', test.id)).view.run?.state).toBe('cancelled')
+    }
+    expect(test.client.calls.filter(method => method === 'driver_release')).toHaveLength(1)
+    expect(test.client.calls).not.toContain('act')
+    expect(test.requests).toHaveLength(1)
+  } finally { await test.close() }
+}, 20000)
+
+it('rejects removing a session owned by another VM without stopping its task', async () => {
+  const test = await environment()
+  try {
+    test.slow()
+    await test.service.start('vm', test.id, 'slow task', randomUUID())
+    await expect(test.service.remove('other-vm', test.id)).rejects.toThrow('对话不属于此虚拟机')
+    expect((await test.service.snapshot('vm', test.id)).view.run?.state).toBe('running')
+    expect(test.client.calls).not.toContain('driver_release')
+  } finally { await test.close() }
+}, 20000)
+
+it.each(['stop', 'remove'] as const)('waits for a starting session before %s and releases its claim', async operation => {
+  const test = await environment()
+  let acquireStarted!: () => void
+  let finishAcquire!: () => void
+  const entered = new Promise<void>(resolve => { acquireStarted = resolve })
+  const blocked = new Promise<void>(resolve => { finishAcquire = resolve })
+  const request = test.client.request.bind(test.client)
+  vi.spyOn(test.client, 'request').mockImplementation(async (...args) => {
+    if (args[0] === 'driver_acquire') { acquireStarted(); await blocked }
+    return request(...args)
+  })
+  try {
+    test.slow()
+    const starting = test.service.start('vm', test.id, 'slow task', randomUUID())
+    await entered
+    const stopping = test.service[operation]('vm', test.id)
+    await new Promise(resolve => setImmediate(resolve))
+    expect((await test.service.snapshot('vm', test.id)).view.run?.state).toBe('starting')
+    finishAcquire()
+    await starting
+    await stopping
+    expect(test.client.calls.filter(method => method === 'driver_release')).toHaveLength(1)
+    expect(test.client.calls).not.toContain('act')
+    if (operation === 'stop') expect((await test.service.snapshot('vm', test.id)).view.run?.state).toBe('cancelled')
+    else await expect(readdir(join(test.service.directory, 'sessions', test.id))).rejects.toMatchObject({ code: 'ENOENT' })
+  } finally { finishAcquire(); await test.close() }
 }, 20000)
 
 it('compacts real SDK history and retains earlier conversation branches', async () => {

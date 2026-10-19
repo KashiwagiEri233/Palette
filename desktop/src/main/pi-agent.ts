@@ -26,6 +26,7 @@ interface SessionRecord {
   textHash?: string
   compacting: boolean
   task?: Promise<void>
+  stopTask?: Promise<void>
   releaseTask?: Promise<void>
   client?: AgentClient
   claim?: string
@@ -275,7 +276,7 @@ export class PiAgentService {
         }
         if (record.stopRequested) throw new Error('任务已停止')
         const failure = reply.result.error as { code?: string } | undefined
-        if (method === 'act' && reply.result.ok === false && failure?.code === 'ACTION_OUTCOME_UNKNOWN') {
+        if (method === 'act' && (reply.result.effect_state === 'unknown' || (reply.result.ok === false && failure?.code === 'ACTION_OUTCOME_UNKNOWN'))) {
           record.stopRequested = true
           record.run.error = '操作结果未知，任务已停止；请先观察虚拟机状态'
           queueMicrotask(() => { void record.session?.abort() })
@@ -385,8 +386,15 @@ export class PiAgentService {
     record.claim = undefined
   }
   async stop(vmId: string, id: string): Promise<AgentSnapshot> {
+    await this.gate
     const record = await this.load(id, vmId)
-    if (running(record)) {
+    await this.stopRecord(record)
+    return this.snapshot(vmId, id)
+  }
+  private async stopRecord(record: SessionRecord): Promise<void> {
+    if (record.stopTask) return record.stopTask
+    if (!running(record)) return
+    const task = (async () => {
       record.stopRequested = true
       if (record.run) record.run.state = 'stopping'
       this.publish(record)
@@ -397,8 +405,10 @@ export class PiAgentService {
       if (record.run?.state === 'stopping') record.run.state = 'cancelled'
       await this.saveRun(record)
       this.publish(record)
-    }
-    return this.snapshot(vmId, id)
+    })()
+    // Concurrent stops share cleanup and the final run metadata write.
+    record.stopTask = task
+    try { await task } finally { record.stopTask = undefined }
   }
   async stopVm(vmId: string): Promise<void> {
     await this.gate
@@ -416,9 +426,10 @@ export class PiAgentService {
   }
   async remove(vmId: string, id: string): Promise<void> {
     if (!validId(id)) throw new Error('对话参数无效')
-    await this.stopVm(vmId)
+    await this.gate
     const record = this.records.get(id) ?? await this.load(id, vmId)
     if (record.conversation.vm_id !== vmId) throw new Error('对话不属于此虚拟机')
+    await this.stopRecord(record)
     record.session?.dispose()
     if (record.publishTimer) clearTimeout(record.publishTimer)
     this.records.delete(id)
