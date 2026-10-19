@@ -210,6 +210,25 @@ class AudioConfig(_Strict):
     backend: Literal["coreaudio", "dsound", "pipewire", "pa", "alsa"] | None = None
 
 
+class QemuGuestAgentConfig(_Strict):
+    enabled: bool = False
+    request_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    max_file_bytes: int = Field(default=16 * 1024 * 1024, ge=1, le=64 * 1024 * 1024)
+
+
+class GuestDesktopConfig(_Strict):
+    clipboard: bool = False
+    resize: bool = False
+    shared_folders: bool = False
+    max_clipboard_bytes: int = Field(default=48 * 1024, ge=1, le=48 * 1024)
+
+
+class SharedFolderConfig(_Strict):
+    tag: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_-]{0,30}$")
+    path: str = Field(min_length=1, max_length=4096)
+    read_only: bool = True
+
+
 class TextConfig(_Strict):
     mode: Literal["keyboard"] = "keyboard"
     max_chars: int = Field(default=256, ge=1, le=4096)
@@ -320,12 +339,22 @@ class Profile(_Strict):
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
+    guest_agent: QemuGuestAgentConfig = Field(default_factory=QemuGuestAgentConfig)
+    guest_desktop: GuestDesktopConfig = Field(default_factory=GuestDesktopConfig)
+    shared_folders: list[SharedFolderConfig] = Field(default_factory=list, max_length=16)
     text: TextConfig = Field(default_factory=TextConfig)
     timeouts: TimeoutConfig = Field(default_factory=TimeoutConfig)
     lifecycle: LifecyclePolicy = Field(default_factory=LifecyclePolicy)
     guest_tools: GuestToolsConfig = Field(default_factory=GuestToolsConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     frame_ttl_seconds: float = Field(default=30.0, gt=0, le=600)
+
+    @model_validator(mode="after")
+    def _shared_tags(self) -> Profile:
+        tags = [folder.tag for folder in self.shared_folders]
+        if len(tags) != len(set(tags)):
+            raise ValueError("shared folder tags must be unique")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -466,6 +495,10 @@ def load_config(root: Path | None = None, *, profiles_dir: Path | None = None) -
                 update={
                     "images": image,
                     "qemu": profile.qemu.model_copy(update={"firmware": firmware}),
+                    "shared_folders": [
+                        folder.model_copy(update={"path": _trusted_path(folder.path, config_root)})
+                        for folder in profile.shared_folders
+                    ],
                 }
             )
             profiles[profile.profile_id] = profile

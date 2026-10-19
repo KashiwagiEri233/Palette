@@ -175,3 +175,7 @@ npm --prefix desktop run test:e2e
 ```
 
 Electron Playwright 端到端测试（`npm --prefix desktop run test:e2e`）使用独立临时配置目录、受监督的 fake QEMU 子进程与真实的本机 WebSocket RFB 连接，自动验证创建虚拟机、修改硬件设置、控制台画面连接、人工接管与退出确认流程。实机客户机验收步骤详见[端到端验收测试指南](acceptance-test.zh-CN.md)。
+
+## 可选虚拟机增强工具
+
+客户机安装、能力自动检测与降级、中文剪贴板、自动分辨率、QGA 管理、文件传输和私有 WebDAV 共享目录，请参阅[增强工具指南](guest-enhancements.zh-CN.md)。缺少工具时仍可使用基础虚拟机控制台。

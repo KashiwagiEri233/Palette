@@ -763,6 +763,37 @@ class ActionController:
             "input-send-event", arguments, timeout=timeout, on_sending=on_sending
         )
 
+    async def operator_enhancement(
+        self,
+        label: str,
+        validate: Callable[[], None],
+        runner: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Serialize operator enhancements with input, capture and ownership changes."""
+        identity = self._identity()
+
+        async def run() -> dict[str, Any]:
+            validate()
+            self._require_identity(identity)
+            self.view.action_seq += 1
+            try:
+                result = await runner()
+                validate()
+                self._require_identity(identity)
+                return result
+            finally:
+                if self._audit is not None:
+                    self._audit.record(
+                        "operator.enhancement", vm_id=self.view.vm_id, operation=label
+                    )
+
+        return cast(
+            dict[str, Any],
+            await self.scheduler.submit(
+                self.scheduler.make_job(JobKind.OPERATOR_INPUT, label, run)
+            ),
+        )
+
     async def operator_input(
         self, events: list[dict[str, Any]], validate: Callable[[], None]
     ) -> int:

@@ -13,6 +13,7 @@ Two core invariants run through every page:
 
 | Document | Audience & Scope |
 | --- | --- |
+| [Guest Enhancements](guest-enhancements.md) · [简体中文](guest-enhancements.zh-CN.md) | Guest installation, capability detection/degradation, Unicode clipboard, automatic resolution, QGA management, file transfer and private WebDAV exports |
 | [Project Overview (../README.md)](../README.md) · [简体中文](../README.zh-CN.md) | Architecture overview, key features, quick start, and safety default switches |
 | [Desktop Guide (desktop.md)](desktop.md) · [简体中文](desktop.zh-CN.md) | Running Palette Desktop from source, persistent VM creation, offline hardware settings, read-only RFB gateway, human takeover, and shared daemon usage |
 | [Backend Ownership & Concurrency](backend-architecture.md) · [简体中文](backend-architecture.zh-CN.md) | Application boundaries, per-VM operations, disk references and cancellation-safe cleanup |

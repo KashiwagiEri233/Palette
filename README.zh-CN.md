@@ -274,3 +274,7 @@ uv run python scripts/p0_probe.py          # 实机冷启动、截图、点击�
 ## 许可证
 
 本项目基于 [Apache-2.0 许可证](LICENSE)开源。
+
+## 可选虚拟机增强工具
+
+客户机安装、能力自动检测与降级、中文剪贴板、自动分辨率、QGA 管理、文件传输和私有 WebDAV 共享目录，请参阅[增强工具指南](docs/guest-enhancements.zh-CN.md)。缺少工具时仍可使用基础虚拟机控制台。

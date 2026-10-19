@@ -371,6 +371,7 @@ class VmStatus(BaseModel):
     display: DisplayInfo | None = None
     input_ledger: InputLedgerState = Field(default_factory=InputLedgerState)
     guest_tools: GuestToolStatus = Field(default_factory=GuestToolStatus)
+    enhancements: dict[str, Any] = Field(default_factory=dict)
     queued_actions: int = 0
     controller_owned: bool = True
     control_owner: Literal["agent", "operator"] = "agent"

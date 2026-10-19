@@ -36,6 +36,10 @@ from ..capture.qmp import QmpCaptureBackend
 from ..cleanup import join_cleanup
 from ..config import PaletteConfig, Profile
 from ..errors import ErrorCode, PaletteError
+from ..guest_agent import QemuGuestAgent
+from ..guest_desktop import RfbGuestDesktop
+from ..guest_session import GuestSession
+from ..guest_shares import GuestShares
 from ..guest_tools.base import DisabledGuestToolBackend, GuestToolBackend
 from ..guest_tools.bridge import BridgeGuestToolBackend, GuestToolTransport
 from ..input.controller import ActionController
@@ -55,6 +59,7 @@ from .launcher import (
     probe_binary_async,
     require_accelerator,
     resolve_firmware,
+    run_tool,
     spawn_qemu,
 )
 from .managed import ManagedProcess
@@ -107,6 +112,11 @@ class VmInstance:
     capture: CaptureBackend | None = None
     controller: ActionController | None = None
     guest_tools: GuestToolBackend | None = None
+    qemu_guest_agent: QemuGuestAgent | None = None
+    guest_desktop: RfbGuestDesktop | None = None
+    guest_session: GuestSession | None = None
+    guest_shares: GuestShares | None = None
+    enhancement_ports: dict[str, bool] = field(default_factory=dict)
     guard: ProcessGuard | None = None
     stderr_lines: deque[str] = field(default_factory=lambda: deque(maxlen=200))
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
@@ -474,6 +484,13 @@ class VmManager:
         )
 
         # 2. command line, then the process itself, hidden and with a whitelisted env.
+        clipboard_available = False
+        if profile.guest_desktop.clipboard and self.console_enabled:
+            with contextlib.suppress(PaletteError, OSError, TimeoutError):
+                code, output, _stderr = await run_tool(
+                    [binary, *profile.qemu.argv_prefix, "-chardev", "help"], timeout=5
+                )
+                clipboard_available = code == 0 and "qemu-vdagent" in output.split()
         plan = build_launch_plan(
             profile=profile,
             binary=binary,
@@ -487,6 +504,7 @@ class VmManager:
             extra_volumes=overrides.volumes,
             caller_args=overrides.qemu_args,
             managed_console=self.console_enabled,
+            clipboard_available=clipboard_available,
         )
         instance.plan = plan
         process = await spawn_qemu(
@@ -520,6 +538,20 @@ class VmManager:
         )
 
         # 5. QMP handshake over the private pipes (never stdio of this process).
+        if plan.webdav_endpoint is not None:
+            instance.guest_shares = GuestShares(plan.webdav_endpoint, profile.shared_folders)
+            instance.tasks.append(asyncio.create_task(instance.guest_shares.run()))
+        if plan.session_endpoint is not None:
+            instance.guest_session = GuestSession(plan.session_endpoint)
+            instance.tasks.append(asyncio.create_task(instance.guest_session.run()))
+        if plan.guest_agent_endpoint is not None:
+            instance.qemu_guest_agent = QemuGuestAgent(
+                plan.guest_agent_endpoint,
+                timeout_seconds=profile.guest_agent.request_timeout_seconds,
+                max_file_bytes=profile.guest_agent.max_file_bytes,
+            )
+            # Windows pipe chardev initialization waits for this connection before QMP.
+            instance.tasks.append(asyncio.create_task(self._watch_enhancements(instance)))
         transport = ProcessQmpTransport(process, name=f"qmp-{paths.vm_id}")
         instance.transport = transport
         qmp = QmpClient(
@@ -552,6 +584,19 @@ class VmManager:
                 instance.console_password = password
         await qmp.execute("cont")
         instance.transition(VmState.RUNNING)
+
+        if instance.console_address is not None and instance.console_password is not None:
+            instance.guest_desktop = RfbGuestDesktop(
+                instance.console_address,
+                instance.console_password,
+                max_clipboard_bytes=profile.guest_desktop.max_clipboard_bytes,
+            )
+        if instance.qemu_guest_agent is None and (
+            instance.guest_desktop is not None
+            or instance.guest_shares is not None
+            or instance.guest_session is not None
+        ):
+            instance.tasks.append(asyncio.create_task(self._watch_enhancements(instance)))
 
         capture = QmpCaptureBackend(qmp, profile.capture)
         instance.capture = capture
@@ -622,6 +667,25 @@ class VmManager:
                 capabilities.detail,
             )
         return bridge
+
+    async def _watch_enhancements(self, instance: VmInstance) -> None:
+        while instance.process is not None and instance.process.returncode is None:
+            if instance.qemu_guest_agent is not None:
+                await instance.qemu_guest_agent.refresh_info()
+            if instance.qmp is not None and instance.view.qmp_ready:
+                with contextlib.suppress(PaletteError):
+                    result = await instance.qmp.execute("query-chardev")
+                    if isinstance(result, list):
+                        instance.enhancement_ports = {
+                            item["label"]: item.get("frontend-open") is True
+                            for item in result
+                            if isinstance(item, dict) and isinstance(item.get("label"), str)
+                        }
+            desktop = instance.guest_desktop
+            if desktop is not None and not desktop.connected:
+                with contextlib.suppress(OSError, ValueError, TimeoutError, PaletteError):
+                    await desktop.connect()
+            await asyncio.sleep(3)
 
     def _refresh_guest_tools(self, instance: VmInstance) -> None:
         previous = instance.guest_tools
@@ -843,6 +907,14 @@ class VmManager:
         if instance.guest_tools is not None:
             with contextlib.suppress(Exception):
                 await instance.guest_tools.close()
+        if instance.qemu_guest_agent is not None:
+            await instance.qemu_guest_agent.close()
+        if instance.guest_desktop is not None:
+            await instance.guest_desktop.close()
+        if instance.guest_session is not None:
+            await instance.guest_session.close()
+        if instance.guest_shares is not None:
+            await instance.guest_shares.close()
         if instance.qmp is not None:
             with contextlib.suppress(Exception):
                 await instance.qmp.close()
@@ -931,7 +1003,19 @@ class VmManager:
             instance.stop_requested = True
             instance.view.state = str(VmState.STOPPING)
             try:
-                await instance.qmp.execute("system_powerdown")
+                agent = instance.qemu_guest_agent
+                if agent is not None and agent.online and "guest-shutdown" in agent.commands:
+                    try:
+                        await agent.shutdown()
+                    except PaletteError as exc:
+                        if exc.code not in {
+                            ErrorCode.GUEST_TOOL_UNAVAILABLE,
+                            ErrorCode.UNSUPPORTED_CAPABILITY,
+                        }:
+                            raise
+                        await instance.qmp.execute("system_powerdown")
+                else:
+                    await instance.qmp.execute("system_powerdown")
                 await self._await_exit(instance, timeout=instance.profile.timeouts.shutdown_seconds)
             except BaseException:
                 instance.view.state = previous
@@ -1089,6 +1173,13 @@ class VmManager:
         instance.view.boot_epoch = epoch
         instance.view.screen_ready = False
         instance.view.desktop_ready = None
+        instance.enhancement_ports.clear()
+        if instance.qemu_guest_agent is not None:
+            instance.qemu_guest_agent.invalidate()
+        if instance.guest_session is not None:
+            instance.guest_session.last_seen = 0
+        if instance.guest_desktop is not None:
+            instance.guest_desktop.clipboard = None
         if instance.controller is not None:
             instance.controller.invalidate(reason="the guest rebooted")
             instance.tasks.append(

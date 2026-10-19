@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -414,6 +415,10 @@ class LaunchPlan:
     memory_limit_bytes: int | None = None
     max_runtime_seconds: float | None = None
     host_path_config: bytes | None = None
+    guest_agent_endpoint: str | None = None
+    webdav_endpoint: str | None = None
+    session_endpoint: str | None = None
+    clipboard_enabled: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -547,6 +552,7 @@ def build_launch_plan(
     accelerator: str | None = None,
     start_paused: bool = True,
     managed_console: bool = False,
+    clipboard_available: bool = True,
     extra_volumes: Sequence[ExtraVolume] = (),
     caller_args: Sequence[str] = (),
 ) -> LaunchPlan:
@@ -576,6 +582,46 @@ def build_launch_plan(
     argv += ["-nodefaults", "-display", "none"]
     if managed_console:
         argv += ["-vnc", "127.0.0.1:0,to=99,password=on,share=force-shared"]
+    clipboard_enabled = managed_console and profile.guest_desktop.clipboard and clipboard_available
+    endpoints: dict[str, str] = {}
+    if (
+        profile.guest_agent.enabled
+        or clipboard_enabled
+        or profile.guest_desktop.shared_folders
+        or profile.guest_desktop.resize
+    ):
+        argv += ["-device", "virtio-serial-pci,id=palette-serial"]
+    for key, enabled, port in (
+        ("qga", profile.guest_agent.enabled, "org.qemu.guest_agent.0"),
+        ("webdav", profile.guest_desktop.shared_folders, "org.spice-space.webdav.0"),
+        ("session", profile.guest_desktop.resize, "org.palette.desktop.0"),
+    ):
+        if not enabled:
+            continue
+        if IS_WINDOWS:
+            name = f"palette-{key}-{uuid.uuid4().hex}"
+            endpoints[key] = rf"\\.\pipe\{name}"
+            backend = f"pipe,id=palette-{key},path={name}"
+        else:
+            endpoints[key] = str(workdir / f"{key}.sock")
+            backend = f"socket,id=palette-{key},path={key}.sock,server=on,wait=off"
+        argv += [
+            "-chardev",
+            backend,
+            "-device",
+            f"virtserialport,id=palette-{key}-port,bus=palette-serial.0,"
+            f"chardev=palette-{key},name={port}",
+        ]
+    if clipboard_enabled:
+        argv += [
+            "-chardev",
+            "qemu-vdagent,id=palette-vdagent,clipboard=on,mouse=off",
+            "-device",
+            "virtserialport,id=palette-vdagent-port,bus=palette-serial.0,"
+            "chardev=palette-vdagent,name=com.redhat.spice.0",
+        ]
+    elif profile.guest_desktop.clipboard:
+        notes.append("clipboard enhancement unavailable; base display and input remain available")
     nic = network.qemu_nic_argument()
     if qemu.arch == "aarch64" and network.attaches_nic and "model=" not in nic:
         nic += ",model=virtio-net-pci"
@@ -685,6 +731,10 @@ def build_launch_plan(
         host_path_config=(
             "\n".join(config_sections).encode(locale.getencoding()) if config_sections else None
         ),
+        guest_agent_endpoint=endpoints.get("qga"),
+        webdav_endpoint=endpoints.get("webdav"),
+        session_endpoint=endpoints.get("session"),
+        clipboard_enabled=clipboard_enabled,
     )
 
 

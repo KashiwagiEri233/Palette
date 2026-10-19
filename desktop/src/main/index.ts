@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, protocol, net, Menu, safeStorage, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, protocol, net, Menu, safeStorage, shell, clipboard } from 'electron'
 import { spawn } from 'node:child_process'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path'
@@ -11,6 +11,8 @@ import { ConversationRepository } from './conversations'
 import { agentMethods } from '../shared/agent'
 import { PiAgentService } from './pi-agent'
 import { externalLink } from '../shared/external-link'
+import { checkedClipboard, checkedGuestPath, withGuestLease, uploadGuestFile, downloadGuestFile } from './guest-enhancements'
+import type { GuestAction } from '../shared/guest'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const backendRoot = resolve(here, '../../..')
@@ -22,6 +24,7 @@ let handlingClose = false
 let connectionsInFlight = 0
 const shutdown = new RuntimeShutdown()
 const leases = new Map<string, string>()
+const guestActions = new Map<string, AbortController>()
 const repositories = new Map<string, ConversationRepository>()
 const agentServices = new Map<string, PiAgentService>()
 function agent(): PiAgentService {
@@ -48,6 +51,8 @@ function conversations(): ConversationRepository {
   return repository
 }
 const methods = new Set<DesktopMethod>(['profiles', 'doctor', 'vms.list', 'vms.create', 'vms.update', 'vms.start', 'vms.stop', 'vms.restart', 'vms.reset', 'vms.delete', 'display.ticket', 'display.sync', 'control.acquire', 'control.input', 'control.heartbeat', 'control.release'])
+methods.add('guest.status')
+methods.add('control.display.resize')
 methods.add('image.info')
 methods.add('hardware.capabilities')
 methods.add('vms.settings.get')
@@ -125,12 +130,13 @@ app.whenReady().then(async () => {
     // Escape can end HTML fullscreen while the native window remains fullscreen.
     if (window.isFullScreen()) window.setFullScreen(false)
   })
-  window.on('blur', () => { void releaseAll(); window.webContents.send('control-lost') })
+  window.on('blur', () => { for (const action of guestActions.values()) action.abort(); void releaseAll(); window.webContents.send('control-lost') })
   window.webContents.on('render-process-gone', () => { void releaseAll() })
   window.on('close', event => {
     if (allowedClose) return
     event.preventDefault()
     if (handlingClose) return
+    for (const action of guestActions.values()) action.abort()
     window.webContents.send('close-request')
     void releaseAll()
   })
@@ -236,6 +242,54 @@ app.whenReady().then(async () => {
     }
     return result
   })
+  ipcMain.handle('guest-cancel', (event, vmId: string) => { trusted(event); guestActions.get(vmId)?.abort() })
+  ipcMain.handle('guest-action', async (event, vmId: string, instanceId: string, action: GuestAction, options: { path?: string; readOnly?: boolean; text?: string } = {}) => {
+    trusted(event)
+    if (handlingClose || !/^[A-Za-z0-9_.-]{1,128}$/.test(vmId) || typeof instanceId !== 'string' || instanceId.length > 128 || !['copy', 'paste', 'text', 'sync', 'upload', 'download', 'share', 'unshare'].includes(action)) throw new Error('增强操作无效')
+    if (typeof options !== 'object' || options === null || Array.isArray(options) || Buffer.byteLength(JSON.stringify(options)) > 64 * 1024) throw new Error('增强参数无效')
+    if (guestActions.has(vmId)) throw new Error('该虚拟机已有增强操作正在进行')
+    const root = runtimeRoot
+    const owner = await call(root, 'hello')
+    if (!Array.isArray(owner.features) || !owner.features.includes('guest-enhancements-v1')) throw new Error('后台需要重启才能启用增强工具')
+    const generation = String(owner.generation)
+    const request = (method: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> => call(root, method, vmId, payload, generation)
+    let path: string | undefined
+    if (action === 'upload' || action === 'download') checkedGuestPath(options.path)
+    if (action === 'text') checkedClipboard(typeof options.text === 'string' ? options.text : '')
+    await releaseAll(); window.webContents.send('control-lost')
+    await agentServices.get(resolve(configRoot))?.stopVm(vmId)
+    if (action === 'upload' || action === 'share') {
+      const result = await dialog.showOpenDialog(window, { title: action === 'share' ? '选择共享目录' : '选择要发送的文件（最多 16 MiB）', properties: action === 'share' ? ['openDirectory'] : ['openFile'] })
+      if (result.canceled || !result.filePaths[0]) return { completed: false }
+      path = result.filePaths[0]
+    } else if (action === 'download') {
+      const result = await dialog.showSaveDialog(window, { title: '保存客户机文件' })
+      if (result.canceled || !result.filePath) return { completed: false }
+      path = result.filePath
+    }
+    if (!window.isFocused() || handlingClose) throw new Error('请回到 Palette 窗口后重试')
+    if (guestActions.has(vmId)) throw new Error('该虚拟机已有增强操作正在进行')
+    const controller = new AbortController()
+    guestActions.set(vmId, controller)
+    const progress = (bytes: number): void => { if (!window.isDestroyed()) window.webContents.send('guest-progress', { vmId, bytes, phase: 'running' }) }
+    try {
+      await withGuestLease(request, instanceId, controller.signal, async controlled => {
+        if (action === 'paste' || action === 'text') await controlled('control.clipboard.set', { text: checkedClipboard(action === 'paste' ? clipboard.readText() : options.text ?? '') })
+        else if (action === 'copy') {
+          const result = await controlled('control.clipboard.get', {})
+          if (typeof result.text !== 'string') throw new Error('客户机剪贴板无效')
+          clipboard.writeText(checkedClipboard(result.text))
+        } else if (action === 'sync') await controlled('guest.sync_time', {})
+        else if (action === 'upload') await uploadGuestFile(controlled, path!, options.path!, controller.signal, progress)
+        else if (action === 'download') await downloadGuestFile(controlled, path!, options.path!, controller.signal, progress)
+        else await controlled('guest.share.set', { folders: action === 'unshare' ? [] : [{ tag: 'shared', path, read_only: options.readOnly !== false }] })
+      })
+      return { completed: true }
+    } finally {
+      guestActions.delete(vmId)
+      if (!window.isDestroyed()) window.webContents.send('guest-progress', { vmId, bytes: 0, phase: 'done' })
+    }
+  })
   ipcMain.handle('choose-file', async (event, source: string) => {
     trusted(event)
     if (source !== 'image' && source !== 'iso') throw new Error('文件类型无效')
@@ -244,6 +298,7 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('choose-root', async event => {
     trusted(event)
+    if (guestActions.size) throw new Error('请先结束文件传输或增强操作后再切换工作目录')
     if (handlingClose) throw new Error('正在退出，请稍候')
     const result = await dialog.showOpenDialog(window, { properties: ['openDirectory'] })
     if (result.canceled) return null

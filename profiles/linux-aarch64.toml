@@ -23,3 +23,12 @@ allowed_options = ["file"]
 [guest_tools.allowed_apps.file-manager]
 executable = "/usr/bin/thunar"
 allowed_options = ["directory"]
+
+# Optional upstream tools: missing guest services preserve basic VM operation.
+[guest_agent]
+enabled = true
+
+[guest_desktop]
+clipboard = true
+resize = true
+shared_folders = true

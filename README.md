@@ -274,3 +274,7 @@ uv run python scripts/p0_probe.py          # measure cold boot, capture latency,
 ## License
 
 Licensed under the [Apache-2.0 License](LICENSE).
+
+## Optional Guest Enhancements
+
+See the [guest enhancement guide](docs/guest-enhancements.md) for guest installation, automatic capability detection and degradation, Unicode clipboard, automatic resolution, QGA management, file transfer, and private WebDAV shared directories. Missing tools preserve the basic VM console.

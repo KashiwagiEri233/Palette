@@ -167,3 +167,12 @@ max_overlays = 8
 persist_screenshots = false
 audit_max_bytes = 8388608
 audit_max_files = 5
+
+# Optional upstream tools: missing guest services preserve basic VM operation.
+[guest_agent]
+enabled = true
+
+[guest_desktop]
+clipboard = true
+resize = true
+shared_folders = true

@@ -185,6 +185,8 @@ class PaletteService:
         else:
             ledger = InputLedgerState(release_confirmed=False)
         guest = instance.guest_tools
+        from .enhancements import enhancement_status
+
         guest_status = await guest.capabilities() if guest is not None else None
         status = VmStatus(
             **execution_info(instance.profile),
@@ -227,6 +229,7 @@ class PaletteService:
                 else GuestToolStatus()
             ),
             queued_actions=controller.queued_jobs if controller else 0,
+            enhancements=enhancement_status(instance),
             controller_owned=True,
             control_owner="operator" if vm_id in self.control.leases else "agent",
             control_state=self.control.leases[vm_id].state

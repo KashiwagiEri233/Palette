@@ -1,2 +1,5 @@
 # Vendored Pi checksums require stable bytes across Windows and Unix checkouts.
 desktop/vendor/pi/** text=auto eol=lf
+
+# These files are copied into Linux guests, including from Windows checkouts.
+guest/linux/** text=auto eol=lf

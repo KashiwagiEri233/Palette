@@ -4,6 +4,9 @@ import type { WorkspaceMethod } from '../shared/workspace'
 import type { AgentMethod, AgentEvent } from '../shared/agent'
 
 const api: DesktopApi = {
+  guestAction: (vmId, instanceId, action, options) => ipcRenderer.invoke('guest-action', vmId, instanceId, action, options),
+  cancelGuestAction: vmId => ipcRenderer.invoke('guest-cancel', vmId),
+  onGuestProgress: callback => { const listener = (_event: Electron.IpcRendererEvent, event: import('../shared/guest').GuestProgress): void => callback(event); ipcRenderer.on('guest-progress', listener); return () => ipcRenderer.removeListener('guest-progress', listener) },
   platform: process.platform,
   setWindowBackdrop: (opacity, background) => ipcRenderer.invoke('window-backdrop', opacity, background),
   connect: () => ipcRenderer.invoke('connect'),

@@ -11,6 +11,8 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
 import { IconButton } from './components/workspace-primitives'
 import { toast } from 'sonner'
+import { GuestEnhancements } from './GuestEnhancements'
+import type { GuestStatus } from '../shared/guest'
 
 export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRecord; reportError: (message: string) => void; onAction?: (action: string) => void; busy?: boolean }) {
   const mount = useRef<HTMLDivElement>(null)
@@ -33,11 +35,56 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
   const scaleMenuOpen = useRef(false)
   const [acquiring, setAcquiring] = useState(false)
   const running = vm.status.state === 'RUNNING'
+  const [guestStatus, setGuestStatus] = useState<GuestStatus | null>(null)
+  const [autoResize, setAutoResize] = useState(false)
+  const autoResizeRef = useRef(false)
+  const resizePending = useRef<{ width: number; height: number; at: number } | null>(null)
+
+  useEffect(() => {
+    let disposed = false
+    let polling = false
+    setGuestStatus(null); setAutoResize(false); autoResizeRef.current = false; resizePending.current = null
+    const poll = async (): Promise<void> => {
+      if (polling || !running || !vm.status.instance_id) return
+      polling = true
+      try { const result = await window.palette.request('guest.status', vm.vm_id, { instance_id: vm.status.instance_id }) as GuestStatus; if (!disposed) setGuestStatus(result) }
+      catch { if (!disposed) setGuestStatus(null) }
+      finally { polling = false }
+    }
+    void poll()
+    const timer = window.setInterval(() => void poll(), 3000)
+    return () => { disposed = true; clearInterval(timer) }
+  }, [vm.vm_id, vm.status.instance_id, running])
+
+  useEffect(() => {
+    if (!autoResize || !controlling || !guestStatus?.desktop.resize || !surface.current) return
+    let timer = 0
+    let disposed = false
+    const observer = new ResizeObserver(() => {
+      clearTimeout(timer)
+      timer = window.setTimeout(() => {
+        const current = lease.current
+        if (!current || disposed || !surface.current) return
+        const width = Math.min(4096, Math.max(320, Math.floor(surface.current.clientWidth / 2) * 2))
+        const height = Math.min(4096, Math.max(200, Math.floor(surface.current.clientHeight / 2) * 2))
+        if (geometry.current.width === width && geometry.current.height === height) return
+        const pending = resizePending.current
+        if (pending && pending.width === width && pending.height === height) return
+        resizePending.current = { width, height, at: Date.now() }
+        void window.palette.request('control.display.resize', vm.vm_id, { instance_id: vm.status.instance_id, lease_id: current.lease_id, width, height }).then(() => {
+          window.setTimeout(() => { const pending = resizePending.current; if (!disposed && pending && Date.now() - pending.at >= 7500) { resizePending.current = null; setAutoResize(false); autoResizeRef.current = false; toast.info('客户机未确认分辨率变化，已保留画面缩放') } }, 8000)
+        }).catch(error => { if (!disposed) { resizePending.current = null; setAutoResize(false); autoResizeRef.current = false; reportError(String(error)) } })
+      }, 500)
+    })
+    observer.observe(surface.current)
+    return () => { disposed = true; observer.disconnect(); clearTimeout(timer) }
+  }, [autoResize, controlling, guestStatus?.desktop.resize, vm.vm_id, vm.status.instance_id])
 
   async function release(): Promise<void> {
     acquisition.current += 1
     setAcquiring(false)
     const previous = lease.current
+    resizePending.current = null
     lease.current = null
     queue.current?.stop(); queue.current = null
     setControlling(false)
@@ -101,7 +148,10 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
         observer = new MutationObserver(() => {
           const canvas = mount.current?.querySelector('canvas')
           if (canvas && (canvas.width !== geometry.current.width || canvas.height !== geometry.current.height)) {
-            void release().then(sync).catch(error => reportError(String(error)))
+            const pending = resizePending.current
+            const resume = !!lease.current && autoResizeRef.current && pending?.width === canvas.width && pending?.height === canvas.height
+            resizePending.current = null
+            void release().then(sync).then(() => { if (resume && !disposed && document.hasFocus()) return acquire() }).catch(error => reportError(String(error)))
           }
         })
         observer.observe(mount.current, { childList: true, subtree: true, attributes: true, attributeFilter: ['width', 'height'] })
@@ -184,6 +234,8 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
     <div className="console-toolbar">
       <div className="flex items-center gap-2"><span className={`status-dot ${connected ? 'online' : ''}`} /><span>{connected ? controlling ? '人工控制' : '仅查看' : '未连接'}</span>{onAction && <ButtonGroup aria-label="虚拟机电源操作"><IconButton label="关机" disabled={busy || !['RUNNING', 'PAUSED'].includes(vm.status.state)} onClick={() => onAction('stop')}><Power size={15} /></IconButton><IconButton label="重启" disabled={busy || !running || !vm.persistent} onClick={() => onAction('restart')}><RotateCw size={15} /></IconButton></ButtonGroup>}</div>
       <div className="flex items-center gap-2">
+        <GuestEnhancements vm={vm} status={guestStatus} release={release} reportError={reportError} />
+        <label className="flex items-center gap-1 text-xs" title={guestStatus?.desktop.resize ? '接管时自动调整客户机分辨率' : '需要 virtio-gpu 和客户机会话工具'}><input type="checkbox" checked={autoResize} disabled={!guestStatus?.desktop.resize} onChange={event => { setAutoResize(event.target.checked); autoResizeRef.current = event.target.checked }} />自动分辨率</label>
         <Button variant={controlling ? 'default' : 'secondary'} disabled={!connected || acquiring} onClick={() => controlling ? void release() : void acquire()}><PcMouseIcon className="size-4" />{acquiring ? '正在接管…' : controlling ? '结束控制' : '接管'}</Button>
         <Select value={scale} items={{ fit: '适应窗口', native: '原始尺寸' }} onValueChange={value => { if (value) changeScale(value) }} onOpenChange={open => { scaleMenuOpen.current = open }}>
           <SelectTrigger aria-label="画面缩放" className="console-scale-select"><SelectValue /></SelectTrigger>

@@ -211,6 +211,8 @@ class ControlManager:
         if controller is not None:
             result = await controller.emergency_release()
             confirmed = result.release_confirmed
+        if instance.qemu_guest_agent is not None:
+            await instance.qemu_guest_agent.close_files()
         if confirmed or instance.process is None or instance.process.returncode is not None:
             self.leases.pop(vm_id, None)
         else:

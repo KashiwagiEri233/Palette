@@ -11,6 +11,7 @@ from . import __version__
 from .cleanup import close_all, join_cleanup
 from .desktop import DesktopManager
 from .display import DisplayGateway
+from .enhancements import EnhancementRoutes
 from .errors import ErrorCode, PaletteError
 from .operator.protocol import DesktopCommand
 from .operator.server import OperatorServer
@@ -27,6 +28,7 @@ class RuntimeOwner:
         self.operator = OperatorServer(service)
         self.desktop = DesktopManager(service)
         self.display = DisplayGateway(service)
+        self.enhancements = EnhancementRoutes(service)
         self.stopping = asyncio.Event()
         self.operator.desktop_route = self.route
         self.agent: AgentServer | None = None
@@ -83,6 +85,7 @@ class RuntimeOwner:
                     "runtime-stop",
                     "vm-stop-identity",
                     "driver-claim-v1",
+                    "guest-enhancements-v1",
                 ],
                 "owner_kind": self.kind,
                 "pid": os.getpid(),
@@ -103,6 +106,12 @@ class RuntimeOwner:
                     for profile in self.service.config.profiles.values()
                 ],
             }
+        if method.startswith("guest.") or method in {
+            "control.clipboard.get",
+            "control.clipboard.set",
+            "control.display.resize",
+        }:
+            return await self.enhancements.route(vm_id, method, payload)
         if method == "doctor":
             from .cli import build_doctor_report
 

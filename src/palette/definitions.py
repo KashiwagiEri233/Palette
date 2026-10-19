@@ -113,6 +113,20 @@ class DefinitionRepository:
                         ErrorCode.INVALID_ARGUMENT, "VM definition exceeds its limit"
                     )
                 definition = VmDefinition.model_validate_json(path.read_text(encoding="utf-8"))
+                # Definitions written before upstream integrations existed inherit only
+                # missing channel settings from their trusted profile. Never inherit
+                # directory exports, disks, graphics, resources, or explicit opt-outs.
+                defaults = manager.config.profiles.get(definition.profile.profile_id)
+                if defaults is not None:
+                    updates = {
+                        name: getattr(defaults, name)
+                        for name in ("guest_agent", "guest_desktop")
+                        if name not in definition.profile.model_fields_set
+                    }
+                    if updates:
+                        definition = definition.model_copy(
+                            update={"profile": definition.profile.model_copy(update=updates)}
+                        )
                 validate_identifier(definition.vm_id, what="vm_id")
                 if path.stem != definition.vm_id:
                     raise PaletteError(

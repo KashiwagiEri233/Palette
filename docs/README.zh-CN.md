@@ -13,6 +13,7 @@
 
 | 文档 | 适用读者与核心内容 |
 | --- | --- |
+| [虚拟机增强工具](guest-enhancements.zh-CN.md) · [English](guest-enhancements.md) | 客户机安装、能力检测与降级、中文剪贴板、自动分辨率、QGA 管理、文件传输与私有 WebDAV 共享 |
 | [项目总览 (../README.zh-CN.md)](../README.zh-CN.md) · [English](../README.md) | 架构全景、核心特性、快速开始与安全默认开关速览 |
 | [桌面应用指南 (desktop.zh-CN.md)](desktop.zh-CN.md) · [English](desktop.md) | Palette Desktop 源码运行、持久虚拟机创建、离线硬件配置、只读画面网关、人工独占接管与共用后台 |
 | [后端资源所有权与并发](backend-architecture.zh-CN.md) · [English](backend-architecture.md) | 应用职责、按 VM 并发、磁盘引用与取消后的资源清理 |
