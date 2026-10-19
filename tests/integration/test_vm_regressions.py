@@ -38,7 +38,7 @@ async def test_failed_channel_replacement_reaps_the_old_process(service: Palette
     current = await service.manager.start("desktop")
     assert old.process.returncode is not None
     assert not old.tasks
-    assert old.controller is not None and old.controller._worker is None
+    assert old.controller is not None and old.controller.scheduler.worker is None
     assert current is service.manager.get("desktop")
     assert current.process is not None and current.process.returncode is None
 
@@ -138,7 +138,7 @@ async def test_cancelled_start_finishes_cleanup_after_second_cancel(service, mon
     with pytest.raises(asyncio.CancelledError):
         await task
     assert instance.process is not None and instance.process.returncode is not None
-    assert instance.controller is not None and instance.controller._worker is None
+    assert instance.controller is not None and instance.controller.scheduler.worker is None
     assert service.manager.find("desktop") is None
     assert not instance.paths.root.exists()
 
@@ -173,7 +173,7 @@ async def test_stop_and_reset_finish_stopping_before_propagating_cancel(
 
 async def test_stop_queued_after_reset_targets_the_replacement(service) -> None:
     first = await service.manager.start("desktop")
-    async with service.manager._lock:
+    async with service.manager.operations.hold("desktop"):
         reset = asyncio.create_task(service.manager.reset("desktop"))
         await asyncio.sleep(0)
         stop = asyncio.create_task(service.manager.stop("desktop"))
@@ -214,7 +214,7 @@ async def test_cancelled_shutdown_still_stops_every_vm(service, monkeypatch) -> 
 
 async def test_authorized_stop_does_not_apply_to_a_replacement(service) -> None:
     first = await service.manager.start("desktop")
-    async with service.manager._lock:
+    async with service.manager.operations.hold("desktop"):
         reset = asyncio.create_task(service.manager.reset("desktop"))
         await asyncio.sleep(0)
         stop = asyncio.create_task(service.stop("desktop"))
@@ -331,10 +331,10 @@ def test_doctor_checks_disk_contents_instead_of_extension(service, tmp_path) -> 
     profile = profile.model_copy(
         update={"images": profile.images.model_copy(update={"base": str(renamed)})}
     )
-    report = service.manager._images(profile).verify_base_image()
+    report = service.manager.images_for(profile).verify_base_image()
     assert report["ok"] is True and report["actual_format"] == "qcow2"
     renamed.write_bytes(b"a raw disk, regardless of its suffix")
-    report = service.manager._images(profile).verify_base_image()
+    report = service.manager.images_for(profile).verify_base_image()
     assert report["ok"] is False and report["actual_format"] == "raw"
 
 
@@ -361,7 +361,7 @@ async def test_failed_manifest_identity_never_authorizes_deletion(service) -> No
     document = json.loads(instance.paths.manifest.read_text())
     document["instance_id"] = "someone-else"
     instance.paths.manifest.write_text(json.dumps(document))
-    images = service.manager._images(instance.profile)
+    images = service.manager.images_for(instance.profile)
     with pytest.raises(PaletteError) as error:
         images.delete_instance("desktop", instance.view.instance_id)
     assert error.value.code is ErrorCode.PATH_DENIED

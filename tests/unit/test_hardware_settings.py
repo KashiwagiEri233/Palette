@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,51 @@ from palette.config import AudioConfig, HostConfig, Profile
 from palette.errors import PaletteError
 from palette.vm.launcher import build_launch_plan
 from palette.vm_settings import CapabilityProbe, settings_from_profile, validate_hardware
+
+
+async def test_capability_probe_is_shared_and_survives_one_cancelled_waiter(
+    config, profile, monkeypatch
+) -> None:
+    probe = CapabilityProbe(config.host)
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+    calls = 0
+
+    async def inspect(*_args):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await resume.wait()
+        return {"available": True}
+
+    monkeypatch.setattr(probe, "_probe", inspect)
+    first = asyncio.create_task(probe.get(profile))
+    await entered.wait()
+    second = asyncio.create_task(probe.get(profile))
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    resume.set()
+    assert await second == {"available": True}
+    assert await probe.get(profile) == {"available": True}
+    assert calls == 1
+    await probe.close()
+
+
+async def test_failed_capability_probe_can_be_retried(config, profile, monkeypatch) -> None:
+    probe = CapabilityProbe(config.host)
+    calls = 0
+
+    async def inspect(*_args):
+        nonlocal calls
+        calls += 1
+        return {"available": calls > 1}
+
+    monkeypatch.setattr(probe, "_probe", inspect)
+    assert not (await probe.get(profile))["available"]
+    assert (await probe.get(profile))["available"]
+    assert calls == 2
+    await probe.close()
 
 
 async def test_missing_devices_and_audio_are_explained(

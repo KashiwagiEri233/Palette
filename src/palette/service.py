@@ -15,14 +15,15 @@ must hold no matter which tool was called:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable, Sequence
-from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from .audit import AuditLog, NullAuditLog
 from .config import PaletteConfig
+from .contracts import Actor as Actor
 from .errors import ErrorCode, PaletteError
 from .guest_tools.base import GuestToolOutcome
 from .input.controller import ActionController
@@ -38,19 +39,18 @@ from .models import (
     Receipt,
     ReleaseResult,
     StatusResult,
+    VmListResult,
     VmStatus,
+    VmSummary,
     WaitResult,
 )
-from .policy import PathGuard, Policy, validate_identifier
-from .vm.images import validate_caller_path
-from .vm.launcher import ExtraVolume, LaunchOverrides
+from .policy import Policy, validate_identifier
 from .vm.manager import VmInstance, VmManager, VmState
 
 logger = logging.getLogger("palette.service")
 
 #: Roles a request can be attributed to. Only trusted call sites choose a role; an agent
 #: cannot ask for one.
-Actor = Literal["agent", "operator"]
 
 
 class PaletteService:
@@ -73,15 +73,36 @@ class PaletteService:
         from .control import ControlManager
 
         self.control = ControlManager(self)
+        from .driver import DriverManager
+
+        self.driver = DriverManager(self)
+        from .lifecycle import LifecycleService
+
+        self.lifecycle = LifecycleService(self)
+        self._shutdown_task: asyncio.Task[None] | None = None
 
     # -- lifecycle --------------------------------------------------------------------
     async def startup(self) -> None:
         self.config.runtime_root.mkdir(parents=True, exist_ok=True)
         self.control.start()
+        self.driver.start()
 
     async def shutdown(self) -> None:
-        await self.control.close()
-        await self.manager.shutdown()
+        from .cleanup import close_all, join_cleanup
+
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(
+                close_all(
+                    (
+                        self.manager.operations.seal,
+                        self.driver.close,
+                        self.control.close,
+                        self.manager.shutdown,
+                    )
+                ),
+                name="service-shutdown",
+            )
+        await join_cleanup(self._shutdown_task)
 
     # -- helpers ----------------------------------------------------------------------
     def policy_for(self, vm_id: str) -> Policy:
@@ -90,7 +111,7 @@ class PaletteService:
     def _instance(self, vm_id: str) -> VmInstance:
         return self.manager.get(vm_id)
 
-    def _require_instance_id(self, instance: VmInstance, instance_id: str) -> None:
+    def require_instance_id(self, instance: VmInstance, instance_id: str) -> None:
         """Bind a request to the process it was written for.
 
         Without this a request that outlived a reset could be applied to the *new*
@@ -104,16 +125,42 @@ class PaletteService:
                 details={"expected_instance_id": instance.view.instance_id},
             )
 
-    def _controller(self, instance: VmInstance) -> ActionController:
+    def controller_for(self, instance: VmInstance) -> ActionController:
         if instance.controller is None:
             raise PaletteError(
                 ErrorCode.VM_NOT_RUNNING,
                 f"VM {instance.view.vm_id!r} has no active session",
                 details={"state": str(instance.state)},
             )
+        instance.controller.mutation_guard = lambda: self.control.require_agent(instance.view.vm_id)
         return instance.controller
 
     # -- observation ------------------------------------------------------------------
+    async def list_vms(self) -> VmListResult:
+        desktop = self.lifecycle.desktop
+        definitions = desktop.definitions if desktop is not None else {}
+        records: list[VmSummary] = []
+        for vm_id in sorted(set(definitions) | set(self.manager.known())):
+            definition = definitions.get(vm_id)
+            instance = self.manager.find(vm_id)
+            lease = self.control.leases.get(vm_id)
+            profile = instance.profile if instance else definition.profile if definition else None
+            records.append(
+                VmSummary(
+                    vm_id=vm_id,
+                    name=definition.draft.name if definition else vm_id,
+                    persistent=definition is not None,
+                    state=str(instance.state) if instance else "STOPPED",
+                    guest_arch=profile.qemu.arch if profile else None,
+                    instance_id=instance.view.instance_id if instance else None,
+                    screen_ready=instance.view.screen_ready if instance else False,
+                    control_owner="operator" if lease else "agent",
+                    control_state=lease.state if lease else "available",
+                    agent_driver_claimed=vm_id in self.driver.claims,
+                )
+            )
+        return VmListResult(ok=True, vms=records)
+
     async def status(self, vm_id: str, *, actor: Actor = "agent") -> StatusResult:
         from .platforms import execution_info
 
@@ -215,11 +262,11 @@ class PaletteService:
                 "max_long_edge must be between 64 and 4096",
                 details={"max_long_edge": max_long_edge},
             )
-        controller = self._controller(instance)
+        controller = self.controller_for(instance)
         frame, captured = await controller.observe(
             request_id=request_id, max_long_edge=max_long_edge
         )
-        self._audit("observe", vm_id, frame=frame, scaled=captured.scaled)
+        self.record_event("observe", vm_id, frame=frame, scaled=captured.scaled)
         return ObserveResult(
             ok=True,
             frame=frame,
@@ -238,11 +285,11 @@ class PaletteService:
     ) -> tuple[ObserveResult, bytes]:
         """Observe and hand back the encoded PNG for the transport layer to embed."""
         instance = await self.manager.require_running(vm_id)
-        controller = self._controller(instance)
+        controller = self.controller_for(instance)
         frame, captured = await controller.observe(
             request_id=request_id, max_long_edge=max_long_edge
         )
-        self._audit("observe", vm_id, frame=frame, scaled=captured.scaled)
+        self.record_event("observe", vm_id, frame=frame, scaled=captured.scaled)
         return (
             ObserveResult(
                 ok=True,
@@ -286,7 +333,7 @@ class PaletteService:
                 ErrorCode.INVALID_ARGUMENT,
                 "changed and stable waits compare against a previous frame, so after_frame_id is required",
             )
-        controller = self._controller(instance)
+        controller = self.controller_for(instance)
         result, image = await controller.wait(
             after_frame_id=after_frame_id,
             mode=mode,
@@ -294,7 +341,9 @@ class PaletteService:
             delay_ms=delay_ms,
             threshold=threshold,
         )
-        self._audit("wait", vm_id, mode=mode, reason=str(result.reason), samples=result.samples)
+        self.record_event(
+            "wait", vm_id, mode=mode, reason=str(result.reason), samples=result.samples
+        )
         return result, image
 
     # -- actions ----------------------------------------------------------------------
@@ -316,14 +365,14 @@ class PaletteService:
         validate_identifier(request_id, what="request_id")
         self.control.require_agent(vm_id)
         instance = await self.manager.require_running(vm_id)
-        self._require_instance_id(instance, instance_id)
-        controller = self._controller(instance)
+        self.require_instance_id(instance, instance_id)
+        controller = self.controller_for(instance)
         return await controller.act(request_id=request_id, frame_id=frame_id, action_payload=action)
 
     async def release_inputs(self, vm_id: str, *, instance_id: str) -> ReleaseResult:
         self.control.require_agent(vm_id)
         instance = self.manager.get(vm_id)
-        self._require_instance_id(instance, instance_id)
+        self.require_instance_id(instance, instance_id)
         controller = instance.controller
         if controller is None:
             return ReleaseResult(
@@ -331,8 +380,8 @@ class PaletteService:
                 release_confirmed=False,
                 note="this VM has no active input session; nothing is held by this service",
             )
-        result = await controller.release_inputs()
-        self._audit(
+        result = await controller.release_inputs(guarded=True)
+        self.record_event(
             "release_inputs",
             vm_id,
             confirmed=result.release_confirmed,
@@ -357,7 +406,7 @@ class PaletteService:
         validate_identifier(request_id, what="request_id")
         self.control.require_agent(vm_id)
         instance = await self.manager.require_running(vm_id)
-        self._require_instance_id(instance, instance_id)
+        self.require_instance_id(instance, instance_id)
         policy = instance.policy
         policy.require_capability("guest.input_text")
         self._require_boot_epoch(instance, boot_epoch)
@@ -366,7 +415,7 @@ class PaletteService:
             raise PaletteError(
                 ErrorCode.GUEST_TOOL_UNAVAILABLE, "no guest tool backend is attached"
             )
-        controller = self._controller(instance)
+        controller = self.controller_for(instance)
 
         async def runner(on_sending: Callable[[], None]) -> GuestToolOutcome:
             policy.require_capability("guest.input_text")
@@ -396,7 +445,7 @@ class PaletteService:
         self.control.require_agent(vm_id)
         validate_identifier(app_id, what="app_id")
         instance = await self.manager.require_running(vm_id)
-        self._require_instance_id(instance, instance_id)
+        self.require_instance_id(instance, instance_id)
         policy = instance.policy
         policy.require_capability("guest.launch_app")
         policy.require_app(app_id)
@@ -407,7 +456,7 @@ class PaletteService:
             raise PaletteError(
                 ErrorCode.GUEST_TOOL_UNAVAILABLE, "no guest tool backend is attached"
             )
-        controller = self._controller(instance)
+        controller = self.controller_for(instance)
 
         async def runner(on_sending: Callable[[], None]) -> GuestToolOutcome:
             policy.require_capability("guest.launch_app")
@@ -443,23 +492,9 @@ class PaletteService:
         extra_disks: Sequence[str] | None = None,
         qemu_args: Sequence[str] | None = None,
     ) -> LifecycleResult:
-        """Start a VM, optionally with host material the caller supplied.
-
-        Each kind of override has its own switch and its own consequence, so they are
-        authorised and validated one at a time rather than as a bundle. Nothing here is
-        filtered for content: a caller who may pass QEMU arguments may pass any of them,
-        which is exactly the condition the threat model records as "the host boundary is
-        the caller's to keep".
-        """
-        validate_identifier(vm_id, what="vm_id")
-        if actor == "agent":
-            self.control.require_agent(vm_id)
-        profile = self.config.profile(profile_id)
-        # The lifecycle gate uses the profile being started, not one already running.
-        gate = Policy(profile, _runtime_guard(self.config))
-        gate.require_lifecycle("start", actor=actor)
-        overrides = self._build_overrides(
-            gate,
+        return await self.lifecycle.start(
+            vm_id,
+            profile_id=profile_id,
             actor=actor,
             image=image,
             image_format=image_format,
@@ -467,154 +502,32 @@ class PaletteService:
             extra_disks=extra_disks,
             qemu_args=qemu_args,
         )
-        instance = await self.manager.start(vm_id, profile.profile_id, overrides=overrides)
-        if self.audit.enabled and not overrides.is_empty:
-            # Shape only: kinds and counts. The paths themselves go into the manifest, where
-            # they belong, and not into a log that outlives the instance.
-            self.audit.record(
-                "vm.started_with_overrides",
-                vm_id=vm_id,
-                instance_id=instance.view.instance_id,
-                overrides=",".join(overrides.describe()),
-            )
-        return LifecycleResult(
-            ok=True,
-            vm_id=vm_id,
-            state=str(instance.state),
-            instance_id=instance.view.instance_id,
-            profile_id=profile.profile_id,
-            note=(
-                "started with caller-supplied " + ", ".join(overrides.describe())
-                if not overrides.is_empty
-                else None
-            ),
-        )
-
-    def _build_overrides(
-        self,
-        gate: Policy,
-        *,
-        actor: Actor,
-        image: str | None,
-        image_format: str | None,
-        iso: Sequence[str] | None,
-        extra_disks: Sequence[str] | None,
-        qemu_args: Sequence[str] | None,
-    ) -> LaunchOverrides:
-        """Authorise, then validate, then normalise what the caller handed us."""
-        resolved_image: Path | None = None
-        if image is not None:
-            gate.require_host_material("image", actor=actor)
-            resolved_image = validate_caller_path(image, what="image")
-        if image_format is not None and resolved_image is None:
-            raise PaletteError(
-                ErrorCode.INVALID_ARGUMENT,
-                "image_format only means something together with image",
-            )
-        if image_format is not None:
-            image_format = image_format.lower()
-            if image_format not in {"raw", "qcow2"}:
-                raise PaletteError(ErrorCode.IMAGE_INVALID, "image_format must be raw or qcow2")
-
-        volumes: list[ExtraVolume] = []
-        optical = list(iso or ())
-        disks = list(extra_disks or ())
-        if optical or disks:
-            gate.require_host_material("iso", actor=actor)
-        for path in optical:
-            volumes.append(
-                ExtraVolume(path=str(validate_caller_path(path, what="ISO")), media="cdrom")
-            )
-        for path in disks:
-            volumes.append(
-                ExtraVolume(path=str(validate_caller_path(path, what="extra disk")), media="disk")
-            )
-
-        args = list(qemu_args or ())
-        if args:
-            gate.require_host_material("qemu_args", actor=actor)
-            args = _validate_qemu_args(args)
-
-        return LaunchOverrides(
-            image=resolved_image,
-            image_format=image_format,
-            volumes=tuple(volumes),
-            qemu_args=tuple(args),
-        )
 
     async def stop(
-        self, vm_id: str, *, force: bool = False, actor: Actor = "operator"
+        self,
+        vm_id: str,
+        *,
+        force: bool = False,
+        actor: Actor = "operator",
+        expected_instance_id: str | None = None,
     ) -> LifecycleResult:
-        if actor == "agent":
-            self.control.require_agent(vm_id)
-        else:
-            await self.control.revoke(vm_id)
-        instance = self.manager.get(vm_id)
-        instance.policy.require_lifecycle("force_stop" if force else "stop", actor=actor)
-        stopped = await self.manager.stop(
-            vm_id, force=force, expected_instance_id=instance.view.instance_id
-        )
-        return LifecycleResult(
-            ok=True,
-            vm_id=vm_id,
-            state=str(stopped.state),
-            instance_id=stopped.view.instance_id,
+        return await self.lifecycle.stop(
+            vm_id, force=force, actor=actor, expected_instance_id=expected_instance_id
         )
 
     async def reset(
         self, vm_id: str, *, profile_id: str | None = None, actor: Actor = "operator"
     ) -> LifecycleResult:
-        if actor == "agent":
-            self.control.require_agent(vm_id)
-        else:
-            await self.control.revoke(vm_id)
-        instance = self.manager.find(vm_id)
-        profile = instance.profile if instance is not None else self.config.profile(profile_id)
-        gate = Policy(profile, _runtime_guard(self.config))
-        gate.require_lifecycle("reset", actor=actor)
-        new_instance = await self.manager.reset(
-            vm_id,
-            profile.profile_id,
-            expected_instance_id=instance.view.instance_id if instance is not None else None,
-            expect_absent=instance is None,
-        )
-        return LifecycleResult(
-            ok=True,
-            vm_id=vm_id,
-            state=str(new_instance.state),
-            instance_id=new_instance.view.instance_id,
-            profile_id=profile.profile_id,
-            note=(
-                "the previous writable layer was handled by the retention policy; "
-                "the base image is untouched"
-            ),
-        )
+        return await self.lifecycle.reset(vm_id, profile_id=profile_id, actor=actor)
 
     async def emergency_stop(self, vm_id: str | None = None) -> list[str]:
-        """Operator escape hatch: release inputs and stop, without a graceful guest."""
-        if vm_id is not None:
-            instance = self.manager.get(vm_id)
-            await self.manager.stop(
-                vm_id, force=True, expected_instance_id=instance.view.instance_id
-            )
-            return [vm_id]
-        return await self.manager.emergency_stop_all()
+        return await self.lifecycle.emergency_stop(vm_id)
 
     async def take_control(self, vm_id: str, *, reason: str) -> int:
-        """Human/operator takeover: invalidate every frame and bump the control epoch.
-
-        The plan requires an epoch bump on handover so that frames captured under the
-        previous controller cannot be used to drive input afterwards.
-        """
-        instance = self.manager.get(vm_id)
-        epoch = await self.manager.take_control(
-            vm_id, expected_instance_id=instance.view.instance_id
-        )
-        self._audit("control.handover", vm_id, epoch=epoch, reason=reason)
-        return epoch
+        return await self.lifecycle.take_control(vm_id, reason=reason)
 
     # -- audit ------------------------------------------------------------------------
-    def _audit(self, event: str, vm_id: str, **fields: Any) -> None:
+    def record_event(self, event: str, vm_id: str, **fields: Any) -> None:
         if not self.audit.enabled:
             return
         payload: dict[str, Any] = {"vm_id": vm_id, "event_kind": event}
@@ -626,45 +539,5 @@ class PaletteService:
         self.audit.record(f"tool.{event}", **payload)
 
 
-#: Bounds on caller-supplied QEMU arguments. Deliberately not a content filter — a caller
-#: who may pass arguments may pass any of them, including ones that add a monitor channel or
-#: point QEMU at a host file. These limits only stop a broken or absurd vector before a
-#: process is spawned.
-MAX_CALLER_ARGS = 64
-MAX_CALLER_ARG_CHARS = 4096
-
-
-def _validate_qemu_args(args: Sequence[str]) -> list[str]:
-    if len(args) > MAX_CALLER_ARGS:
-        raise PaletteError(
-            ErrorCode.INVALID_ARGUMENT,
-            f"at most {MAX_CALLER_ARGS} QEMU arguments may be supplied per start",
-            details={"count": len(args)},
-        )
-    cleaned: list[str] = []
-    for argument in args:
-        if not isinstance(argument, str) or not argument:
-            raise PaletteError(
-                ErrorCode.INVALID_ARGUMENT, "QEMU arguments must be non-empty strings"
-            )
-        if "\x00" in argument:
-            raise PaletteError(
-                ErrorCode.INVALID_ARGUMENT, "a QEMU argument must not contain a NUL byte"
-            )
-        if len(argument) > MAX_CALLER_ARG_CHARS:
-            raise PaletteError(
-                ErrorCode.INVALID_ARGUMENT,
-                f"a single QEMU argument may be at most {MAX_CALLER_ARG_CHARS} characters",
-            )
-        cleaned.append(argument)
-    return cleaned
-
-
 def _safe_audit_value(value: Any) -> bool:
     return isinstance(value, str | int | float | bool | type(None))
-
-
-def _runtime_guard(config: PaletteConfig) -> PathGuard:
-    from .policy import PathGuard
-
-    return PathGuard(config.runtime_root)

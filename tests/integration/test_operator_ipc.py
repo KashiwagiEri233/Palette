@@ -233,7 +233,7 @@ async def test_closing_owner_cancels_partial_clients_and_allows_restart(
         await channel.close()
     async with OperatorServer(service) as replacement:
         assert replacement.endpoint.generation != owner.endpoint.generation
-        assert not replacement._handlers
+        assert not replacement.listener.handlers
 
 
 async def test_mcp_cancel_scope_does_not_skip_vm_or_endpoint_cleanup(
@@ -357,6 +357,7 @@ async def test_real_serve_owns_cli_vms_until_exit(
         tools = json.loads(await asyncio.wait_for(process.stdout.readline(), 5))
         assert tools["id"] == 2
         names = {tool["name"] for tool in tools["result"]["tools"]}
+        assert "vm_list" in names
         assert "vm_status" in names
         assert "runtime.stop" not in names
         code, output, error = await cli(tmp_path, "start", "--profile", "default")

@@ -288,6 +288,18 @@ class FakeQemu:
             self.reply(message_id, [])
         elif command == "input-send-event":
             self.reply(message_id, {})
+            behavior = self.behavior()
+            if behavior.get("shutdown_on_input"):
+                self.send_event(
+                    "SHUTDOWN",
+                    {
+                        "guest": behavior.get("shutdown_guest", True),
+                        "reason": behavior.get("shutdown_reason", "guest-shutdown"),
+                    },
+                )
+                threading.Timer(
+                    0.15, lambda: os._exit(behavior.get("shutdown_exit_code", 0))
+                ).start()
         elif command == "screendump":
             self.screendump(message_id, arguments)
         elif command == "cont":
@@ -308,6 +320,7 @@ class FakeQemu:
                 # A guest that does not shut down: the manager must fall through to the
                 # forced path rather than waiting forever or claiming success.
                 return
+            self.send_event("SHUTDOWN", {"guest": True, "reason": "guest-shutdown"})
             threading.Timer(0.15, lambda: os._exit(0)).start()
         elif command == "quit":
             self.reply(message_id, {})

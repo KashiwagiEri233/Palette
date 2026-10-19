@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import __version__
+from .cleanup import close_all, join_cleanup
 from .desktop import DesktopManager
 from .display import DisplayGateway
 from .errors import ErrorCode, PaletteError
 from .operator.protocol import DesktopCommand
 from .operator.server import OperatorServer
 from .service import PaletteService
+
+if TYPE_CHECKING:
+    from .agent_ipc import AgentServer
 
 
 class RuntimeOwner:
@@ -24,8 +29,8 @@ class RuntimeOwner:
         self.display = DisplayGateway(service)
         self.stopping = asyncio.Event()
         self.operator.desktop_route = self.route
-        self.operator.desktop_manager = self.desktop
-        self.agent: Any = None
+        self.agent: AgentServer | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         from .agent_ipc import AgentServer
@@ -36,20 +41,30 @@ class RuntimeOwner:
             await self.desktop.recover_operations()
             await self.display.start()
             self.service.manager.console_enabled = True
-            self.agent = AgentServer(self.service, self.operator, self.desktop)
+            self.agent = AgentServer(self.service, self.operator)
             await self.agent.start()
             await self.operator.start()
         except BaseException:
-            await self.close()
+            try:
+                await self.close()
+            except BaseException as exc:
+                logging.getLogger("palette.runtime").error(
+                    "startup cleanup failed: %s", type(exc).__name__
+                )
             raise
 
     async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close(), name="runtime-close")
+        await join_cleanup(self._close_task)
+
+    async def _close(self) -> None:
         try:
-            await self.display.close()
-            await self.operator.stop()
+            steps = [self.service.manager.operations.seal, self.operator.stop]
             if self.agent is not None:
-                await self.agent.stop()
-            await self.service.shutdown()
+                steps.append(self.agent.stop)
+            steps.extend((self.display.close, self.service.shutdown))
+            await close_all(steps)
         finally:
             self.operator.release()
 
@@ -57,10 +72,18 @@ class RuntimeOwner:
         method, payload = command.method, command.payload
         vm_id = command.vm_id or ""
         if method == "hello":
+            if self.agent is None:
+                raise PaletteError(ErrorCode.STATE_CONFLICT, "the runtime is not started")
             return {
                 "version": __version__,
                 "desktop_protocol": 1,
-                "features": ["vm-settings-v2", "disk-resize", "runtime-stop"],
+                "features": [
+                    "vm-settings-v2",
+                    "disk-resize",
+                    "runtime-stop",
+                    "vm-stop-identity",
+                    "driver-claim-v1",
+                ],
                 "owner_kind": self.kind,
                 "pid": os.getpid(),
                 "generation": self.operator.endpoint.generation,
@@ -91,7 +114,7 @@ class RuntimeOwner:
 
             profile = self.service.config.profile(payload.get("profile_id"))
             path = validate_caller_path(payload["path"], what="image")
-            info = await self.service.manager._images(profile).inspect_image(path)
+            info = await self.service.manager.images_for(profile).inspect_image(path)
             return {"format": info.format, "virtual_size": info.virtual_size}
         if method == "vms.list":
             return {"vms": await self.desktop.list()}
@@ -108,17 +131,35 @@ class RuntimeOwner:
                 self.service.config.profile(payload.get("profile_id"))
             )
         if method == "vms.start":
-            if vm_id in self.desktop.definitions:
-                return await self.desktop.start(vm_id)
-            return (await self.service.start(vm_id)).model_dump(mode="json")
+            result = await self.service.start(vm_id)
+            return (
+                {
+                    key: value
+                    for key, value in result.model_dump(mode="json", exclude_unset=True).items()
+                    if key != "ok"
+                }
+                if self.service.lifecycle.is_persistent(vm_id)
+                else result.model_dump(mode="json")
+            )
         if method == "vms.stop":
-            return await self.desktop.stop(vm_id, force=payload.get("force", False))
+            return await self.desktop.stop(
+                vm_id,
+                force=payload.get("force", False),
+                expected_instance_id=payload.get("expected_instance_id"),
+            )
         if method == "vms.restart":
             return await self.desktop.restart(vm_id)
         if method == "vms.reset":
-            if vm_id in self.desktop.definitions:
-                return await self.desktop.reset(vm_id)
-            return (await self.service.reset(vm_id)).model_dump(mode="json")
+            result = await self.service.reset(vm_id)
+            return (
+                {
+                    key: value
+                    for key, value in result.model_dump(mode="json", exclude_unset=True).items()
+                    if key != "ok"
+                }
+                if self.service.lifecycle.is_persistent(vm_id)
+                else result.model_dump(mode="json")
+            )
         if method == "vms.delete":
             return await self.desktop.delete(vm_id)
         if method == "display.ticket":

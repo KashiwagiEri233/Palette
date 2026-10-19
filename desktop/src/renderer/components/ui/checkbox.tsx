@@ -1,6 +1,6 @@
 import * as React from "react"
 import { Checkbox as CheckboxPrimitive } from "@base-ui/react/checkbox"
-import { Icon } from "@iconify/react"
+import { CheckIcon } from "@/components/icons"
 
 import { cn } from "@/lib/utils"
 
@@ -47,9 +47,9 @@ const Checkbox = React.forwardRef<HTMLButtonElement, CheckboxProps>(
       >
         <CheckboxPrimitive.Indicator data-slot="checkbox-indicator" className="size-full flex items-center justify-center text-current">
           {isIndeterminate ? (
-            <Icon icon="ph:minus-bold" className="h-3 w-3" />
+            <span aria-hidden="true" className="h-0.5 w-2.5 rounded-full bg-current" />
           ) : (
-            <Icon icon="ph:check-bold" className="h-3 w-3" />
+            <CheckIcon aria-hidden="true" className="h-3 w-3" />
           )}
         </CheckboxPrimitive.Indicator>
       </CheckboxPrimitive.Root>

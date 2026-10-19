@@ -16,7 +16,7 @@ npm --prefix desktop ci
 npm --prefix desktop run build
 ```
 
-* **Prerequisites**: Python `3.12`/`3.13`, `uv`, Node.js `22.12+`, a QEMU binary and firmware matching the guest ISA, and a bootable desktop base image (`qcow2`/`raw`) or installer ISO.
+* **Prerequisites**: Python `3.12`/`3.13`, `uv`, Node.js `22.19+`, a QEMU binary and firmware matching the guest ISA, and a bootable desktop base image (`qcow2`/`raw`) or installer ISO.
 * **Identifiers**: Below, `CONFIG_ROOT` denotes the directory holding `palette.toml` and `profiles/`. Always copy `VM_ID` from the GUI **Status** view (e.g., `vm_489cdb67aca0`), never the human-readable display name.
 * **Evidence Storage**: Store test reports and screenshots under `.runtime/acceptance/`. Never commit disk images, screenshots, or connection tokens to Git.
 
@@ -79,7 +79,8 @@ Configure an MCP client that supports `stdio` and forwards `ImageContent` blocks
 
 **Pass Criteria**:
 
-* Initialization succeeds and exposes `vm_status`, `vm_observe`, `vm_act`, `vm_wait`, and `vm_release_inputs`.
+* Initialization succeeds and exposes `vm_list`, `vm_status`, `vm_observe`, `vm_act`, `vm_wait`, and `vm_release_inputs`.
+* `vm_list({})` discovers persistent and runtime-known VM IDs, including stopped definitions, without starting VMs, acquiring control or returning host configuration.
 * `vm_status({"vm_id": "VM_ID"})` returns `ok = true`, `state = "RUNNING"`, and the exact same `instance_id` shown in the GUI.
 * `vm_observe({"vm_id": "VM_ID"})` delivers an actual PNG image to the agent, not just JSON metadata.
 
@@ -160,6 +161,10 @@ The script writes `report.json`, `02-before.png`, `03-click.png`, and (after a d
 | **Close Window Only** | Close the GUI window and choose **Close Window Only** | `daemon` and VM stay running; MCP continues observing; reopening GUI reconnects to the same instance |
 | **Quit Completely** | Close the GUI window and choose **Quit Completely** | Gracefully shuts down running VMs, stops `daemon`, verifies process exit, and closes the window while preserving persistent disks |
 | **Shutdown failure** | Trigger **Quit Completely** when ACPI shutdown times out | Window remains open displaying the error with options to retry, cancel, or close window only |
+| **Confirmed recovery** | After a shutdown timeout, choose **Force Stop This VM and Quit…**; cancel once, then explicitly confirm | Cancel preserves the VM; confirmation stops only that instance, preserves disks, and continues graceful exit for other VMs. A replacement instance is rejected |
+| **Guest-initiated shutdown** | Shut down from inside the guest | A guest `SHUTDOWN` event followed by QEMU exit code 0 becomes `STOPPED`, releases resources, and retains persistent disks; panic or nonzero exit remains `FAILED` |
+
+Record QMP events, process exit code, elapsed time, and whether force was used. `POWERDOWN` only establishes that the power request was sent; it is not proof of a completed shutdown. A CLI stop that times out and then kills QEMU must not count as a graceful shutdown pass. Compare guest-agent shutdown and ACPI shutdown separately.
 
 ## 9. Offline Hardware Settings Verification
 

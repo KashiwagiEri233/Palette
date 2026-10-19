@@ -16,7 +16,7 @@ npm --prefix desktop ci
 npm --prefix desktop run build
 ```
 
-* **前置组件**：Python `3.12`/`3.13`、`uv`、Node.js `22.12+`、匹配客户机架构的 QEMU 可执行文件与 UEFI 固件，以及可启动的桌面基础镜像（`qcow2`/`raw`）或系统安装 ISO。
+* **前置组件**：Python `3.12`/`3.13`、`uv`、Node.js `22.19+`、匹配客户机架构的 QEMU 可执行文件与 UEFI 固件，以及可启动的桌面基础镜像（`qcow2`/`raw`）或系统安装 ISO。
 * **目录与标识约定**：下文中 `CONFIG_ROOT` 表示包含 `palette.toml` 和 `profiles/` 的配置根目录；`VM_ID` 必须从 GUI 的“状态”页复制真实虚拟机 ID（如 `vm_489cdb67aca0`），不能用显示名称代替。
 * **证据存放**：所有测试报告与截图均保存在 `.runtime/acceptance/` 下，切勿向 Git 提交磁盘镜像、截图或连接凭据。
 
@@ -79,7 +79,8 @@ npm --prefix desktop run preview
 
 **通过标准**：
 
-* MCP 会话初始化成功，工具列表包含 `vm_status`、`vm_observe`、`vm_act`、`vm_wait`、`vm_release_inputs`。
+* MCP 会话初始化成功，工具列表包含 `vm_list`、`vm_status`、`vm_observe`、`vm_act`、`vm_wait`、`vm_release_inputs`。
+* `vm_list({})` 可发现持久化及运行时已知 VM ID（包括停机定义），不启动 VM、不领取控制权，也不返回宿主配置。
 * 调用 `vm_status({"vm_id": "VM_ID"})` 返回 `ok = true`、`state = "RUNNING"`，且 `instance_id` 与 GUI 状态页完全一致。
 * 调用 `vm_observe({"vm_id": "VM_ID"})`，确认模型实际收到了 PNG 图像（仅列出工具或仅看到 JSON 文本不算通过）。
 
@@ -160,6 +161,10 @@ uv run python scripts/mcp_click_test.py   --root CONFIG_ROOT --vm-id VM_ID --x X
 | **仅关闭窗口** | 关闭桌面端窗口并选择“仅关闭窗口” | `daemon` 与 VM 继续运行，MCP 仍可观察，重开 GUI 可见同一运行实例 |
 | **完全退出** | 关闭桌面端窗口并选择“完全退出” | 先正常关闭所有运行中 VM，再停止当前 `daemon`，确认进程退出后关闭窗口，持久数据保留 |
 | **退出异常保护** | 正常关机超时或后台断线时点击“完全退出” | 窗口保留并显示错误原因，支持重试、取消或改为“仅关闭窗口”，绝不静默强杀 |
+| **确认后恢复退出** | 关机超时后选择“强制停止此虚拟机并退出…”，先取消一次，再明确确认 | 取消保留虚拟机运行；确认仅停止原实例并保留磁盘，其他虚拟机继续正常退出；实例已被替换时拒绝执行 |
+| **客户机内部关机** | 在客户机内部操作正常关机 | 客户机 `SHUTDOWN` 事件和 QEMU 退出码 0 对应 `STOPPED`，释放资源并保留持久磁盘；崩溃或非零退出仍为 `FAILED` |
+
+记录 QMP 事件、进程退出码、耗时及是否使用强制停止。`POWERDOWN` 仅证明发出了电源请求，不证明客户机已完成关机。CLI 停止命令若超时后强杀 QEMU，不能算正常关机通过。客户机代理关机与 ACPI 关机应分别验证。
 
 ## 9. 离线硬件设置验收清单
 

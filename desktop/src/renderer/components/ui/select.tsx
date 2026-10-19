@@ -1,6 +1,6 @@
 import * as React from "react"
 import { Select as SelectPrimitive } from "@base-ui/react/select"
-import { Icon } from "@iconify/react"
+import { CheckIcon, NavArrowDownIcon } from "@/components/icons"
 
 import { cn } from "@/lib/utils"
 import { cashmereGrainStyle, formFieldBase, formFieldSingleLine } from "./_shared"
@@ -20,10 +20,11 @@ function SelectTrigger({
 }: WithClassName<SelectPrimitive.Trigger.Props>) {
   return (
     <SelectPrimitive.Trigger
+      data-slot="select-trigger"
       className={cn(
         formFieldBase,
         formFieldSingleLine,
-        "items-center justify-between",
+        "items-center justify-between gap-2 text-left",
         "[&>span]:line-clamp-1",
         className
       )}
@@ -32,7 +33,7 @@ function SelectTrigger({
       {children}
       <SelectPrimitive.Icon
         render={
-          <Icon icon="ph:caret-down" className="h-4 w-4 text-muted-foreground opacity-70" />
+          <NavArrowDownIcon aria-hidden="true" className="h-4 w-4 shrink-0 text-muted-foreground opacity-70" />
         }
       />
     </SelectPrimitive.Trigger>
@@ -46,10 +47,10 @@ function SelectScrollUpButton({
 }: WithClassName<SelectPrimitive.ScrollUpArrow.Props>) {
   return (
     <SelectPrimitive.ScrollUpArrow
-      className={cn("top-0 flex w-full cursor-default items-center justify-center py-1", className)}
+      className={cn("inset-x-0 top-0 z-10 flex cursor-default items-center justify-center bg-popover py-1", className)}
       {...props}
     >
-      <Icon icon="ph:caret-up" className="h-4 w-4" />
+      <NavArrowDownIcon aria-hidden="true" className="h-4 w-4 rotate-180" />
     </SelectPrimitive.ScrollUpArrow>
   )
 }
@@ -61,10 +62,10 @@ function SelectScrollDownButton({
 }: WithClassName<SelectPrimitive.ScrollDownArrow.Props>) {
   return (
     <SelectPrimitive.ScrollDownArrow
-      className={cn("bottom-0 flex w-full cursor-default items-center justify-center py-1", className)}
+      className={cn("inset-x-0 bottom-0 z-10 flex cursor-default items-center justify-center bg-popover py-1", className)}
       {...props}
     >
-      <Icon icon="ph:caret-down" className="h-4 w-4" />
+      <NavArrowDownIcon aria-hidden="true" className="h-4 w-4" />
     </SelectPrimitive.ScrollDownArrow>
   )
 }
@@ -79,15 +80,18 @@ function SelectContent({
   align,
   alignOffset,
   alignItemWithTrigger = false,
+  container,
   ...props
 }: WithClassName<SelectPrimitive.Popup.Props> &
   Pick<
     SelectPrimitive.Positioner.Props,
     "side" | "sideOffset" | "align" | "alignOffset" | "alignItemWithTrigger"
-  > & { style?: React.CSSProperties }) {
+  > & { style?: React.CSSProperties; container?: SelectPrimitive.Portal.Props["container"] }) {
   return (
-    <SelectPrimitive.Portal>
+    <SelectPrimitive.Portal container={container}>
       <SelectPrimitive.Positioner
+        className="isolate z-50 outline-none"
+        positionMethod="fixed"
         side={side}
         sideOffset={sideOffset}
         align={align}
@@ -95,9 +99,10 @@ function SelectContent({
         alignItemWithTrigger={alignItemWithTrigger}
       >
         <SelectPrimitive.Popup
+          data-slot="select-popup"
           style={{ ...cashmereGrainStyle, ...style }}
           className={cn(
-            "relative z-50 max-h-96 min-w-[8rem] overflow-hidden",
+            "relative z-50 flex max-h-[min(24rem,var(--available-height))] min-w-[8rem] flex-col overflow-hidden",
             "rounded-xl border border-border",
             "bg-popover text-popover-foreground",
             "[box-shadow:var(--shadow-l)]",
@@ -113,9 +118,9 @@ function SelectContent({
           <SelectScrollUpButton />
           <SelectPrimitive.List
             className={cn(
-              "p-1",
+              "min-h-0 overflow-y-auto p-1",
               !alignItemWithTrigger &&
-                "max-h-[var(--available-height)] w-full min-w-[var(--anchor-width)] overflow-y-auto"
+                "w-full min-w-[var(--anchor-width)]"
             )}
           >
             {children}
@@ -162,7 +167,7 @@ function SelectItem({
     >
       <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
         <SelectPrimitive.ItemIndicator>
-          <Icon icon="ph:check-bold" className="h-4 w-4 text-primary" />
+          <CheckIcon aria-hidden="true" className="h-4 w-4 text-primary" />
         </SelectPrimitive.ItemIndicator>
       </span>
       <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
@@ -184,7 +189,46 @@ function SelectSeparator({
 }
 SelectSeparator.displayName = "SelectSeparator"
 
+interface FormSelectOption {
+  value: string
+  label: React.ReactNode
+  disabled?: boolean
+}
+
+interface FormSelectProps {
+  id?: string
+  value: string
+  options: readonly FormSelectOption[]
+  onValueChange?: (value: string) => void
+  disabled?: boolean
+  className?: string
+  "aria-label"?: string
+  "aria-describedby"?: string
+  "aria-invalid"?: React.AriaAttributes["aria-invalid"]
+}
+
+function FormSelect({ value, options, onValueChange, disabled, ...triggerProps }: FormSelectProps) {
+  return (
+    <Select
+      value={value}
+      items={options}
+      disabled={disabled}
+      onValueChange={next => { if (next !== null) onValueChange?.(next) }}
+    >
+      <SelectTrigger {...triggerProps}><SelectValue /></SelectTrigger>
+      <SelectContent>
+        {options.map(option => (
+          <SelectItem key={option.value} value={option.value} disabled={option.disabled}>
+            {option.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
+}
+
 export {
+  FormSelect,
   Select,
   SelectGroup,
   SelectValue,

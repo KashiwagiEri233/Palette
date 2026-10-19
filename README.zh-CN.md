@@ -65,7 +65,7 @@ Palette 提供两条互补的交互路径：
 
 * **Python**：`>= 3.12, < 3.14` 与 [uv](https://docs.astral.sh/uv/)
 * **QEMU**：安装匹配目标架构的 `qemu-system-x86_64` 或 `qemu-system-aarch64` 以及 `qemu-img`，并以**普通非管理员用户**运行
-* **Node.js**：`>= 22.12`（仅运行或构建 Palette Desktop 时需要）
+* **Node.js**：`>= 22.19`（仅运行或构建 Palette Desktop 时需要）
 * **客户机镜像**：准备匹配的 `qcow2`/`raw` 桌面基础镜像或系统安装 ISO（构建说明见[客户机模板指南](docs/guest-template.zh-CN.md)）
 
 在仓库根目录同步依赖并执行环境自检：
@@ -153,6 +153,7 @@ Palette 通过 `stdio` 提供 MCP 服务。`palette serve` 发现已有兼容 `d
 
 | 类别 | 工具名 | 权限与行为说明 |
 | --- | --- | --- |
+| **发现** | `vm_list` | 只读列出持久化及运行时已知 VM（包括停机条目）的 ID、名称、状态与控制权；不返回宿主路径或配置 |
 | **视觉基线** | `vm_status` | 查询生命周期状态、QMP 通道在线状态、`screen_ready`、已启用能力及当前按住的键鼠状态 |
 | **视觉基线** | `vm_observe` | 抓取当前屏幕 PNG 截图并返回定义坐标空间的 `frame`（支持 `max_long_edge` 缩放） |
 | **视觉基线** | `vm_act` | 基于最新 `frame_id` 执行单次有界动作：`move`、`click`、`scroll`、`drag`、`key`、`type_text`（US 可打印 ASCII），返回回执与动作后新截图 |

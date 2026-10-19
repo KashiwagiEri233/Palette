@@ -11,16 +11,22 @@ import { cashmereSurfaceStyle } from "./_shared"
 
 interface CardProps extends React.HTMLAttributes<HTMLDivElement> {
   interactive?: boolean
+  variant?: "default" | "workspace" | "pane" | "input"
 }
 
 const Card = React.forwardRef<HTMLDivElement, CardProps>(
-  ({ className, interactive, style, ...props }, ref) => (
+  ({ className, interactive, variant = "default", style, ...props }, ref) => (
     <div
       ref={ref}
+      data-slot="card"
+      data-variant={variant}
       style={{ ...cashmereSurfaceStyle, ...style }}
       className={cn(
-        "rounded-2xl bg-card text-card-foreground",
-        "[box-shadow:var(--shadow-s)]",
+        "bg-card text-card-foreground",
+        variant === "default" && "rounded-2xl [box-shadow:var(--shadow-s)]",
+        variant === "workspace" && "flex h-full min-h-0 flex-col overflow-hidden rounded-lg",
+        variant === "pane" && "flex h-full min-h-0 min-w-0 flex-col rounded-none",
+        variant === "input" && "rounded-2xl border border-border [box-shadow:var(--shadow-xs)] focus-within:ring-2 focus-within:ring-ring/25 focus-within:border-ring",
         "transition-[box-shadow,transform] duration-200",
         interactive &&
           "cursor-pointer hover:-translate-y-0.5 hover:[box-shadow:var(--shadow-l)]",

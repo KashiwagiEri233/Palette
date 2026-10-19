@@ -471,6 +471,31 @@ class LifecycleResult(BaseModel):
         return self
 
 
+class VmSummary(BaseModel):
+    """Agent discovery metadata, without operator configuration or host paths."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    vm_id: str
+    name: str
+    persistent: bool
+    state: str
+    guest_arch: str | None = None
+    instance_id: str | None = None
+    screen_ready: bool = False
+    control_owner: Literal["agent", "operator"] = "agent"
+    control_state: Literal["available", "held", "releasing", "faulted"] = "available"
+    agent_driver_claimed: bool = False
+
+
+class VmListResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    error: ErrorPayload | None = None
+    vms: list[VmSummary] = Field(default_factory=list)
+
+
 class StatusResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

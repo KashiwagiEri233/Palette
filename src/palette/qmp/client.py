@@ -148,6 +148,11 @@ class QmpClient:
         await self._transport.close()
         self._fail_pending(QmpDisconnectedError("QMP client closed"))
 
+    async def wait_closed(self) -> None:
+        """Drain the final events before classifying a process exit."""
+        if self._reader_task is not None:
+            await asyncio.shield(self._reader_task)
+
     @property
     def connected(self) -> bool:
         return self._connected and not self._transport.reader.at_eof()

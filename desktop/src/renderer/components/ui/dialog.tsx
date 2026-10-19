@@ -4,6 +4,7 @@ import { XmarkIcon } from "@/components/icons"
 
 import { cn } from "@/lib/utils"
 import { cashmereGrainStyle } from "./_shared"
+import { ScrollArea } from "./scroll-area"
 
 const Dialog = DialogPrimitive.Root
 const DialogTrigger = DialogPrimitive.Trigger
@@ -33,15 +34,17 @@ const DialogContent = React.forwardRef<
     className?: string
     style?: React.CSSProperties
     closeDisabled?: boolean
+    scrollable?: boolean
   }
->(({ className, children, style, closeDisabled = false, ...props }, ref) => (
+>(({ className, children, style, closeDisabled = false, scrollable = false, ...props }, ref) => (
   <DialogPortal>
     <DialogOverlay />
     <DialogPrimitive.Popup
       ref={ref}
       style={{ ...cashmereGrainStyle, ...style }}
       className={cn(
-        "app-dialog fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 p-6",
+        "app-dialog fixed left-[50%] top-[50%] z-50 w-full max-w-lg translate-x-[-50%] translate-y-[-50%]",
+        scrollable ? "flex flex-col overflow-hidden p-0" : "grid gap-4 p-6",
         "rounded-xl border border-border",
         "bg-popover text-popover-foreground",
         "[box-shadow:var(--shadow-l)]",
@@ -50,8 +53,13 @@ const DialogContent = React.forwardRef<
       )}
       {...props}
     >
-      {children}
+      {scrollable ? (
+        <ScrollArea className="min-h-0 rounded-[inherit]" viewportClassName="max-h-[calc(100dvh-64px)]">
+          <div className="grid gap-4 p-6">{children}</div>
+        </ScrollArea>
+      ) : children}
       <DialogPrimitive.Close
+        data-slot="dialog-close"
         disabled={closeDisabled}
         className={cn(
           "absolute right-4 top-4 rounded-lg p-1 text-muted-foreground",

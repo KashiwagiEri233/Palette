@@ -65,7 +65,7 @@ Palette provides two complementary execution paths:
 
 * **Python**: `>= 3.12, < 3.14` and [uv](https://docs.astral.sh/uv/)
 * **QEMU**: `qemu-system-x86_64` or `qemu-system-aarch64` plus `qemu-img` matching your target architecture, run as a **normal non-admin user**
-* **Node.js**: `>= 22.12` (required for running or building Palette Desktop)
+* **Node.js**: `>= 22.19` (required for running or building Palette Desktop)
 * **Guest Image**: A matching `qcow2`/`raw` base image or installer ISO (see the [guest template guide](docs/guest-template.md))
 
 Install dependencies and probe your host environment from the repository root:
@@ -153,6 +153,7 @@ Example MCP client configuration:
 
 | Category | Tool Name | Summary |
 | --- | --- | --- |
+| **Discovery** | `vm_list` | Read-only list of persistent and runtime-known VMs, including stopped VMs, with IDs, names, state and control ownership; no host paths or configuration |
 | **Visual Baseline** | `vm_status` | Report lifecycle state, QMP readiness, `screen_ready`, enabled capabilities, and currently held keys/buttons |
 | **Visual Baseline** | `vm_observe` | Capture the guest screen as PNG and return a `frame` defining its coordinate space (supports `max_long_edge`) |
 | **Visual Baseline** | `vm_act` | Perform one bounded action (`move`, `click`, `scroll`, `drag`, `key`, `type_text` in US printable ASCII) against a valid `frame_id` and return a receipt plus fresh screenshot |

@@ -4,6 +4,12 @@ import { readFile, lstat } from 'node:fs/promises'
 
 interface Endpoint { address: string; generation: string; token: string; transport: string; operation_timeout_seconds: number }
 
+export class BackendError extends Error {
+  constructor(readonly code: string, message: string, readonly details?: Record<string, unknown>) {
+    super(`${code}: ${message}`)
+  }
+}
+
 export async function readEndpoint(runtimeRoot: string): Promise<Endpoint> {
   const { join } = await import('node:path')
   const path = join(runtimeRoot, '.operator', 'endpoint.json')
@@ -44,7 +50,7 @@ export async function call(runtimeRoot: string, method: string, vmId?: string, p
       try {
         const response = JSON.parse(received.subarray(4, expected + 4).toString('utf8'))
         if (response.request_id !== requestId || response.generation !== endpoint.generation) throw new Error('后台响应身份不匹配')
-        if (!response.ok) throw new Error(`${response.error?.code ?? 'ERROR'}: ${response.error?.message ?? '操作失败'}`)
+        if (!response.ok) throw new BackendError(response.error?.code ?? 'ERROR', response.error?.message ?? '操作失败', response.error?.details)
         done = true; resolve(response.result); socket.end()
       } catch (error) { fail(error as Error) }
     })

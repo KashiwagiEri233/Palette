@@ -128,14 +128,14 @@ async def test_resize_preserves_chain_bytes_vars_and_reset_capacity(
     marker.write_bytes(b"guest data")
     await desktop.stop(vm_id)
     data = await desktop.get_settings(vm_id)
-    chain = (await service.manager._images(desktop.get(vm_id).profile).inspect_image(disk)).chain
+    chain = (await service.manager.images_for(desktop.get(vm_id).profile).inspect_image(disk)).chain
     await desktop.resize_disk(vm_id, {"revision": data["revision"], "disk_gib": 32})
     expanded = await desktop.get_settings(vm_id)
     assert expanded["disk"]["virtual_bytes"] == 32 * 1024**3
-    assert not desktop._operation_path(vm_id).exists()
+    assert not desktop.storage.operation_path(vm_id).exists()
     assert marker.read_bytes() == b"guest data"
     assert (
-        await service.manager._images(desktop.get(vm_id).profile).inspect_image(disk)
+        await service.manager.images_for(desktop.get(vm_id).profile).inspect_image(disk)
     ).chain == chain
     with pytest.raises(PaletteError):
         await desktop.resize_disk(vm_id, {"revision": expanded["revision"], "disk_gib": 24})
@@ -145,7 +145,7 @@ async def test_resize_preserves_chain_bytes_vars_and_reset_capacity(
     replacement = service.manager.get(vm_id).paths.overlay
     assert replacement != disk
     assert (
-        await service.manager._images(desktop.get(vm_id).profile).inspect_image(replacement)
+        await service.manager.images_for(desktop.get(vm_id).profile).inspect_image(replacement)
     ).virtual_size == 32 * 1024**3
 
 
@@ -156,7 +156,7 @@ async def test_resize_before_first_boot(service: PaletteService) -> None:
     await desktop.start(vm_id)
     disk = service.manager.get(vm_id).paths.overlay
     assert (
-        await service.manager._images(desktop.get(vm_id).profile).inspect_image(disk)
+        await service.manager.images_for(desktop.get(vm_id).profile).inspect_image(disk)
     ).virtual_size == 40 * 1024**3
 
 
@@ -166,20 +166,20 @@ async def test_resize_journal_recovers_after_definition_write_failure(
     desktop, vm_id = await machine(service)
     await desktop.start(vm_id)
     await desktop.stop(vm_id)
-    original_save = desktop._save
+    original_save = desktop.repository.save
 
     def fail_save(_: Any) -> None:
         raise OSError("injected save failure")
 
-    monkeypatch.setattr(desktop, "_save", fail_save)
+    monkeypatch.setattr(desktop.repository, "save", fail_save)
     with pytest.raises(OSError, match="injected"):
         await desktop.resize_disk(vm_id, {"revision": 0, "disk_gib": 32})
-    assert desktop._operation_path(vm_id).exists()
-    monkeypatch.setattr(desktop, "_save", original_save)
+    assert desktop.storage.operation_path(vm_id).exists()
+    monkeypatch.setattr(desktop.repository, "save", original_save)
     restored = DesktopManager(service)
     await restored.recover_operations()
     assert restored.get(vm_id).draft.disk_gib == 32
-    assert not restored._operation_path(vm_id).exists()
+    assert not restored.storage.operation_path(vm_id).exists()
 
 
 async def test_failed_resize_recovers_original_capacity(
@@ -194,11 +194,11 @@ async def test_failed_resize_recovers_original_capacity(
             return 1, "", "injected resize failure"
         return await run_tool(argv, **kwargs)
 
-    monkeypatch.setattr("palette.desktop.run_tool", fail_resize)
+    monkeypatch.setattr("palette.persistent_storage.run_tool", fail_resize)
     with pytest.raises(PaletteError):
         await desktop.resize_disk(vm_id, {"revision": 0, "disk_gib": 32})
     assert desktop.get(vm_id).draft.disk_gib == 24
-    assert not desktop._operation_path(vm_id).exists()
+    assert not desktop.storage.operation_path(vm_id).exists()
 
 
 async def test_edit_and_start_share_lock(
@@ -232,11 +232,13 @@ async def test_uncertain_disk_integrity_blocks_start_and_keeps_journal(
     desktop, vm_id = await machine(service)
     await desktop.start(vm_id)
     await desktop.stop(vm_id)
-    storage = desktop._storage(desktop.get(vm_id))
+    storage = desktop.storage.paths(desktop.get(vm_id))
     assert storage is not None
-    info = await service.manager._images(desktop.get(vm_id).profile).inspect_image(storage.overlay)
-    path = desktop._operation_path(vm_id)
-    desktop._write_operation(
+    info = await service.manager.images_for(desktop.get(vm_id).profile).inspect_image(
+        storage.overlay
+    )
+    path = desktop.storage.operation_path(vm_id)
+    desktop.storage._write_operation(
         path,
         {
             "overlay": str(storage.overlay),
@@ -252,7 +254,7 @@ async def test_uncertain_disk_integrity_blocks_start_and_keeps_journal(
             return 2, "", "injected corruption"
         return await run_tool(argv, **kwargs)
 
-    monkeypatch.setattr("palette.desktop.run_tool", corrupt)
+    monkeypatch.setattr("palette.persistent_storage.run_tool", corrupt)
     with pytest.raises(PaletteError):
         await desktop.start(vm_id)
     assert path.exists()
@@ -266,9 +268,9 @@ async def test_missing_exit_evidence_prevents_edits(service: PaletteService) -> 
     await desktop.start(vm_id)
     await desktop.stop(vm_id)
     data = await desktop.get_settings(vm_id)
-    storage = desktop._storage(desktop.get(vm_id))
+    storage = desktop.storage.paths(desktop.get(vm_id))
     assert storage is not None
-    service.manager._images(desktop.get(vm_id).profile).update_manifest(
+    service.manager.images_for(desktop.get(vm_id).profile).update_manifest(
         storage, {"process_exited": False}
     )
     with pytest.raises(PaletteError, match="previous process"):

@@ -1,6 +1,6 @@
 import * as React from "react"
 import { Command as CommandPrimitive } from "cmdk"
-import { Icon } from "@iconify/react"
+import { SearchIcon } from "@/components/icons"
 
 import { cn } from "@/lib/utils"
 import { cashmereGrainStyle } from "./_shared"
@@ -14,7 +14,7 @@ const Command = React.forwardRef<
     ref={ref}
     style={{ ...cashmereGrainStyle, ...style }}
     className={cn(
-      "flex h-full w-full flex-col overflow-hidden rounded-xl",
+      "flex h-full min-h-0 w-full flex-col overflow-hidden rounded-xl",
       "bg-popover text-popover-foreground",
       className
     )}
@@ -42,12 +42,12 @@ const CommandInput = React.forwardRef<
   React.ElementRef<typeof CommandPrimitive.Input>,
   React.ComponentPropsWithoutRef<typeof CommandPrimitive.Input>
 >(({ className, ...props }, ref) => (
-  <div className="flex items-center border-b border-border px-3" cmdk-input-wrapper="">
-    <Icon icon="ph:magnifying-glass" className="mr-2 h-4 w-4 shrink-0 text-muted-foreground" />
+  <div className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-4 focus-within:border-ring" cmdk-input-wrapper="">
+    <SearchIcon aria-hidden="true" className="h-4 w-4 shrink-0 text-muted-foreground" />
     <CommandPrimitive.Input
       ref={ref}
       className={cn(
-        "flex h-11 w-full rounded-md bg-transparent py-3 text-sm outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50",
+        "flex h-full min-w-0 flex-1 rounded-none border-0 bg-transparent p-0 text-sm outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50",
         className
       )}
       {...props}

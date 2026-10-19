@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest'
-import { RuntimeShutdown, processAlive } from '../src/main/shutdown'
+import { RuntimeShutdown, VmShutdownTimeout, processAlive } from '../src/main/shutdown'
+import { BackendError } from '../src/main/ipc'
 
-const owner = { pid: 12345, generation: 'a'.repeat(32), owner_kind: 'daemon', features: ['runtime-stop'] }
+const owner = { pid: 12345, generation: 'a'.repeat(32), owner_kind: 'daemon', features: ['runtime-stop', 'vm-stop-identity'] }
 
 function fixture(options: { owner?: Record<string, unknown>; vms?: { vm_id: string; status: { state: string } }[]; alive?: () => boolean } = {}) {
   const backend = vi.fn(async (_root: string, method: string): Promise<Record<string, unknown>> => {
@@ -44,6 +45,36 @@ describe('complete runtime exit', () => {
     const { shutdown, backend } = fixture({ vms: [{ vm_id: 'running', status: { state: 'RUNNING' } }, { vm_id: 'stopped', status: { state: 'STOPPED' } }, { vm_id: 'paused', status: { state: 'PAUSED' } }] })
     await shutdown.stop('root')
     expect(backend.mock.calls.map(call => call[1])).toEqual(['hello', 'vms.list', 'vms.stop', 'vms.stop', 'hello', 'runtime.stop'])
+  })
+
+  it('returns the exact timed-out instance for an explicit force confirmation', async () => {
+    const { shutdown, backend } = fixture({ vms: [{ vm_id: 'running', status: { state: 'RUNNING' } }] })
+    const vm = { vm_id: 'running', name: 'Workstation', status: { state: 'RUNNING', instance_id: 'inst_old' } }
+    backend.mockResolvedValueOnce(owner).mockResolvedValueOnce({ vms: [vm] }).mockRejectedValueOnce(new BackendError('TIMEOUT', 'the guest did not shut down within the configured budget', { operation: 'guest-shutdown', vm_id: vm.vm_id, instance_id: 'inst_old' }))
+    const error = await shutdown.stop('root').catch(error => error)
+    expect(error).toBeInstanceOf(VmShutdownTimeout)
+    expect(error.target).toEqual({ vm_id: vm.vm_id, name: vm.name, instance_id: 'inst_old' })
+    expect(backend).toHaveBeenLastCalledWith('root', 'vms.stop', 'running', { expected_instance_id: 'inst_old' }, owner.generation)
+    expect(backend.mock.calls.some(call => call[1] === 'runtime.stop')).toBe(false)
+  })
+
+  it.each(['inst_replacement', undefined])('never offers force recovery for an uncertain or mismatched timeout (%s)', async instanceId => {
+    const { shutdown, backend } = fixture()
+    const failure = new BackendError('TIMEOUT', 'QMP command timed out', { operation: 'guest-shutdown', vm_id: 'running', instance_id: instanceId })
+    backend.mockResolvedValueOnce(owner).mockResolvedValueOnce({ vms: [{ vm_id: 'running', status: { state: 'RUNNING', instance_id: 'inst_old' } }] }).mockRejectedValueOnce(failure)
+    await expect(shutdown.stop('root')).rejects.toBe(failure)
+  })
+
+  it.each(['STARTING', 'STOPPING'])('refuses complete exit while a VM is %s without queuing another stop', async state => {
+    const { shutdown, backend } = fixture({ vms: [
+      { vm_id: 'running', status: { state: 'RUNNING' } },
+      { vm_id: 'busy', status: { state } }
+    ] })
+    await expect(shutdown.stop('root')).rejects.toThrow('请等待操作完成后重试退出')
+    expect(backend.mock.calls.map(call => call[1])).toEqual(['hello', 'vms.list'])
+    backend.mockResolvedValueOnce(owner).mockResolvedValueOnce({ vms: [] }).mockResolvedValueOnce(owner).mockResolvedValueOnce({ stopping: true })
+    await shutdown.stop('root')
+    expect(backend.mock.calls.at(-1)?.[1]).toBe('runtime.stop')
   })
 
   it('keeps daemon compatibility and refuses an older embedded backend before stopping VMs', async () => {

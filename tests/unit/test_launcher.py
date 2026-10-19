@@ -242,6 +242,90 @@ class TestExtraVolumes:
         assert "scsi-cd,drive=extra1,bus=scsi0.0" in plan.argv
 
 
+class TestWindowsHostPaths:
+    @pytest.fixture(autouse=True)
+    def windows_code_page(self, monkeypatch):
+        monkeypatch.setattr("palette.vm.launcher.IS_WINDOWS", True)
+        monkeypatch.setattr("palette.vm.launcher.locale.getencoding", lambda: "cp936")
+
+    def test_chinese_media_path_uses_native_config_without_option_injection(
+        self, profile, tmp_path: Path
+    ) -> None:
+        path = "E:/迅雷下载/安装 盘,readonly=off.iso"
+        plan = plan_for(
+            profile,
+            overlay=tmp_path / "o.qcow2",
+            workdir=tmp_path,
+            extra_volumes=(ExtraVolume(path=path, media="cdrom", boot_index=0),),
+        )
+        assert plan.host_path_config is not None
+        config = plan.host_path_config.decode("cp936")
+        assert f'file = "{path}"' in config
+        assert 'format = "raw"' in config
+        assert 'readonly = "on"' in config
+        assert 'if = "none"' in config
+        assert 'id = "extra0"' in config
+        assert plan.argv[plan.argv.index("-readconfig") + 1] == "qemu-host-paths.conf"
+        assert "scsi-cd,drive=extra0,bus=scsi0.0,bootindex=0" in plan.argv
+        assert plan.argv.count("-blockdev") == 2  # ASCII overlay keeps its graph.
+
+    def test_chinese_overlay_keeps_explicit_format_and_disk_boot_order(
+        self, profile, tmp_path: Path
+    ) -> None:
+        plan = plan_for(profile, overlay=tmp_path / "磁盘.qcow2", workdir=tmp_path)
+        assert plan.host_path_config is not None
+        config = plan.host_path_config.decode("cp936")
+        assert 'format = "qcow2"' in config
+        assert 'id = "disk"' in config
+        assert 'discard = "unmap"' in config
+        assert "virtio-blk-pci,drive=disk,bootindex=0" in plan.argv
+        assert "-blockdev" not in plan.argv
+
+    def test_firmware_code_and_vars_keep_their_order_across_encodings(
+        self, profile, tmp_path: Path
+    ) -> None:
+        configured = profile.model_copy(
+            update={
+                "qemu": profile.qemu.model_copy(
+                    update={"firmware": FirmwareConfig(code="E:/固件/code.fd", vars="E:/vars.fd")}
+                )
+            }
+        )
+        plan = plan_for(
+            configured,
+            overlay=tmp_path / "o.qcow2",
+            workdir=tmp_path,
+            hardware_vars_path=tmp_path / "vars.fd",
+        )
+        assert plan.host_path_config is not None
+        config = plan.host_path_config.decode("cp936")
+        assert config.index("E:/固件/code.fd") < config.index(str(tmp_path / "vars.fd"))
+        assert config.count("[drive]") == 2
+        assert "-drive" not in plan.argv
+
+    @pytest.mark.parametrize("name", ["安装\n[device].iso", '安装".iso', "安装😀.iso"])
+    def test_unrepresentable_or_unsafe_config_paths_fail_before_spawn(
+        self, profile, tmp_path: Path, name: str
+    ) -> None:
+        with pytest.raises(PaletteError) as failure:
+            plan_for(
+                profile,
+                overlay=tmp_path / "o.qcow2",
+                workdir=tmp_path,
+                extra_volumes=(ExtraVolume(path="E:/" + name, media="cdrom"),),
+            )
+        assert failure.value.code == ErrorCode.STARTUP_FAILED
+
+    def test_posix_unicode_paths_keep_the_json_block_graph(
+        self, profile, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("palette.vm.launcher.IS_WINDOWS", False)
+        overlay = tmp_path / "磁盘.qcow2"
+        plan = plan_for(profile, overlay=overlay, workdir=tmp_path)
+        assert plan.host_path_config is None
+        assert json.loads(plan.argv[plan.argv.index("-blockdev") + 1])["filename"] == str(overlay)
+
+
 class TestCallerArguments:
     def test_caller_arguments_are_appended_after_the_profiles(
         self, profile, tmp_path: Path

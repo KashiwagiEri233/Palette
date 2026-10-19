@@ -4,19 +4,23 @@ import { Icon } from "@iconify/react"
 import { cn } from "@/lib/utils"
 
 export interface EmptyStateProps extends Omit<React.HTMLAttributes<HTMLDivElement>, "title"> {
-  icon?: string
+  icon?: string | React.ReactNode
+  variant?: "default" | "plain"
+  heading?: "div" | "h1" | "h2"
   title: React.ReactNode
   description?: React.ReactNode
   action?: React.ReactNode
 }
 
 const EmptyState = React.forwardRef<HTMLDivElement, EmptyStateProps>(
-  ({ className, icon = "ph:package", title, description, action, ...props }, ref) => (
+  ({ className, icon = "ph:package", variant = "default", heading: Heading = "div", title, description, action, ...props }, ref) => (
     <div
       ref={ref}
+      data-slot="empty-state"
+      data-variant={variant}
       className={cn(
-        "flex flex-col items-center justify-center gap-4 rounded-xl p-8 text-center",
-        "bg-card text-card-foreground border border-dashed border-border",
+        "flex flex-col items-center justify-center gap-4 p-8 text-center text-card-foreground",
+        variant === "default" && "rounded-xl bg-card border border-dashed border-border",
         className
       )}
       {...props}
@@ -28,10 +32,10 @@ const EmptyState = React.forwardRef<HTMLDivElement, EmptyStateProps>(
           "[box-shadow:var(--shadow-s)]"
         )}
       >
-        <Icon icon={icon} className="h-5 w-5" />
+        {typeof icon === "string" ? <Icon icon={icon} className="h-5 w-5" /> : icon}
       </div>
       <div className="space-y-1 max-w-md">
-        <div className="text-base font-semibold text-foreground">{title}</div>
+        <Heading className="text-base font-semibold text-foreground">{title}</Heading>
         {description && (
           <div className="text-sm text-muted-foreground leading-relaxed">{description}</div>
         )}

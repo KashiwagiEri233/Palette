@@ -1,0 +1,2 @@
+# Vendored Pi checksums require stable bytes across Windows and Unix checkouts.
+desktop/vendor/pi/** text=auto eol=lf

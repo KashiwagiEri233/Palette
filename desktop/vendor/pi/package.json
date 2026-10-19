@@ -1,0 +1,10 @@
+{
+  "name": "palette-pi-build",
+  "version": "1.3.0",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "shx": "0.3.4"
+  }
+}

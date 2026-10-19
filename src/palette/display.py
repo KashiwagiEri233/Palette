@@ -174,7 +174,7 @@ class DisplayGateway:
 
     def ticket(self, vm_id: str, instance_id: str) -> dict[str, str]:
         instance = self.service.manager.get(vm_id)
-        self.service._require_instance_id(instance, instance_id)
+        self.service.require_instance_id(instance, instance_id)
         if instance.console_address is None:
             raise PaletteError(
                 ErrorCode.UNSUPPORTED_CAPABILITY,
@@ -204,7 +204,7 @@ class DisplayGateway:
                 await ws.close(code=1008, reason="display ticket is invalid")
                 return
             instance = self.service.manager.get(ticket.vm_id)
-            self.service._require_instance_id(instance, ticket.instance_id)
+            self.service.require_instance_id(instance, ticket.instance_id)
             if instance.console_address is None or instance.console_password is None:
                 return
             accepted = True
@@ -296,4 +296,6 @@ class DisplayGateway:
                 with contextlib.suppress(PaletteError):
                     current = self.service.manager.find(ticket.vm_id)
                     if current is not None and current.view.instance_id == ticket.instance_id:
-                        await self.service.control.revoke(ticket.vm_id)
+                        await self.service.control.revoke(
+                            ticket.vm_id, expected_instance_id=ticket.instance_id
+                        )

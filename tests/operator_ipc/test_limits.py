@@ -87,7 +87,7 @@ async def test_pending_operations_are_bounded_independently_of_connections(
         refused = await owner._execute_once(request(MAX_CLIENTS))
         assert not refused.ok
         assert refused.error.code == ErrorCode.BUSY
-        assert len(owner._requests) == MAX_CLIENTS
+        assert len(owner.requests.entries) == MAX_CLIENTS
     finally:
         release.set()
         await asyncio.gather(*tasks)

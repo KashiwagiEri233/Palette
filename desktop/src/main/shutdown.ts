@@ -1,7 +1,12 @@
-import { call } from './ipc'
+import { BackendError, call } from './ipc'
+import type { ShutdownTimeout } from '../shared/types'
 
 type BackendCall = typeof call
 interface ExitTarget { pid: number; generation: string }
+
+export class VmShutdownTimeout extends Error {
+  constructor(readonly target: ShutdownTimeout) { super('虚拟机未在规定时间内完成正常关机') }
+}
 
 export function processAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true }
@@ -27,10 +32,21 @@ export class RuntimeShutdown {
       const owner = await this.backend(root, 'hello')
       if (!Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0 || typeof owner.generation !== 'string' || !/^[a-f0-9]{32}$/.test(owner.generation)) throw new Error('后台进程身份无效，无法确认完全退出')
       const supported = Array.isArray(owner.features) && owner.features.includes('runtime-stop')
+      const identitySupported = Array.isArray(owner.features) && owner.features.includes('vm-stop-identity')
       if (!supported && owner.owner_kind !== 'daemon') throw new Error('当前 MCP 托管后台需要升级才能完全退出；可选择仅关闭窗口')
       const response = await this.backend(root, 'vms.list', undefined, {}, owner.generation)
-      for (const vm of response.vms as { vm_id: string; status: { state: string } }[]) {
-        if (!['STOPPED', 'FAILED'].includes(vm.status.state)) await this.backend(root, 'vms.stop', vm.vm_id, {}, owner.generation)
+      const vms = response.vms as { vm_id: string; name?: string; status: { state: string; instance_id?: string } }[]
+      if (vms.some(vm => ['STARTING', 'STOPPING'].includes(vm.status.state))) throw new Error('虚拟机正在启动或关机，请等待操作完成后重试退出，或选择仅关闭窗口')
+      for (const vm of vms) {
+        if (['STOPPED', 'FAILED'].includes(vm.status.state)) continue
+        try {
+          await this.backend(root, 'vms.stop', vm.vm_id, identitySupported && vm.status.instance_id ? { expected_instance_id: vm.status.instance_id } : {}, owner.generation)
+        } catch (error) {
+          if (identitySupported && error instanceof BackendError && error.code === 'TIMEOUT' && error.details?.operation === 'guest-shutdown' && error.details.vm_id === vm.vm_id && typeof error.details.instance_id === 'string' && error.details.instance_id === vm.status.instance_id) {
+            throw new VmShutdownTimeout({ vm_id: vm.vm_id, name: vm.name ?? vm.vm_id, instance_id: error.details.instance_id })
+          }
+          throw error
+        }
       }
       const current = await this.backend(root, 'hello', undefined, {}, owner.generation)
       if (current.pid !== owner.pid || current.generation !== owner.generation) throw new Error('后台已更换，请检查状态后重试退出')

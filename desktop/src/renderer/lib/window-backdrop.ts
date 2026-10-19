@@ -2,7 +2,7 @@
 export function syncWindowBackdrop(): void {
   if (window.palette.platform !== 'win32') return
   let frame = 0
-  let previousShade = -1
+  let previousShade = ''
 
   function schedule(): void {
     if (!frame) frame = requestAnimationFrame(update)
@@ -19,16 +19,18 @@ export function syncWindowBackdrop(): void {
       transmission *= 1 - opacity
       animating ||= backdrop.getAnimations().some(animation => animation.playState === 'running')
     }
-    const shade = Math.round(255 * transmission)
+    const background = getComputedStyle(document.documentElement).getPropertyValue('--background').trim()
+    const base = /^#[a-f0-9]{6}$/i.test(background) ? background : '#f7f6f5'
+    const shade = `${base}:${Math.round(transmission * 1000)}`
     if (shade !== previousShade) {
       previousShade = shade
-      void window.palette.setWindowBackdrop(1 - transmission).catch(error => console.error('Window backdrop update failed', error))
+      void window.palette.setWindowBackdrop(1 - transmission, base).catch(error => console.error('Window backdrop update failed', error))
     }
     if (animating) schedule()
   }
 
   const observer = new MutationObserver(schedule)
-  observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'hidden', 'data-starting-style', 'data-ending-style'] })
+  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'data-theme', 'hidden', 'data-starting-style', 'data-ending-style'] })
   window.addEventListener('pagehide', () => { observer.disconnect(); cancelAnimationFrame(frame) }, { once: true })
   schedule()
 }

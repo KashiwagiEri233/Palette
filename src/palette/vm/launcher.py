@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import locale
 import logging
 import os
 import re
@@ -238,6 +239,37 @@ def probe_binary(
     return probe
 
 
+async def probe_binary_async(
+    binary: str, *, timeout: float = 20.0, prefix: Sequence[str] = ()
+) -> QemuProbe:
+    """Probe without blocking other VMs; run_tool owns cancellation and reaping."""
+    probe = QemuProbe(binary=binary)
+    launch = [binary, *prefix]
+    try:
+        code, output, _ = await run_tool([*launch, "--version"], timeout=timeout)
+        if code:
+            probe.error = f"--version exited with {code}"
+            return probe
+        match = _VERSION_RE.search(output)
+        probe.found = True
+        probe.version = (
+            match.group(1) if match else output.splitlines()[0].strip() if output else None
+        )
+        code, output, _ = await run_tool([*launch, "-accel", "help"], timeout=timeout)
+        if not code:
+            probe.accelerators = sorted(
+                {
+                    line.strip()
+                    for line in output.splitlines()
+                    if line.strip() and not line.strip().startswith("Accelerators")
+                }
+            )
+    except (OSError, TimeoutError, PaletteError) as exc:
+        if not probe.found:
+            probe.error = type(exc).__name__
+    return probe
+
+
 def require_accelerator(profile: Profile, probe: QemuProbe) -> str:
     """Return the accelerator to use, or fail loudly.
 
@@ -381,6 +413,7 @@ class LaunchPlan:
     notes: list[str] = field(default_factory=list)
     memory_limit_bytes: int | None = None
     max_runtime_seconds: float | None = None
+    host_path_config: bytes | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -416,7 +449,40 @@ def _flag_extra_channels(args: Sequence[str], notes: list[str]) -> None:
     )
 
 
-def _extra_volume_args(volumes: Sequence[ExtraVolume], notes: list[str]) -> list[str]:
+def _windows_drive_config(
+    path: str, options: dict[str, str], sections: list[str], *, force: bool = False
+) -> bool:
+    """Bypass QEMU's UTF-8 argv/JSON -> ANSI file API mismatch on Windows.
+
+    Its legacy config reader preserves native-codepage bytes. Keep this limited to
+    non-ASCII host paths; formats, read-only flags and device attachment stay explicit.
+    Config values are literal (including backslashes and commas), not JSON strings.
+    """
+    if not IS_WINDOWS or (path.isascii() and not force):
+        return False
+    values = {"file": path, **options}
+    for value in values.values():
+        if any(char in value for char in ('"', "\r", "\n", "\0")):
+            raise PaletteError(ErrorCode.STARTUP_FAILED, "invalid QEMU host path config value")
+    section = "[drive]\n" + "".join(f'  {key} = "{value}"\n' for key, value in values.items())
+    try:
+        encoded = section.encode(locale.getencoding())
+    except UnicodeEncodeError as exc:
+        raise PaletteError(
+            ErrorCode.STARTUP_FAILED,
+            "this QEMU build requires host paths representable in the Windows system code page",
+            details={"path": path},
+        ) from exc
+    # QEMU's readconfig parser has a 1024-byte line buffer; do not allow truncation.
+    if any(len(line) >= 1023 for line in encoded.splitlines()):
+        raise PaletteError(ErrorCode.STARTUP_FAILED, "QEMU host path config value is too long")
+    sections.append(section)
+    return True
+
+
+def _extra_volume_args(
+    volumes: Sequence[ExtraVolume], notes: list[str], config_sections: list[str]
+) -> list[str]:
     """Attach caller-supplied disks and CD-ROMs behind explicit blockdev nodes."""
     if not volumes:
         return []
@@ -427,28 +493,39 @@ def _extra_volume_args(volumes: Sequence[ExtraVolume], notes: list[str]) -> list
         argv += ["-device", "virtio-scsi-pci,id=scsi0"]
     for index, volume in enumerate(volumes):
         node = f"extra{index}"
-        argv += [
-            "-blockdev",
-            json.dumps(
-                {
-                    "driver": "file",
-                    "filename": volume.path,
-                    "node-name": f"{node}-file",
-                    "read-only": volume.read_only,
-                },
-                separators=(",", ":"),
-            ),
-            "-blockdev",
-            json.dumps(
-                {
-                    "driver": volume.format,
-                    "file": f"{node}-file",
-                    "node-name": node,
-                    "read-only": volume.read_only,
-                },
-                separators=(",", ":"),
-            ),
-        ]
+        native_path = _windows_drive_config(
+            volume.path,
+            {
+                "id": node,
+                "if": "none",
+                "format": volume.format,
+                "readonly": "on" if volume.read_only else "off",
+            },
+            config_sections,
+        )
+        if not native_path:
+            argv += [
+                "-blockdev",
+                json.dumps(
+                    {
+                        "driver": "file",
+                        "filename": volume.path,
+                        "node-name": f"{node}-file",
+                        "read-only": volume.read_only,
+                    },
+                    separators=(",", ":"),
+                ),
+                "-blockdev",
+                json.dumps(
+                    {
+                        "driver": volume.format,
+                        "file": f"{node}-file",
+                        "node-name": node,
+                        "read-only": volume.read_only,
+                    },
+                    separators=(",", ":"),
+                ),
+            ]
         if volume.media == "cdrom":
             boot = f",bootindex={volume.boot_index}" if volume.boot_index is not None else ""
             argv += ["-device", f"scsi-cd,drive={node},bus=scsi0.0{boot}"]
@@ -486,6 +563,7 @@ def build_launch_plan(
     resources = profile.resources
     network = profile.network
     notes: list[str] = []
+    config_sections: list[str] = []
 
     argv: list[str] = [binary, *qemu.argv_prefix]
     argv += ["-name", f"palette-{vm_id}-{instance_id}"]
@@ -515,13 +593,28 @@ def build_launch_plan(
         notes.append(f"{len(network.hostfwd)} host port forward(s) configured")
 
     if qemu.firmware.code:
-        argv += [
-            "-drive",
-            f"if=pflash,format=raw,readonly=on,file={qemu.firmware.code}",
-        ]
-        if qemu.firmware.vars and hardware_vars_path is not None:
-            # A writable variable store is per-instance state: resetting the VM must not
-            # leave the previous boot's boot entries and keys behind.
+        native_firmware = not qemu.firmware.code.isascii() or (
+            hardware_vars_path is not None and not str(hardware_vars_path).isascii()
+        )
+        if not _windows_drive_config(
+            qemu.firmware.code,
+            {"if": "pflash", "format": "raw", "readonly": "on"},
+            config_sections,
+            force=native_firmware,
+        ):
+            argv += ["-drive", f"if=pflash,format=raw,readonly=on,file={qemu.firmware.code}"]
+        # A writable variable store is per-instance state. Keep both pflash drives in
+        # the same input source so readconfig cannot reverse their implicit unit order.
+        if (
+            qemu.firmware.vars
+            and hardware_vars_path is not None
+            and not _windows_drive_config(
+                str(hardware_vars_path),
+                {"if": "pflash", "format": "raw"},
+                config_sections,
+                force=native_firmware,
+            )
+        ):
             argv += ["-drive", f"if=pflash,format=raw,file={hardware_vars_path}"]
 
     # The display device must exist before the input devices that bind to it.
@@ -555,9 +648,14 @@ def build_launch_plan(
         overlay_path=overlay_path,
         profile=profile,
         notes=notes,
+        config_sections=config_sections,
         boot_index=1 if any(volume.boot_index == 0 for volume in extra_volumes) else 0,
     )
-    argv += _extra_volume_args(extra_volumes, notes)
+    argv += _extra_volume_args(extra_volumes, notes, config_sections)
+    if config_sections:
+        # Relative to cwd so a non-ASCII runtime directory is never sent via argv.
+        argv += ["-readconfig", "qemu-host-paths.conf"]
+        notes.append("Windows host paths loaded through a native-codepage drive config")
 
     # QMP over the child's own stdin/stdout, never a socket. ``signal=off`` keeps QEMU
     # from installing host signal handlers around our channel.
@@ -584,18 +682,33 @@ def build_launch_plan(
             else None
         ),
         max_runtime_seconds=resources.process_max_runtime_seconds,
+        host_path_config=(
+            "\n".join(config_sections).encode(locale.getencoding()) if config_sections else None
+        ),
     )
 
 
 def _block_args(
-    *, overlay_path: Path, profile: Profile, notes: list[str], boot_index: int = 0
+    *,
+    overlay_path: Path,
+    profile: Profile,
+    notes: list[str],
+    config_sections: list[str],
+    boot_index: int = 0,
 ) -> list[str]:
     """Explicit blockdev graph: file node and format node are separate.
 
     The format is stated, never probed from the file's extension, so a renamed or
     swapped image cannot change how QEMU interprets the backing chain.
     """
-    # JSON is required for --blockdev; compact separators only (no spaces, no newlines).
+    device = f"virtio-blk-pci,drive=disk,bootindex={boot_index}"
+    if _windows_drive_config(
+        str(overlay_path),
+        {"id": "disk", "if": "none", "format": "qcow2", "discard": "unmap"},
+        config_sections,
+    ):
+        return ["-device", device]
+    # Compact JSON preserves paths without shell or QemuOpts escaping.
     file_node = json.dumps(
         {
             "driver": "file",
@@ -621,7 +734,7 @@ def _block_args(
         "-blockdev",
         format_node,
         "-device",
-        f"virtio-blk-pci,drive=disk,bootindex={boot_index}",
+        device,
     ]
 
 
@@ -666,6 +779,13 @@ async def _dispose_spawned(process: ManagedProcess) -> None:
 async def _spawn_qemu(
     plan: LaunchPlan, *, on_spawn: Callable[[ManagedProcess], None] | None = None
 ) -> ManagedProcess:
+    if plan.host_path_config is not None:
+        try:
+            (plan.cwd / "qemu-host-paths.conf").write_bytes(plan.host_path_config)
+        except OSError as exc:
+            raise PaletteError(
+                ErrorCode.STARTUP_FAILED, "QEMU host path config could not be written"
+            ) from exc
     try:
         if not IS_WINDOWS:
             return await _spawn_supervisor(plan, on_spawn=on_spawn)

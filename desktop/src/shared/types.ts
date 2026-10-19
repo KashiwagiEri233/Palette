@@ -1,3 +1,6 @@
+import type { WorkspaceMethod, WorkspaceRoutes } from './workspace'
+import type { AgentMethod, AgentRoutes, AgentEvent } from './agent'
+
 export type InputEvent =
   | { type: 'move'; x: number; y: number }
   | { type: 'button'; button: 'left' | 'middle' | 'right'; down: boolean }
@@ -15,15 +18,19 @@ export interface VmSettingsResult { revision: number; draft: VmDraft; settings: 
 export interface VmStatus { state: string; instance_id?: string; guest_arch?: string; accelerator?: string; control_owner?: 'agent' | 'operator'; control_state?: string; display_epoch?: number; boot_epoch?: number; controller_epoch?: number; action_seq?: number; queued_actions?: number; qmp_ready?: boolean; screen_ready?: boolean; desktop_ready?: boolean | null; input_ledger?: { keys: string[]; buttons: string[]; release_confirmed: boolean }; display?: { width: number; height: number }; last_error?: { code: string; message: string } }
 export interface VmRecord { vm_id: string; name: string; persistent: boolean; definition: { draft: VmDraft; iso_attached: boolean; revision: number } | null; status: VmStatus }
 export interface ControlLease { lease_id: string; instance_id: string; controller_epoch: number; boot_epoch: number; display_epoch: number }
+export interface ShutdownTimeout { vm_id: string; name: string; instance_id: string }
 export interface DoctorReport { ok: boolean; checks: { name: string; ok: boolean; blocking?: boolean; detail?: unknown }[] }
 export interface DesktopApi {
   readonly platform: string
-  setWindowBackdrop(opacity: number): Promise<void>
+  setWindowBackdrop(opacity: number, background?: string): Promise<void>
   connect(): Promise<OwnerInfo>
   request(method: DesktopMethod, vmId?: string, payload?: Record<string, unknown>): Promise<unknown>
+  request<K extends WorkspaceMethod>(method: K, vmId: string | undefined, payload: WorkspaceRoutes[K]['payload']): Promise<WorkspaceRoutes[K]['result']>
+  request<K extends AgentMethod>(method: K, vmId: string | undefined, payload: AgentRoutes[K]['payload']): Promise<AgentRoutes[K]['result']>
+  onAgentEvent(callback: (event: AgentEvent) => void): () => void
   chooseFile(source: 'image' | 'iso'): Promise<string | null>
   chooseRoot(): Promise<OwnerInfo | null>
   onClose(callback: () => void): () => void
-  finishClose(choice: 'background' | 'shutdown' | 'cancel'): Promise<void>
+  finishClose(choice: 'background' | 'shutdown' | 'cancel'): Promise<{ shutdownTimeout: ShutdownTimeout } | void>
 }
 declare global { interface Window { palette: DesktopApi } }
