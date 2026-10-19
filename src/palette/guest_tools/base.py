@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from ..errors import ErrorCode, PaletteError
 from ..models import EffectState
@@ -64,6 +64,7 @@ class GuestToolOutcome:
     launch_id: str | None = None
     detail: str | None = None
     error: PaletteError | None = None
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 @runtime_checkable

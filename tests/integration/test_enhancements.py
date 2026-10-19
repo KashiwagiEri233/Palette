@@ -73,6 +73,8 @@ async def test_releasing_control_cleans_guest_file_handles(service, running_vm):
     agent.close = AsyncMock()
     running_vm.qemu_guest_agent = agent
     lease = await service.control.acquire("desktop", running_vm.view.instance_id)
+    agent.close_files.assert_awaited_once()  # Close handles belonging to the former writer.
+    agent.close_files.reset_mock()
     await service.control.release("desktop", lease["lease_id"])
     agent.close_files.assert_awaited_once()
 

@@ -11,7 +11,6 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
 import { IconButton } from './components/workspace-primitives'
 import { toast } from 'sonner'
-import { GuestEnhancements } from './GuestEnhancements'
 import type { GuestStatus } from '../shared/guest'
 
 export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRecord; reportError: (message: string) => void; onAction?: (action: string) => void; busy?: boolean }) {
@@ -234,7 +233,6 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
     <div className="console-toolbar">
       <div className="flex items-center gap-2"><span className={`status-dot ${connected ? 'online' : ''}`} /><span>{connected ? controlling ? '人工控制' : '仅查看' : '未连接'}</span>{onAction && <ButtonGroup aria-label="虚拟机电源操作"><IconButton label="关机" disabled={busy || !['RUNNING', 'PAUSED'].includes(vm.status.state)} onClick={() => onAction('stop')}><Power size={15} /></IconButton><IconButton label="重启" disabled={busy || !running || !vm.persistent} onClick={() => onAction('restart')}><RotateCw size={15} /></IconButton></ButtonGroup>}</div>
       <div className="flex items-center gap-2">
-        <GuestEnhancements vm={vm} status={guestStatus} release={release} reportError={reportError} />
         <label className="flex items-center gap-1 text-xs" title={guestStatus?.desktop.resize ? '接管时自动调整客户机分辨率' : '需要 virtio-gpu 和客户机会话工具'}><input type="checkbox" checked={autoResize} disabled={!guestStatus?.desktop.resize} onChange={event => { setAutoResize(event.target.checked); autoResizeRef.current = event.target.checked }} />自动分辨率</label>
         <Button variant={controlling ? 'default' : 'secondary'} disabled={!connected || acquiring} onClick={() => controlling ? void release() : void acquire()}><PcMouseIcon className="size-4" />{acquiring ? '正在接管…' : controlling ? '结束控制' : '接管'}</Button>
         <Select value={scale} items={{ fit: '适应窗口', native: '原始尺寸' }} onValueChange={value => { if (value) changeScale(value) }} onOpenChange={open => { scaleMenuOpen.current = open }}>

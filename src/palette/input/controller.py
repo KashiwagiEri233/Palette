@@ -56,7 +56,7 @@ from ..models import (
 from ..qmp.client import QmpClient
 from .coordinates import CoordinateTransform, transform_id_for
 from .dedupe import RequestDeduplicator
-from .events import InputPlanner, button_event, key_event
+from .events import InputPlanner, button_event, key_event, key_plan_batches
 from .frames import (
     FrameRegistry,
     image_difference_ratio,
@@ -64,6 +64,7 @@ from .frames import (
     rescale,
     thumbnail_difference,
 )
+from .keyboard import plan_chord
 from .ledger import InputLedger
 from .scheduler import ActionScheduler, Job, JobKind
 from .state import ActionResult, CursorPositionSource, InstanceView
@@ -373,6 +374,7 @@ class ActionController:
         frame_id: str | None,
         parameters: dict[str, Any],
         runner: Callable[[Callable[[], None]], Awaitable[GuestToolOutcome]],
+        capture_after: bool = True,
     ) -> tuple[GuestToolResult, bytes | None]:
         """Run and retain guest receipts using the same queue and identity as visual input."""
         identity = self._identity()
@@ -406,14 +408,15 @@ class ActionController:
                 result.effect_state in {EffectState.SUBMITTED, EffectState.PARTIAL}
             )
             settle = self.profile.timeouts.settle_after_input_ms / 1000.0
-            if settle:
+            if settle and capture_after:
                 await asyncio.sleep(settle)
             frame: Frame | None = None
             png: bytes | None = None
             try:
-                frame, captured = await self._capture_frame()
-                png = captured.png_bytes
-                self.view.screen_ready = True
+                if capture_after:
+                    frame, captured = await self._capture_frame()
+                    png = captured.png_bytes
+                    self.view.screen_ready = True
             except PaletteError as exc:
                 logger.info("post-guest-operation capture failed: %s", exc.code)
             error = result.error
@@ -434,6 +437,7 @@ class ActionController:
                 action_seq=progress.sequence,
                 frame=frame,
                 detail=result.detail,
+                data=result.data,
             ), png
 
         job = self.scheduler.make_job(JobKind.ACTION, label, _job)
@@ -460,6 +464,16 @@ class ActionController:
         if code is not None:
             payload["error_code"] = str(code)
         self._audit.record("guest.operation", **payload)
+
+    async def paste_guest_clipboard(self) -> None:
+        """Send Ctrl+V within an already scheduled guest operation, using its ledger."""
+        for events, delay_ms in key_plan_batches(plan_chord(["CTRL", "V"], hold_ms=30), hold_ms=30):
+            self._check_mutation()
+            self._ledger.note_presses(events)
+            await self._send_events(events, timeout=self.profile.timeouts.qmp_command_seconds)
+            self._ledger.note_releases(events)
+            if delay_ms:
+                await asyncio.sleep(delay_ms / 1000)
 
     async def release_inputs(self, *, guarded: bool = False) -> ReleaseResult:
         """Release every key and button the service believes it holds."""

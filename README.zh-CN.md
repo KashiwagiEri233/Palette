@@ -15,7 +15,7 @@ Agent 通过标准 Model Context Protocol（MCP）接收桌面截图并发送有
 * **共享后台与多端协同**：通过单一 `RuntimeOwner`（`palette daemon` 或托管 `palette serve`）统一管理虚拟机状态。Palette Desktop、运维 CLI 与多个 MCP 客户端（`palette serve --connect-only`）可安全共用同一个后台进程。
 * **人机独占控制权交接**：采用单写入者输入控制器。运维人员可在桌面端控制台点击“接管”（带 3 秒心跳租约，支持 `Ctrl+Alt+G`、失焦或断线自动释放键鼠）或执行 `palette vm take-control`，立即递增 `controller_epoch` 并作废 Agent 手中的旧 frame；人工操控期间 Agent 仍可调用 `vm_observe` 观察画面，但写入请求会被安全拦截。
 * **只读画面网关与严密宿主边界**：从不向 Agent 暴露原始 QMP、HMP 或通用客户机 Shell。QMP 始终运行在受监管子进程的私有管道上（绝不监听 TCP）；桌面端实时画面通过仅监听本机的 WebSocket RFB 网关传输，采用一次性票据并在协议层过滤写入消息。所有受管可写层、临时帧与日志经 `PathGuard` 严格收敛在 `.runtime/` 目录内。
-* **可选客户机内增强通道**：在保持视觉基线独立可用的前提下，提供受同一套策略、调度与审计约束的 `Guest Tool Bridge`（`vm_guest_input_text` 原生 Unicode/中文文本输入、`vm_guest_launch_app` 受控白名单应用启动）。客户机未运行增强服务时如实返回 `GUEST_TOOL_UNAVAILABLE`，绝不静默降级为模拟按键。
+* **可选 Agent 增强能力**：Agent 通过标准 QEMU/SPICE 与 QGA 服务直接输入中文、读写客户机剪贴板并传输二进制文件，无需人工点击，参阅[增强工具指南](docs/guest-enhancements.zh-CN.md)。独立的自定义服务继续支持原生文本与应用接口：在保持视觉基线独立可用的前提下，提供受同一套策略、调度与审计约束的 `Guest Tool Bridge`（`vm_guest_input_text` 原生 Unicode/中文文本输入、`vm_guest_launch_app` 受控白名单应用启动）。客户机未运行增强服务时如实返回 `GUEST_TOOL_UNAVAILABLE`，绝不静默降级为模拟按键。
 * **跨平台硬件加速与显式 TCG**：原生支持 Windows（`WHPX`）、macOS Apple Silicon / Intel（`HVF`）与 Linux x86_64 / aarch64（`KVM`），并提供显式软件模拟配置（`tcg-x86_64`、`tcg-aarch64`，例如在 Apple Silicon 上免 Rosetta 运行 x86_64 客户机）。缺少硬件加速时直接诊断报错，绝不静默回退到 TCG。
 
 ## 系统架构
@@ -162,7 +162,10 @@ Palette 通过 `stdio` 提供 MCP 服务。`palette serve` 发现已有兼容 `d
 | **生命周期** | `vm_start` | 按允许的 profile 启动实例；可选传入 `image`、`iso`、`extra_disks`、`qemu_args`（每项均需 profile 对应开关放行） |
 | **生命周期** | `vm_stop` | 请求客户机正常关机并在超时预算内结束 QEMU（需 `allow_agent_stop`；`force=true` 需 `allow_agent_force_stop`） |
 | **生命周期** | `vm_reset` | 丢弃当前可写 overlay 并从只读基础镜像重建干净实例（破坏性操作，需 `allow_agent_reset`） |
-| **客户机增强** | `vm_guest_input_text` | 通过客户机内增强服务写入 Unicode/多语言文本（`native_text` / `clipboard_paste`），仅在启用增强通道时注册 |
+| **客户机增强** | `vm_guest_input_text` | 标准 clipboard_paste 直接输入中文与 Unicode；native_text 需要自定义服务 |
+| **客户机剪贴板** | `vm_guest_clipboard_get` / `vm_guest_clipboard_set` | 直接读写客户机文本剪贴板，无需宿主剪贴板或人工租约 |
+| **客户机文件传输** | `vm_guest_file_open` / `vm_guest_file_read` / `vm_guest_file_write` / `vm_guest_file_close` | QGA 二进制上传/下载，有界 Base64 分块，无需宿主文件选择器 |
+| **客户机管理** | `vm_guest_resize` / `vm_guest_sync_time` | 按客户机能力请求分辨率或同步时间 |
 | **客户机增强** | `vm_guest_launch_app` | 启动 profile 白名单中注册的 `app_id` 与受限选项，绝不接受自由命令行或 Shell |
 
 ### 运维 CLI 命令

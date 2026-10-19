@@ -14,18 +14,22 @@ const encryption = { available: () => true, encrypt: (text: string) => Buffer.fr
 const pixel = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aP1sAAAAASUVORK5CYII=', 'base64')
 class FakeClient extends AgentClient {
   readonly calls: string[] = []
+  readonly requests: { method: string; parameters: Record<string, unknown>; claim?: string }[] = []
   unknownAction = false
+  unknownEnhancement = false
   actionResult?: Record<string, unknown>
   constructor() { super({ address: 'unused', generation: '', token: '', operation_timeout_seconds: 1 }) }
   override async request(method: string, _vm: string, parameters: Record<string, unknown> = {}, _claim?: string, signal?: AbortSignal): Promise<AgentReply> {
     signal?.throwIfAborted()
     this.calls.push(method)
+    this.requests.push({ method, parameters, claim: _claim })
     if (method === 'status') return { result: { ok: true, status: { instance_id: 'instance' } }, image: Buffer.alloc(0) }
     if (method === 'driver_acquire') return { result: { claim_token: 'a'.repeat(48) }, image: Buffer.alloc(0) }
     if (method === 'driver_release') return { result: { release_confirmed: true }, image: Buffer.alloc(0) }
     if (method === 'act') expect(parameters).toMatchObject({ instance_id: 'instance', frame_id: 'frame', action: { type: 'click', x: 0, y: 0 } })
     if (method === 'act' && this.unknownAction) return { result: { ok: false, error: { code: 'ACTION_OUTCOME_UNKNOWN', message: 'unknown' } }, image: Buffer.alloc(0) }
     if (method === 'act' && this.actionResult) return { result: this.actionResult, image: Buffer.alloc(0) }
+    if (['guest_input_text', 'guest_enhancement'].includes(method)) return { result: { ok: !this.unknownEnhancement, effect_state: this.unknownEnhancement ? 'unknown' : 'submitted', data: { transfer_id: 'transfer', count: 3 } }, image: Buffer.alloc(0) }
     return { result: { ok: true, frame: { instance_id: 'instance', frame_id: 'frame', width: 1, height: 1 } }, image: pixel }
   }
 }
@@ -36,6 +40,7 @@ async function environment() {
   let slow = false
   let fail = false
   let measuredUsage = false
+  let script: { name: string; arguments: Record<string, unknown> }[] | undefined
   const server = createServer(async (request, response) => {
     let body = ''
     for await (const data of request) body += data
@@ -49,7 +54,10 @@ async function environment() {
     if (slow) { chunk({ content: '开始执行' }); return }
     const tools = payload.messages.filter((message: { role: string }) => message.role === 'tool').length
     const visual = payload.messages.some((message: { role: string; content: unknown }) => message.role === 'user' && JSON.stringify(message.content).includes('visual'))
-    if (visual && tools < 2) {
+    if (script && tools < script.length) {
+      chunk({ tool_calls: [{ index: 0, id: `script-${tools}`, type: 'function', function: { name: script[tools].name, arguments: JSON.stringify(script[tools].arguments) } }] })
+      chunk({}, 'tool_calls')
+    } else if (visual && tools < 2) {
       const name = tools === 0 ? 'observe' : 'act'
       chunk({ tool_calls: [{ index: 0, id: `call-${tools}`, type: 'function', function: { name, arguments: JSON.stringify(tools === 0 ? {} : { instance_id: 'instance', frame_id: 'frame', action: { type: 'click', x: 0, y: 0 } }) } }] })
       chunk({}, 'tool_calls')
@@ -73,7 +81,7 @@ async function environment() {
   const configuration: AgentConfiguration = { providerId: 'custom-fixture', modelId: 'fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${address.port}/v1`, custom: true, contextWindow: 128000, maxTokens: 1024, vision: true, reasoning: false, thinkingLevel: 'off', maxSteps: 100 }
   await service.saveProvider({ id: configuration.providerId, name: 'Fixture', api: configuration.api, baseUrl: configuration.baseUrl, models: [{ ...configuration, id: configuration.modelId, name: configuration.modelId }] }, 'test-secret')
   await service.updateSettings(configuration)
-  return { root, id, service, create, conversations, client, requests, events, configuration, slow: () => { slow = true }, fail: () => { fail = true }, measure: () => { measuredUsage = true },
+  return { root, id, service, create, conversations, client, requests, events, configuration, script: (steps: NonNullable<typeof script>) => { script = steps }, slow: () => { slow = true }, fail: () => { fail = true }, measure: () => { measuredUsage = true },
     close: async () => { await service.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); await rm(root, { recursive: true, force: true }) } }
 }
 async function settled(service: PiAgentService, id: string) {
@@ -104,7 +112,7 @@ it('runs the real SDK through VM tools, persists history and reopens its tree', 
     expect(result.view.contextUsage).toMatchObject({ tokens: 2176, contextWindow: 128000 })
     expect(result.view.contextUsage!.percent).toBeCloseTo(1.7)
     const names = ((test.requests[0].tools ?? []) as { function: { name: string } }[]).map(tool => tool.function.name)
-    expect(names.sort()).toEqual(['act', 'observe', 'release_inputs', 'status', 'wait'])
+    expect(names.sort()).toEqual(['act', 'clipboard_get', 'clipboard_set', 'display_resize', 'file_close', 'file_open', 'file_read', 'file_write', 'input_text', 'observe', 'release_inputs', 'status', 'sync_time', 'wait'])
     expect(JSON.stringify(result)).not.toContain('test-secret')
     const directory = join(test.service.directory, 'sessions', test.id)
     const files = (await readdir(directory)).filter(file => file.endsWith('.jsonl'))
@@ -324,5 +332,51 @@ it('recovers interrupted runs without executing and isolates configuration roots
       expect((await isolated.snapshot('vm', test.id)).view.messages).toHaveLength(0)
       expect((await isolated.settings()).credentialConfigured).toBe(false)
     } finally { await reopened.close(); await isolated.close() }
+  } finally { await test.close() }
+}, 20000)
+
+
+it('lets the real SDK input Chinese, use clipboard and transfer files directly under its claim', async () => {
+  const test = await environment()
+  const identity = { instance_id: 'instance', boot_epoch: 1 }
+  try {
+    test.script([
+      { name: 'input_text', arguments: { ...identity, frame_id: 'frame', text: '中文输入\n第二行 😀' } },
+      { name: 'clipboard_get', arguments: identity },
+      { name: 'clipboard_set', arguments: { ...identity, text: '客户机剪贴板' } },
+      { name: 'file_open', arguments: { ...identity, path: '/home/guest/文件.bin', mode: 'w' } },
+      { name: 'file_write', arguments: { ...identity, transfer_id: 'transfer', data_base64: 'AP8B' } },
+      { name: 'file_close', arguments: { ...identity, transfer_id: 'transfer' } },
+      { name: 'file_open', arguments: { ...identity, path: '/home/guest/文件.bin', mode: 'r' } },
+      { name: 'file_read', arguments: { ...identity, transfer_id: 'transfer', count: 3 } },
+      { name: 'file_close', arguments: { ...identity, transfer_id: 'transfer' } }
+    ])
+    await test.service.start('vm', test.id, 'enhancement task', randomUUID())
+    const result = await settled(test.service, test.id)
+    expect(result.view.run?.state).toBe('completed')
+    const requests = test.client.requests.filter(request => ['guest_input_text', 'guest_enhancement'].includes(request.method))
+    expect(requests).toHaveLength(9)
+    expect(requests.every(request => request.claim === 'a'.repeat(48))).toBe(true)
+    expect(requests[0].parameters).toMatchObject({ ...identity, text: '中文输入\n第二行 😀', method: 'clipboard_paste' })
+    expect(requests[3].parameters).toMatchObject({ operation: 'file.open', parameters: { path: '/home/guest/文件.bin', mode: 'w' } })
+    expect(requests[4].parameters).toMatchObject({ operation: 'file.write', parameters: { transfer_id: 'transfer', data_base64: 'AP8B' } })
+    expect(new Set(requests.map(request => request.parameters.request_id)).size).toBe(9)
+    expect(test.client.calls.at(-1)).toBe('driver_release')
+  } finally { await test.close() }
+}, 20000)
+
+it('stops the SDK after an unknown enhancement result without issuing the next write', async () => {
+  const test = await environment()
+  try {
+    test.client.unknownEnhancement = true
+    test.script([
+      { name: 'clipboard_set', arguments: { instance_id: 'instance', boot_epoch: 1, text: '中文' } },
+      { name: 'clipboard_set', arguments: { instance_id: 'instance', boot_epoch: 1, text: '重复' } }
+    ])
+    await test.service.start('vm', test.id, 'enhancement task', randomUUID())
+    const result = await settled(test.service, test.id)
+    expect(result.view.run?.state).toBe('cancelled')
+    expect(test.client.calls.filter(method => method === 'guest_enhancement')).toHaveLength(1)
+    expect(test.client.calls.at(-1)).toBe('driver_release')
   } finally { await test.close() }
 }, 20000)

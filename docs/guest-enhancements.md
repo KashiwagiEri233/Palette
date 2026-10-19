@@ -2,7 +2,7 @@
 
 **English** | [简体中文](guest-enhancements.zh-CN.md)
 
-Palette reuses QEMU Guest Agent, SPICE vdagent and spice-webdavd. The desktop remains usable without these guest services: missing responses mean **currently unavailable**, not proof that software is uninstalled. Availability is checked repeatedly, including after guest reboot. Existing `org.palette.tools.0` MCP text/app tools remain a separate protocol; installing QGA does not implement them.
+Palette reuses QEMU Guest Agent, SPICE vdagent and spice-webdavd. The desktop remains usable without these guest services: missing responses mean **currently unavailable**, not proof that software is uninstalled. Availability is checked repeatedly, including after guest reboot. Unicode clipboard input uses the standard QEMU/SPICE channel and file transfers use QGA. Native text APIs and app launching still require the separate `org.palette.tools.0` custom protocol.
 
 ## Install inside a Debian / XFCE guest
 
@@ -47,21 +47,32 @@ read_only = true
 
 Relative export paths resolve from the configuration root. Only configured or explicitly selected directories are exposed. QGA and WebDAV use separate per-instance private Unix sockets on POSIX or named pipes on Windows; no guest management/file-sharing TCP port is opened on the host. Restart the shared daemon after upgrading the backend and restart the VM after channel configuration changes. On Windows, host pipe connections start before QMP because QEMU's pipe initialization waits for a client.
 
-## Desktop use and degradation
+## Direct agent operations and degradation
 
-Open **增强工具** in the VM console. The panel updates automatically every three seconds.
+The built-in pi Agent and external MCP clients call enhancements directly, without an operator button, human takeover or file picker.
 
-| Feature | Behavior | If unavailable |
+| Built-in Agent | MCP | Behavior |
 | --- | --- | --- |
-| Clipboard | Explicit buttons copy text in either direction, or send typed Unicode/CJK text; maximum 48 KiB UTF-8 | Buttons disabled; physical keyboard remains available. After sending, take control and press Ctrl+V in the guest |
-| Automatic resolution | Opt in using **自动分辨率**; requests are debounced while human control is held. Matching display changes release held input, synchronize geometry and reacquire control while focused | Existing framebuffer and viewport scaling remain available; an unconfirmed resize disables the option |
-| Guest information | Agent version, OS, hostname and interface IPs | QEMU lifecycle/readiness remains visible; guest fields unavailable |
-| Time synchronization | Explicit host UTC timestamp sent through an enabled QGA command | Disabled; guest's own timekeeping continues |
-| Safe Desktop shutdown | Known-online QGA shutdown, otherwise existing ACPI shutdown | Timeout is reported without automatically forcing power off. A result-unknown QGA operation is not retried through ACPI |
-| File transfer | Main-process host file dialogs; guest absolute path; 48 KiB chunks; maximum 16 MiB per file; progress and cancel | Disabled when required QGA commands are absent |
-| Shared folders | Read-only by default; selected host directory available via guest WebDAV | Service status unavailable; basic VM use unaffected |
+| `input_text` | `vm_guest_input_text` | Set guest clipboard and send Ctrl+V atomically; Unicode, Chinese, multiline text and Emoji; returns screenshot |
+| `clipboard_get` / `clipboard_set` | `vm_guest_clipboard_get` / `vm_guest_clipboard_set` | Read/set guest text clipboard, up to 48 KiB UTF-8; no host clipboard access |
+| `file_open` / `file_read` / `file_write` / `file_close` | `vm_guest_file_open` / `vm_guest_file_read` / `vm_guest_file_write` / `vm_guest_file_close` | Upload/download binary contents in QGA chunks without host dialogs |
+| `display_resize` | `vm_guest_resize` | Request guest dimensions, then observe actual framebuffer size |
+| `sync_time` | `vm_guest_sync_time` | Set guest time to host UTC |
+| `status` | `vm_status` | Discover live enhancements, QGA metadata and readiness |
 
-Each explicit enhancement operation acquires human ownership, shares the input scheduler, and releases ownership afterward. Host clipboard content and filesystem dialogs stay in Electron main. Transfers are cancelled on loss of host-window focus. Downloads use a temporary host file and replace the destination only after complete transfer and guest close. Uploads overwrite the selected guest path; cancellation or disconnect may leave a partial guest file. There is no automatic replay of uncertain writes, clipboard operations or shutdown requests.
+Read `instance_id`, `boot_epoch` and `enhancements` from status first. Text input also needs the latest `frame_id`. Example external MCP input parameters (replace identity/frame values with current results):
+
+```json
+{"vm_id":"desktop","instance_id":"current-instance","boot_epoch":1,"frame_id":"latest-frame","request_id":"paste-1","text":"中文输入 😀","method":"clipboard_paste"}
+```
+
+Clipboard setting and Ctrl+V share one queued transaction, preventing another writer from intervening. Submission does not prove application response: inspect the returned screenshot. Terminals may need clipboard_set followed by an explicit Ctrl+Shift+V. `native_text` still requires the separate custom service. Unavailable enhancements return `GUEST_TOOL_UNAVAILABLE`; baseline observation and ASCII keyboard input remain usable. Unicode is never silently converted to keyboard events, and services that recover become callable again.
+
+For uploads, open an absolute guest path with `mode="w"` (overwrites the guest file), take `data.transfer_id`, and send base64 chunks through file_write. Always file_close after completion or failure. For downloads, use `mode="r"`, decode each `data.data_base64` until `data.eof=true`, and close. Chunks are limited to 49152 bytes, files to 16 MiB by default, and simultaneous handles to four. Empty uploads need only open/close. Failed uploads may leave partial guest files. QGA accesses guest files with its service privileges; these tools grant no host filesystem access.
+
+Use a fresh request_id for each operation (the built-in Agent generates it). Identical retries return the retained receipt, preventing duplicate paste/write or skipped read chunks; changed parameters with the same ID are rejected. Unknown operations are never automatically replayed; the built-in Agent stops for inspection. All calls share the input scheduler and check operator ownership and Agent run claims. Operator takeover blocks agent writes; handover/run completion closes file handles, and reboot invalidates old boot epochs. The console automatic-resolution checkbox remains optional for human viewing; agents call the resize tool directly.
+
+Desktop graceful shutdown uses known-online QGA or otherwise ACPI. Timeout never automatically forces power off, and an unknown QGA shutdown is not repeated through ACPI.
 
 ## Shared folders on Windows, macOS and Linux hosts
 
@@ -71,21 +82,21 @@ The private multiplex protocol is compatible with guest `spice-webdavd`; Palette
 dav://127.0.0.1:9843/
 ```
 
-Use **选择共享目录** to select a host directory. **只读共享** defaults on; turn it off only when guest writes are intended. A GUI selection replaces the active exports and lasts until the VM stops; trusted profile `[[shared_folders]]` exports are restored on the next start. **停止共享** removes active exports. Export traversal and symlink escape are blocked by the upstream filesystem provider; error responses omit host filesystem diagnostics. Each request/response is limited to 16 MiB and four guest HTTP clients. Protocol support covers the current little-endian x86_64/aarch64 targets. Actual mount behavior still depends on the guest WebDAV client.
+Trusted Profile `[[shared_folders]]` entries explicitly configure host exports, read-only by default. Agents access configured exports through guest WebDAV and cannot select arbitrary host directories. The upstream provider blocks traversal and symlink escape, and errors omit host filesystem diagnostics. Requests/responses are limited to 16 MiB with four concurrent guest HTTP clients. Protocol support covers current little-endian x86_64/aarch64 targets; actual mounting still needs guest-specific acceptance.
 
 ## Verification
 
 | Target | Verification status |
 | --- | --- |
 | Windows host, QEMU 11.1, explicit TCG, blank scratch disk | Real startup, QMP/framebuffer, all private host channels, disabled guest capabilities without installed tools, and process cleanup verified |
-| Electron console on Windows | Existing console flow and the new unavailable-enhancement panel/control flow verified; screenshot generated by Playwright |
+| Electron console on Windows | Console flow and baseline control with the manual enhancement entry removed are tested; built-in pi SDK model-tool calls have separate contract tests |
 | Linux/macOS hosts | POSIX channel implementation included; no physical acceptance claimed on this Windows development host |
 | Debian/XFCE guest with installed tools | Installer/helper included; clipboard, live resizing, QGA operations and WebDAV mounting still require real desktop-image acceptance |
 | Windows/Wayland guests | No automatic-resolution helper; upstream QGA/SPICE/WebDAV capabilities require separate acceptance |
 
 `palette doctor` reports host virtio-serial and qemu-vdagent prerequisites as nonblocking checks. Runtime `vm_status.enhancements` and operator `guest.status` expose actual availability; QGA readiness never implies an interactive desktop is ready.
 
-Unit/integration tests cover delayed service startup, fragmented messages, QGA resynchronization after timeouts, disabled commands, ownership fencing, uncertain shutdown, transfer limits/cleanup, Unicode clipboard and decompression bounds, and read-only/Unicode/traversal WebDAV behavior. Electron tests cover the unavailable-feature panel and continued basic console control.
+Unit/integration tests cover delayed service startup, fragmented messages, QGA resynchronization after timeouts, disabled commands, ownership fencing, uncertain shutdown, transfer limits/cleanup, Unicode clipboard and decompression bounds, and read-only/Unicode/traversal WebDAV behavior. Agent tests cover Unicode input, clipboard, binary transfer without human leases, authenticated IPC, deduplication and takeover. Built-in pi SDK tests drive model tool calls; Electron tests cover continued baseline console control.
 
 Real-guest acceptance is separate: install the packages in a real image, verify Chinese/Emoji in both clipboard directions, resize while focused and unfocused, compare transferred file hashes, mount/read/write read-only and writable exports, stop/restart services, reboot and retest availability, and verify timed-out shutdown never force-kills the guest. Mock tests and QEMU firmware-only smoke tests do not establish physical guest acceptance.
 

@@ -54,6 +54,7 @@ class AgentCommand(StrictModel):
         "release_inputs",
         "guest_input_text",
         "guest_launch_app",
+        "guest_enhancement",
         "start",
         "stop",
         "reset",
@@ -182,6 +183,9 @@ class AgentServer:
                     image = png or b""
                 elif method == "guest_launch_app":
                     result, png = await self.service.guest_launch_app(vm_id, **parameters)
+                    image = png or b""
+                elif method == "guest_enhancement":
+                    result, png = await self.service.guest_enhancement(vm_id, **parameters)
                     image = png or b""
                 elif method == "start":
                     result = await self.service.start(vm_id, actor="agent", **parameters)
@@ -438,6 +442,29 @@ class RemoteService:
                 "text": text,
                 "method": method,
                 "target": target,
+            },
+        )
+        return GuestToolResult.model_validate(data), image
+
+    async def guest_enhancement(
+        self,
+        vm_id: str,
+        *,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+        operation: str,
+        parameters: dict[str, Any],
+    ) -> tuple[GuestToolResult, bytes | None]:
+        data, image = await self._call(
+            "guest_enhancement",
+            vm_id,
+            {
+                "instance_id": instance_id,
+                "boot_epoch": boot_epoch,
+                "request_id": request_id,
+                "operation": operation,
+                "parameters": parameters,
             },
         )
         return GuestToolResult.model_validate(data), image

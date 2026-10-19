@@ -986,6 +986,8 @@ class VmManager:
             if instance.controller is not None:
                 instance.controller.invalidate(reason="control changed hands")
                 await self._finish_cleanup(self._release_controller(instance))
+            if instance.qemu_guest_agent is not None:
+                await instance.qemu_guest_agent.close_files()
             return instance.view.controller_epoch
 
     async def graceful_stop(self, vm_id: str, *, expected_instance_id: str | None = None) -> None:

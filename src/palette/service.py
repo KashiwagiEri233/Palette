@@ -188,6 +188,9 @@ class PaletteService:
         from .enhancements import enhancement_status
 
         guest_status = await guest.capabilities() if guest is not None else None
+        enhancements = enhancement_status(instance)
+        standard_clipboard = instance.profile.guest_desktop.clipboard
+        clipboard_ready = enhancements["desktop"]["clipboard"]
         status = VmStatus(
             **execution_info(instance.profile),
             vm_id=vm_id,
@@ -214,22 +217,43 @@ class PaletteService:
             input_ledger=ledger,
             guest_tools=(
                 GuestToolStatus(
-                    enabled=guest_status.enabled,
-                    transport_online=guest_status.transport_online,
-                    service_online=guest_status.service_online,
-                    interactive_desktop_ready=guest_status.interactive_desktop_ready,
+                    enabled=guest_status.enabled or standard_clipboard,
+                    transport_online=guest_status.transport_online
+                    or bool(
+                        standard_clipboard
+                        and instance.guest_desktop
+                        and instance.guest_desktop.connected
+                    ),
+                    service_online=guest_status.service_online or clipboard_ready,
+                    interactive_desktop_ready=(
+                        guest_status.interactive_desktop_ready or clipboard_ready
+                    )
+                    if standard_clipboard
+                    else guest_status.interactive_desktop_ready,
                     protocol_version=guest_status.protocol_version,
                     connection_generation=guest_status.connection_generation,
-                    capabilities=list(guest_status.capabilities),
-                    input_methods=list(guest_status.input_methods),
+                    capabilities=sorted(
+                        set(guest_status.capabilities)
+                        | ({"guest.input_text"} if clipboard_ready else set())
+                    ),
+                    input_methods=sorted(
+                        set(guest_status.input_methods)
+                        | ({"clipboard_paste"} if clipboard_ready else set())
+                    ),
                     allowed_apps=list(guest_status.apps),
-                    detail=guest_status.detail,
+                    detail=(
+                        "Standard QEMU clipboard available"
+                        if clipboard_ready
+                        else "Standard QEMU clipboard unavailable; basic visual input remains available"
+                    )
+                    if standard_clipboard
+                    else guest_status.detail,
                 )
                 if guest_status is not None
                 else GuestToolStatus()
             ),
             queued_actions=controller.queued_jobs if controller else 0,
-            enhancements=enhancement_status(instance),
+            enhancements=enhancements,
             controller_owned=True,
             control_owner="operator" if vm_id in self.control.leases else "agent",
             control_state=self.control.leases[vm_id].state
@@ -410,6 +434,32 @@ class PaletteService:
         self.control.require_agent(vm_id)
         instance = await self.manager.require_running(vm_id)
         self.require_instance_id(instance, instance_id)
+        self._require_boot_epoch(instance, boot_epoch)
+        if method == "clipboard_paste" and instance.profile.guest_desktop.clipboard:
+            from .agent_enhancements import execute, validate_parameters
+
+            if target != "focused" or frame_id is None or not text:
+                raise PaletteError(
+                    ErrorCode.INVALID_ARGUMENT,
+                    "clipboard paste requires text, a frame and focused target",
+                )
+            parameters = validate_parameters("clipboard.set", {"text": text})
+            controller = self.controller_for(instance)
+
+            async def paste(on_sending: Callable[[], None]) -> GuestToolOutcome:
+                await execute(instance, "clipboard.set", parameters, on_sending)
+                # One queued transaction: another writer cannot replace the clipboard
+                # between setting it and sending the paste chord.
+                await controller.paste_guest_clipboard()
+                return GuestToolOutcome(ok=True, method="clipboard_paste")
+
+            return await controller.run_guest_operation(
+                label="guest.input_text",
+                runner=paste,
+                request_id=request_id,
+                frame_id=frame_id,
+                parameters={"text": text, "method": method, "target": target},
+            )
         policy = instance.policy
         policy.require_capability("guest.input_text")
         self._require_boot_epoch(instance, boot_epoch)
@@ -481,6 +531,40 @@ class PaletteService:
                 "the guest rebooted after this request was prepared",
                 details={"expected_boot_epoch": instance.view.boot_epoch},
             )
+
+    async def guest_enhancement(
+        self,
+        vm_id: str,
+        *,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+        operation: str,
+        parameters: dict[str, Any],
+    ) -> tuple[GuestToolResult, bytes | None]:
+        """Agent authority never routes through an operator lease or host dialog."""
+        from .agent_enhancements import execute, validate_parameters
+
+        validate_identifier(request_id, what="request_id")
+        self.control.require_agent(vm_id)
+        instance = await self.manager.require_running(vm_id)
+        self.require_instance_id(instance, instance_id)
+        self._require_boot_epoch(instance, boot_epoch)
+        request = validate_parameters(operation, parameters)
+
+        async def run(on_sending: Callable[[], None]) -> GuestToolOutcome:
+            self.control.require_agent(vm_id)
+            self._require_boot_epoch(instance, boot_epoch)
+            return await execute(instance, operation, request, on_sending)
+
+        return await self.controller_for(instance).run_guest_operation(
+            label="guest." + operation,
+            request_id=request_id,
+            frame_id=None,
+            parameters=parameters,
+            runner=run,
+            capture_after=operation == "display.resize",
+        )
 
     # -- lifecycle --------------------------------------------------------------------
     async def start(

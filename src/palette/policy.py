@@ -45,6 +45,10 @@ _CAPABILITY_LABELS: dict[str, str] = {
     "host.qemu_args": "caller-supplied QEMU arguments",
     "guest.input_text": "vm_guest_input_text",
     "guest.launch_app": "vm_guest_launch_app",
+    "guest.clipboard": "vm_guest_clipboard_get / vm_guest_clipboard_set",
+    "guest.file": "vm_guest_file_open / read / write / close",
+    "guest.resize": "vm_guest_resize",
+    "guest.sync_time": "vm_guest_sync_time",
 }
 
 #: The kinds of host-side material a caller can hand the service. Each has its own switch
@@ -205,6 +209,18 @@ class Policy:
             # Non-guest capabilities are enforced where they are used: observation and
             # control are always available, lifecycle is gated by require_lifecycle.
             return
+        standard = {
+            "guest.clipboard": self.profile.guest_desktop.clipboard,
+            "guest.file": self.profile.guest_agent.enabled,
+            "guest.resize": self.profile.guest_desktop.resize,
+            "guest.sync_time": self.profile.guest_agent.enabled,
+        }
+        if name in standard:
+            if not standard[name]:
+                raise PaletteError(
+                    ErrorCode.GUEST_TOOL_UNAVAILABLE, "guest capability is disabled in this profile"
+                )
+            return
         if not self.profile.guest_tools.enabled:
             raise PaletteError(
                 ErrorCode.GUEST_TOOL_UNAVAILABLE,
@@ -238,6 +254,15 @@ class Policy:
                 available.append(operation)
         if self.profile.guest_tools.enabled:
             available.extend(sorted(self.profile.guest_tools.capabilities))
+        for capability, enabled in (
+            ("guest.input_text", self.profile.guest_desktop.clipboard),
+            ("guest.clipboard", self.profile.guest_desktop.clipboard),
+            ("guest.resize", self.profile.guest_desktop.resize),
+            ("guest.file", self.profile.guest_agent.enabled),
+            ("guest.sync_time", self.profile.guest_agent.enabled),
+        ):
+            if enabled and capability not in available:
+                available.append(capability)
         return available
 
     def describe_capabilities(self) -> dict[str, str]:

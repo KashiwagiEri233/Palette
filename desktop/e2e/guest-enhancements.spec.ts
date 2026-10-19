@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 
-test('missing guest tools disable enhancements while the console remains usable', async () => {
+test('agent enhancements need no manual tools panel and baseline control remains usable', async () => {
   test.setTimeout(120000)
   const repository = resolve('..')
   const root = await mkdtemp(join(tmpdir(), 'palette-enhancements-'))
@@ -29,15 +29,8 @@ test('missing guest tools disable enhancements while the console remains usable'
     await expect(canvas).toBeVisible({ timeout: 20000 })
     await expect(canvas).toHaveJSProperty('width', 320)
     await expect(page.getByRole('checkbox', { name: '自动分辨率' })).toBeDisabled()
-    await page.getByRole('button', { name: '增强工具', exact: true }).click()
-    const panel = page.getByRole('dialog')
-    await expect(panel.getByRole('heading', { name: '虚拟机增强工具' })).toBeVisible()
-    await expect(panel.getByRole('button', { name: '发送宿主剪贴板' })).toBeDisabled()
-    await expect(panel.getByRole('button', { name: '同步客户机时间' })).toBeDisabled()
-    await expect(panel.getByRole('button', { name: '选择共享目录' })).toBeDisabled()
-    await expect(panel.getByText('该配置未启用 QEMU Guest Agent')).toBeVisible()
+    await expect(page.getByRole('button', { name: '增强工具', exact: true })).toHaveCount(0)
     await page.screenshot({ path: 'test-results/guest-enhancements-unavailable.png' })
-    await page.keyboard.press('Escape')
     await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].focus())
     await page.getByRole('button', { name: '接管', exact: true }).click()
     await expect(page.getByText('人工控制', { exact: true })).toBeVisible()

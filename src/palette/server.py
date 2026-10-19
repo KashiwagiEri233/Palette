@@ -3,8 +3,8 @@
 Read-only discovery uses ``vm_list``. Five tools carry the visual baseline
 (``vm_status``, ``vm_observe``, ``vm_act``,
 ``vm_wait``, ``vm_release_inputs``); three drive the lifecycle and are refused unless the
-trusted profile grants an agent that authority; two more expose the retained guest
-enhancement channel and are only registered when a profile enables it.
+trusted profile grants an agent that authority. Guest tools expose standard QEMU
+enhancements directly to agents when a profile enables their channels.
 
 Every success and every structured failure share one published output schema per tool, so
 a client does not need a second, undocumented error shape. Images are returned as
@@ -69,6 +69,18 @@ Things that will save you time:
 * type_text sends key events for US-layout printable ASCII only. Control characters are
   refused: send an explicit ENTER or TAB key action instead. Anything else fails with
   UNSUPPORTED_TEXT and nothing is typed.
+* For Chinese, Unicode, or multiline input, use vm_guest_input_text with
+  method="clipboard_paste", the newest frame_id, instance_id and boot_epoch. It sets the
+  guest clipboard and sends Ctrl+V in one transaction, then returns a screenshot.
+* vm_guest_clipboard_get/set access the guest clipboard directly, without host clipboard
+  access or operator dialogs. Inspect vm_status.enhancements for live availability.
+* vm_guest_file_open/read/write/close transfer binary contents over QGA: use an absolute
+  guest path, r or w mode, then base64 chunks up to 49152 bytes and always close the
+  returned transfer_id. w overwrites the guest file. A file is limited to 16 MiB by
+  default. Each chunk needs a new request_id; reuse that ID only to retrieve its receipt.
+* If guest tools are unavailable, keep using the visual baseline. Never silently replace
+  Unicode or binary data with keyboard events. Clipboard input targets the focused app;
+  terminals may require setting the clipboard then an explicit Ctrl+Shift+V action.
 * An action that times out or loses the connection may already have taken effect. Do not
   repeat it blindly - observe first.
 * A successful call means the input reached the virtual machine. It does not mean an
@@ -107,8 +119,16 @@ def build_server(service: AgentService) -> MCPServer:
 
     register_baseline_tools(server, service)
     register_lifecycle_tools(server, service)
-    if any(profile.guest_tools.enabled for profile in service.config.profiles.values()):
+    profiles = service.config.profiles.values()
+    if any(profile.guest_tools.enabled or profile.guest_desktop.clipboard for profile in profiles):
         register_guest_tools(server, service)
+    if any(
+        profile.guest_agent.enabled
+        or profile.guest_desktop.clipboard
+        or profile.guest_desktop.resize
+        for profile in service.config.profiles.values()
+    ):
+        register_standard_guest_tools(server, service)
     return server
 
 
@@ -343,9 +363,11 @@ def register_guest_tools(server: MCPServer, service: AgentService) -> None:
         title="Type text inside the guest",
         annotations=CONTROL,
         description=(
-            "Hand text to the in-guest service, which writes it through its own platform "
-            "API. Requires an enabled guest tool channel and an explicitly chosen method. "
-            "There is no silent fallback to simulated keystrokes."
+            "Input Unicode, Chinese or multiline text into the focused guest application. "
+            "clipboard_paste uses standard QEMU/SPICE clipboard plus Ctrl+V as one queued "
+            "operation. native_text requires the separate custom guest service. Requires "
+            "the latest frame and returns a screenshot; no operator click or host clipboard. "
+            "No silent fallback to ASCII key events."
         ),
     )
     async def vm_guest_input_text(
@@ -355,7 +377,7 @@ def register_guest_tools(server: MCPServer, service: AgentService) -> None:
         frame_id: str,
         request_id: str,
         text: str,
-        method: str,
+        method: str = "clipboard_paste",
         target: str = "focused",
     ) -> Annotated[CallToolResult, GuestToolResult]:
         try:
@@ -370,8 +392,11 @@ def register_guest_tools(server: MCPServer, service: AgentService) -> None:
                 target=target,
             )
         except PaletteError as exc:
-            return _failure(GuestToolResult, exc, request_id=request_id)
+            return _failure(GuestToolResult, exc, request_id=request_id, effect_state="not_sent")
         return _success(result, image=image, is_error=not result.ok)
+
+    if not any(profile.guest_tools.enabled for profile in service.config.profiles.values()):
+        return
 
     @server.tool(
         name="vm_guest_launch_app",
@@ -402,6 +427,218 @@ def register_guest_tools(server: MCPServer, service: AgentService) -> None:
             )
         except PaletteError as exc:
             return _failure(GuestToolResult, exc, request_id=request_id)
+        return _success(result, image=image, is_error=not result.ok)
+
+
+def register_standard_guest_tools(server: MCPServer, service: AgentService) -> None:
+    @server.tool(
+        name="vm_guest_clipboard_get",
+        title="Read the guest clipboard",
+        annotations=CONTROL,
+        description="Read UTF-8 text from the guest clipboard directly. Requires guest clipboard readiness; never reads the host clipboard.",
+    )
+    async def vm_guest_clipboard_get(
+        vm_id: str,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+    ) -> Annotated[CallToolResult, GuestToolResult]:
+        try:
+            result, image = await service.guest_enhancement(
+                vm_id,
+                instance_id=instance_id,
+                boot_epoch=boot_epoch,
+                request_id=request_id,
+                operation="clipboard.get",
+                parameters={},
+            )
+        except PaletteError as exc:
+            return _failure(GuestToolResult, exc, request_id=request_id, effect_state="not_sent")
+        return _success(result, image=image, is_error=not result.ok)
+
+    @server.tool(
+        name="vm_guest_clipboard_set",
+        title="Set the guest clipboard",
+        annotations=CONTROL,
+        description="Set the guest clipboard to Unicode text, up to 48 KiB UTF-8. Does not paste. Use vm_guest_input_text to set and paste atomically.",
+    )
+    async def vm_guest_clipboard_set(
+        vm_id: str,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+        text: str,
+    ) -> Annotated[CallToolResult, GuestToolResult]:
+        try:
+            result, image = await service.guest_enhancement(
+                vm_id,
+                instance_id=instance_id,
+                boot_epoch=boot_epoch,
+                request_id=request_id,
+                operation="clipboard.set",
+                parameters={"text": text},
+            )
+        except PaletteError as exc:
+            return _failure(GuestToolResult, exc, request_id=request_id, effect_state="not_sent")
+        return _success(result, image=image, is_error=not result.ok)
+
+    @server.tool(
+        name="vm_guest_file_open",
+        title="Open a guest file transfer",
+        annotations=CONTROL,
+        description="Open an absolute guest path over QGA. r downloads, w uploads and OVERWRITES the guest file. Returns an opaque transfer_id and size limit. No host file picker. Always close the transfer.",
+    )
+    async def vm_guest_file_open(
+        vm_id: str,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+        path: str,
+        mode: str = "r",
+    ) -> Annotated[CallToolResult, GuestToolResult]:
+        try:
+            result, image = await service.guest_enhancement(
+                vm_id,
+                instance_id=instance_id,
+                boot_epoch=boot_epoch,
+                request_id=request_id,
+                operation="file.open",
+                parameters={"path": path, "mode": mode},
+            )
+        except PaletteError as exc:
+            return _failure(GuestToolResult, exc, request_id=request_id, effect_state="not_sent")
+        return _success(result, image=image, is_error=not result.ok)
+
+    @server.tool(
+        name="vm_guest_file_read",
+        title="Read a guest file chunk",
+        annotations=CONTROL,
+        description="Download the next binary chunk as data.data_base64, data.count and data.eof. At most 49152 bytes per chunk. Use a fresh request_id for each chunk; close at EOF.",
+    )
+    async def vm_guest_file_read(
+        vm_id: str,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+        transfer_id: str,
+        count: int = 49152,
+    ) -> Annotated[CallToolResult, GuestToolResult]:
+        try:
+            result, image = await service.guest_enhancement(
+                vm_id,
+                instance_id=instance_id,
+                boot_epoch=boot_epoch,
+                request_id=request_id,
+                operation="file.read",
+                parameters={"transfer_id": transfer_id, "count": count},
+            )
+        except PaletteError as exc:
+            return _failure(GuestToolResult, exc, request_id=request_id, effect_state="not_sent")
+        return _success(result, image=image, is_error=not result.ok)
+
+    @server.tool(
+        name="vm_guest_file_write",
+        title="Write a guest file chunk",
+        annotations=CONTROL,
+        description="Upload the next base64-encoded binary chunk, at most 49152 decoded bytes. A fresh request_id is required for each chunk. Reusing the same request_id returns the original receipt without writing twice. Cancellation may leave a partial guest file.",
+    )
+    async def vm_guest_file_write(
+        vm_id: str,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+        transfer_id: str,
+        data_base64: str,
+    ) -> Annotated[CallToolResult, GuestToolResult]:
+        try:
+            result, image = await service.guest_enhancement(
+                vm_id,
+                instance_id=instance_id,
+                boot_epoch=boot_epoch,
+                request_id=request_id,
+                operation="file.write",
+                parameters={"transfer_id": transfer_id, "data_base64": data_base64},
+            )
+        except PaletteError as exc:
+            return _failure(GuestToolResult, exc, request_id=request_id, effect_state="not_sent")
+        return _success(result, image=image, is_error=not result.ok)
+
+    @server.tool(
+        name="vm_guest_file_close",
+        title="Close a guest file transfer",
+        annotations=CONTROL,
+        description="Close and release the guest file handle, including on error or cancellation. Handles are invalidated on reboot and control handover.",
+    )
+    async def vm_guest_file_close(
+        vm_id: str,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+        transfer_id: str,
+    ) -> Annotated[CallToolResult, GuestToolResult]:
+        try:
+            result, image = await service.guest_enhancement(
+                vm_id,
+                instance_id=instance_id,
+                boot_epoch=boot_epoch,
+                request_id=request_id,
+                operation="file.close",
+                parameters={"transfer_id": transfer_id},
+            )
+        except PaletteError as exc:
+            return _failure(GuestToolResult, exc, request_id=request_id, effect_state="not_sent")
+        return _success(result, image=image, is_error=not result.ok)
+
+    @server.tool(
+        name="vm_guest_resize",
+        title="Resize the guest display",
+        annotations=CONTROL,
+        description="Request a guest resolution through the virtio display/session helper. Inspect returned data for acknowledgement and observe again for actual dimensions. Old frames become invalid when dimensions change.",
+    )
+    async def vm_guest_resize(
+        vm_id: str,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+        width: int,
+        height: int,
+    ) -> Annotated[CallToolResult, GuestToolResult]:
+        try:
+            result, image = await service.guest_enhancement(
+                vm_id,
+                instance_id=instance_id,
+                boot_epoch=boot_epoch,
+                request_id=request_id,
+                operation="display.resize",
+                parameters={"width": width, "height": height},
+            )
+        except PaletteError as exc:
+            return _failure(GuestToolResult, exc, request_id=request_id, effect_state="not_sent")
+        return _success(result, image=image, is_error=not result.ok)
+
+    @server.tool(
+        name="vm_guest_sync_time",
+        title="Synchronize guest time",
+        annotations=CONTROL,
+        description="Set guest time to host UTC using QGA, when the guest enables guest-set-time.",
+    )
+    async def vm_guest_sync_time(
+        vm_id: str,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+    ) -> Annotated[CallToolResult, GuestToolResult]:
+        try:
+            result, image = await service.guest_enhancement(
+                vm_id,
+                instance_id=instance_id,
+                boot_epoch=boot_epoch,
+                request_id=request_id,
+                operation="sync_time",
+                parameters={},
+            )
+        except PaletteError as exc:
+            return _failure(GuestToolResult, exc, request_id=request_id, effect_state="not_sent")
         return _success(result, image=image, is_error=not result.ok)
 
 

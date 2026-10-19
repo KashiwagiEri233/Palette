@@ -532,6 +532,7 @@ class GuestToolResult(BaseModel):
     deduplicated: bool = False
     frame: Frame | None = None
     detail: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _failure_has_error(self) -> Self:

@@ -15,11 +15,11 @@
 
 * **纯视觉模式不支持直接输入非 ASCII / 中文文本**：基线 `vm_act` 的 `type_text`（`mode: "keyboard"`）仅发送 **US 布局可打印 ASCII** 扫描码，控制字符（如 `
 `、`	`）与非 ASCII 字符会在发送第一个按键前被全量预校验拦截（返回 `UNSUPPORTED_TEXT`）。在桌面端人工接管控制台时，物理按键同样按客户机键盘布局发送扫描码，不直接传输宿主机输入法（IME）合成词组。
-* **客户机内增强服务（`guest/agent/`）仅完成宿主机侧契约与 Bridge**：宿主机侧的协议分帧、版本协商、权限开关与 `GuestToolBridge` 已完整实现并经过 mock 契约测试，但客户机内部的 `virtio-serial` 守护进程尚未内置实现。因此在客户机实际运行该服务前，调用 `vm_guest_input_text` 或 `vm_guest_launch_app` 会如实返回 `GUEST_TOOL_UNAVAILABLE`。
+* **客户机内增强服务（`guest/agent/`）仅完成宿主机侧契约与 Bridge**：宿主机侧的协议分帧、版本协商、权限开关与 `GuestToolBridge` 已完整实现并经过 mock 契约测试，但客户机内部的 `virtio-serial` 守护进程尚未内置实现。`native_text` 与 `vm_guest_launch_app` 需要该自定义服务；标准 `clipboard_paste` 与 QGA 文件传输工具直接使用上游服务，参阅[增强工具指南](guest-enhancements.zh-CN.md)。
 * **`type_text` 逐键限速**：每个字符包含按下与释放消息并按 `char_interval_ms`（默认 12 ms）限速发送，256 个字符需要数百次往返，不与单次鼠标点击共用延迟预算。
 * **仅支持垂直滚轮（`up` / `down`）**：水平滚动未在标准测试矩阵中验证，因此不在 `vm_act` 的 `scroll` 动作中暴露。
 * **无多点触控、手势或压感输入**：指针采用绝对坐标定位（`usb-tablet`），不支持触摸屏手势或相对鼠标锁定（Pointer Lock）。
-* **可选文本剪贴板**：检测到 SPICE vdagent 后，Palette Desktop 支持由用户明确触发的双向文本复制；不支持剪贴板图片和文件列表，不自动监控宿主剪贴板。参阅[增强工具指南](guest-enhancements.zh-CN.md)。
+* **可选文本剪贴板**：检测到 SPICE vdagent 后，Agent 支持直接读取/设置客户机文本剪贴板并粘贴文字；不支持剪贴板图片和文件列表，不自动监控宿主剪贴板。参阅[增强工具指南](guest-enhancements.zh-CN.md)。
 * **单向音频输出、无麦克风采集与设备直通**：桌面端硬件设置支持通过 **Intel HDA** 将客户机声音输出到宿主机默认音频设备（需 QEMU 对应后端与客户机驱动支持），但**绝不采集宿主机麦克风**，也不支持摄像头、USB 设备直通、PCI 直通、多显示器或 `9p`/`virtiofs`/SMB 共享文件夹。 客户机运行 spice-webdavd 时，支持用户明确选择的私有 WebDAV 共享目录；实际兼容性仍需按宿主和客户机验收。
 * **`vm_wait` 的变化与稳定检测是像素启发式**：`changed` 与 `stable` 模式基于缩略图比较像素差异，闪烁的光标、系统时钟或动画均可能影响结果，不等同于“客户机应用程序已空闲”。
 
