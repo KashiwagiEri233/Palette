@@ -20,6 +20,7 @@ class VmDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
     name: str = Field(min_length=1, max_length=120)
     profile_id: str
+    os_preset: Literal["windows", "linux", "custom"] = "custom"
     source: Literal["image", "iso"]
     path: str = Field(min_length=1, max_length=4096)
     image_format: Literal["qcow2", "raw"] = "qcow2"

@@ -81,6 +81,7 @@ class RuntimeOwner:
                 "desktop_protocol": 1,
                 "features": [
                     "vm-settings-v2",
+                    "os-presets-v1",
                     "disk-resize",
                     "runtime-stop",
                     "vm-stop-identity",
@@ -94,6 +95,10 @@ class RuntimeOwner:
                 "config_root": str(self.service.config.config_root),
                 "agent_endpoint": self.agent.endpoint.model_dump(mode="json"),
             }
+        if method == "os_presets.list":
+            from .os_presets import list_os_presets
+
+            return list_os_presets(self.service.config)
         if method == "profiles":
             from .platforms import native_profile_id
 

@@ -73,6 +73,7 @@ class DesktopCommand(StrictModel):
     method: Literal[
         "hello",
         "profiles",
+        "os_presets.list",
         "image.info",
         "doctor",
         "vms.list",

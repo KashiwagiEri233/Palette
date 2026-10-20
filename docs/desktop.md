@@ -78,7 +78,21 @@ npm --prefix desktop run preview
 
 ### VM Creation Wizard
 
-You can create a persistent VM from two source types:
+Every creation entry uses four steps: **Choose configuration → Choose source → Configure VM → Confirm creation**.
+
+First select a **Preset** or **Custom** configuration. Presets offer Windows and Linux guests in x86_64 or ARM64; Custom retains trusted Profile selection. Guest presets are independent of host execution profiles: a Linux guest on a Windows host still uses the appropriate Windows-host accelerator. TCG requires explicit software-emulation selection. Targets without a matching Profile show a reason and never silently switch accelerators.
+
+| Suggested configuration | Windows | Linux |
+| --- | --- | --- |
+| CPU / RAM / disk | 4 cores / 8 GiB / 80 GiB | 2 cores / 4 GiB / 32 GiB |
+| x86_64 display / NIC | VGA / e1000 | VirtIO GPU / VirtIO Net |
+| ARM64 display / NIC | RAMFB / VirtIO Net | VirtIO GPU / VirtIO Net |
+
+Network mode, audio, storage controller and firmware inherit the base Profile. Step three exposes CPU cores, memory and disk size directly, without opening advanced settings; the final edited values are saved. Back navigation and background refresh preserve edits, and replacing a modified configuration requires confirmation. CPU/memory cannot exceed host totals, and disk size cannot be smaller than the imported image's virtual capacity; validation occurs before creation.
+
+A preset records the intended guest family, without detecting the installed OS, installing drivers, configuring TPM or bypassing Windows setup checks. Supply media with matching architecture, firmware and drivers. The Windows enhancement/driver ISO and its menu mounting action belong to a later release.
+
+Step two offers two source types:
 
 1. **Import Base Image (`qcow2` / `raw`)**: The imported file is treated strictly as a **read-only base image** (preserve its original path and any backing chain). Palette creates a writable overlay inside `.runtime/`. The configured virtual disk size cannot be smaller than the base image.
 2. **Install from ISO**: Palette creates a managed blank disk of your chosen capacity and attaches the installer ISO. Firmware (BIOS / UEFI) and storage drivers must match the guest OS (e.g., Windows ISO installs may require an extra CD-ROM with VirtIO drivers).

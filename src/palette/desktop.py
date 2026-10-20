@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+import psutil
 from pydantic import ValidationError
 
 from .config import Profile
@@ -85,6 +87,21 @@ class DesktopManager:
                 raise self._validation_error(exc) from exc
             path = validate_caller_path(draft.path, what=draft.source)
             profile = self.service.config.profile(draft.profile_id)
+            if draft.os_preset != "custom":
+                from .platforms import validate_target
+
+                validate_target(profile)
+            cores = os.cpu_count()
+            if (cores and draft.vcpus > cores) or (
+                draft.memory_mib > psutil.virtual_memory().total // (1024 * 1024)
+            ):
+                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "CPU 或内存超过宿主资源上限")
+            if draft.source == "image":
+                info = await self.service.manager.images_for(profile).inspect_image(
+                    path, image_format=draft.image_format
+                )
+                if draft.disk_gib * 1024**3 < info.virtual_size:
+                    raise PaletteError(ErrorCode.INVALID_ARGUMENT, "磁盘容量不能小于镜像虚拟容量")
             self._resource_conflicts(profile, draft.vcpus, draft.memory_mib)
             if draft.settings:
                 await validate_hardware(self.probe, profile, draft.settings)

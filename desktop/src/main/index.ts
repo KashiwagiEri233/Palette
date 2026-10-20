@@ -54,6 +54,7 @@ const methods = new Set<DesktopMethod>(['profiles', 'doctor', 'vms.list', 'vms.c
 methods.add('guest.status')
 methods.add('control.display.resize')
 methods.add('image.info')
+methods.add('os_presets.list')
 methods.add('hardware.capabilities')
 methods.add('vms.settings.get')
 methods.add('vms.disk.resize')
