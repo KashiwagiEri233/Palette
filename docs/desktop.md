@@ -110,7 +110,7 @@ The VM management list provides **Start / Shut Down**, **Restart**, **Pause**, *
 * **Graceful Shutdown & Force Stop**: Normal shutdown sends an ACPI shutdown signal; if the guest does not power off within the timeout budget, Palette Desktop reports an error and leaves the VM running rather than silently killing it. **Force Stop** requires explicit confirmation.
   The timeout message provides a **Force Stop…** action that opens this confirmation. Confirmation is tied to the original running instance: if another client has restarted the VM, Palette refuses to stop the replacement. A normal shutdown initiated inside the guest is recognized as **Stopped** once QEMU emits a guest shutdown event and exits successfully; a crash remains a failure.
 * **Restart**: Preserves all persistent disk changes and UEFI variables.
-* **Restore Initial State**: Discards all writable disk modifications and resets UEFI variables — image-backed VMs return to the clean read-only base image, and ISO-backed VMs return to a fresh blank disk.
+* **Restore Initial State**: Discards managed system disk modifications and resets UEFI variables — image-backed VMs return to the clean read-only base image, and ISO-backed VMs return to a fresh blank disk. Additional disk and optical image files retain their contents.
 * **Delete VM**: Removes only managed files inside `.runtime/` that have no remaining dependents. Imported base images and external ISOs are **never** deleted.
 
 ### Window Close & Exit Modes
@@ -141,7 +141,11 @@ Open **VM Settings** directly from the VM management row, or from the VM's actio
 | **Network** | Choose **Offline (`offline`)**, **Restricted Lab (`restricted-lab`)**, or **NAT (`nat`)**, select the NIC model, set a custom MAC address, and configure TCP/UDP port forwards. New port forwards bind strictly to `127.0.0.1` |
 | **Audio** | Routes guest audio through **Intel HDA** to the host's default audio output device (**microphone capture is never enabled**). Requires a supported QEMU audio backend (`CoreAudio` on macOS, `DirectSound` on Windows, `PipeWire`/`PulseAudio`/`ALSA` on Linux) and guest HDA drivers; missing backends fail with a clear diagnostic |
 
-> The **More Hardware Options** step in the creation wizard reuses these exact forms. Version-1 VM definitions are upgraded in place upon saving without mutating disks on read.
+The settings sidebar's **Devices & Drives** (`设备与驱动器`) section manages up to eight additional drives while the VM is stopped. Add existing RAW/QCOW2 disks, ISO optical drives, or empty optical drives. Each drive retains its ID through saves, reloads and list removals. Disks use VirtIO; optical drives use USB with explicit CD-ROM devices. Guest drivers must support the selected device.
+
+Additional disks default to read-only. Selecting read/write directly modifies that disk image; the backend rejects writing to the system base chain or attaching conflicting writable images. Disconnecting a disk, ejecting an ISO, or removing a drive does not delete the file. Added drives preserve the original installation ISO and boot order. This stage attaches existing disk files; it does not create new blank data disks or add extra NICs.
+
+> The **More Hardware Options** step in the creation wizard reuses the display, network, audio and boot forms. Additional drives are configured in VM settings. Version-1 VM definitions are upgraded in place upon saving without mutating disks on read.
 
 ## 4. Live Console & Human Control Handoff
 
@@ -200,6 +204,8 @@ uv run pytest tests/e2e/test_virtio_vga.py
 ```
 
 It verifies resolution parameter acceptance, framebuffer capture, authenticated VNC, keyboard/tablet display bindings, and a visible response to keyboard input. The test uses TCG and disables SMM for its minimal BIOS guest; it does not establish Windows/Linux driver or guest desktop resolution acceptance.
+
+For real QEMU multiple-drive and tools-hotplug verification, set `PALETTE_DRIVES_QEMU` to the same executable and run `uv run pytest tests/e2e/test_real_drives.py`. It checks actual writable disks, shared read-only backing files, loaded/empty optical drives, tools drive creation/reuse/ejection, and preservation of all other media. This firmware-only test does not verify Windows driver installation.
 
 ## Optional Guest Enhancements
 

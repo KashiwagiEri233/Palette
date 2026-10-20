@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -11,12 +12,82 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import PaletteConfig, Profile
-from .errors import ErrorCode, PaletteError
+from .errors import ErrorCode, PaletteError, QmpCommandError
 from .policy import Policy
+from .qmp.client import QmpClient
 from .vm.manager import VmState
 
 if TYPE_CHECKING:
     from .desktop import DesktopManager
+
+logger = logging.getLogger("palette.tools_media")
+_MEDIA_NODE = "palette-tools-medium"
+_USB_ID = "palette-tools-usb"
+_CD_ID = "palette-tools-cd"
+
+
+def _tools_drive(blocks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    # BlockBackend names can be empty for hotplugged -blockdev nodes. Identify our
+    # optical device by QOM path, never by the first removable/system drive.
+    prefix = f"/machine/peripheral/{_CD_ID}"
+    return next(
+        (
+            item
+            for item in blocks
+            if item.get("qdev") in {_CD_ID, prefix}
+            or str(item.get("qdev", "")).startswith(prefix + "/")
+        ),
+        None,
+    )
+
+
+async def _delete_detached_node(qmp: QmpClient) -> None:
+    nodes = await qmp.execute("query-named-block-nodes")
+    if any(item.get("node-name") == _MEDIA_NODE for item in nodes):
+        await qmp.execute("blockdev-del", {"node-name": _MEDIA_NODE})
+
+
+async def _add_tools_drive(qmp: QmpClient, path: Path) -> None:
+    devices = await qmp.execute("qom-list", {"path": "/machine/peripheral"})
+    names = {item["name"] for item in devices}
+    if _CD_ID in names:
+        raise PaletteError(ErrorCode.STATE_CONFLICT, "工具光驱状态尚未就绪, 请稍后重试")
+    # A timed-out earlier attempt may have left an unattached owned node. QEMU
+    # refuses deletion if it is in use, so this cannot detach any guest device.
+    await _delete_detached_node(qmp)
+    await qmp.execute(
+        "blockdev-add",
+        {
+            "driver": "raw",
+            "node-name": _MEDIA_NODE,
+            "read-only": True,
+            "file": {"driver": "file", "filename": str(path)},
+        },
+    )
+    added_usb = False
+    try:
+        if _USB_ID not in names:
+            await qmp.execute("device_add", {"driver": "usb-bot", "id": _USB_ID, "bus": "xhci.0"})
+            added_usb = True
+        # Explicit scsi-cd is important: usb-storage with a blockdev node can
+        # otherwise appear as a removable hard disk rather than an optical drive.
+        await qmp.execute(
+            "device_add",
+            {"driver": "scsi-cd", "id": _CD_ID, "bus": f"{_USB_ID}.0", "drive": _MEDIA_NODE},
+        )
+    except QmpCommandError:
+        # A definitive rejection did not create the CD. Roll back only resources
+        # this attempt created. Timeouts/disconnects instead need a fresh query.
+        if added_usb:
+            try:
+                await qmp.execute("device_del", {"id": _USB_ID})
+            except PaletteError:
+                logger.warning("tools USB controller cleanup failed", exc_info=True)
+        try:
+            await _delete_detached_node(qmp)
+        except PaletteError:
+            logger.warning("tools media node cleanup failed", exc_info=True)
+        raise
 
 
 class ToolsManifest(BaseModel):
@@ -95,40 +166,46 @@ async def change_tools_media(
                 raise PaletteError(ErrorCode.INVALID_ARGUMENT, "运行中装载需要当前实例 ID")
             service.require_instance_id(instance, request.instance_id)
             blocks = await instance.qmp.execute("query-block")
-            drive = next((item for item in blocks if item.get("device") == "palette-tools"), None)
-            if drive is None:
-                raise PaletteError(
-                    ErrorCode.STATE_CONFLICT, "当前实例没有工具光驱, 请关闭并重新启动虚拟机"
+            drive = _tools_drive(blocks)
+            if mount and path is not None and drive is None:
+                await _add_tools_drive(instance.qmp, path)
+            elif drive is not None:
+                arguments: dict[str, Any] = {"id": drive["qdev"]}
+                inserted = drive.get("inserted", {})
+                already_mounted = (
+                    mount
+                    and definition.tools_iso_sha256 == digest
+                    and inserted.get("ro")
+                    and Path(inserted.get("file", "")).resolve() == path
+                    and not drive.get("tray_open", False)
                 )
-            arguments: dict[str, Any] = (
-                {"id": drive["qdev"]} if drive.get("qdev") else {"device": "palette-tools"}
-            )
-            if mount:
-                arguments.update(
-                    filename=str(path), format="raw", **{"read-only-mode": "read-only"}
-                )
-                await instance.qmp.execute("blockdev-change-medium", arguments)
-            else:
-                arguments["force"] = False
-                await instance.qmp.execute("eject", arguments)
+                if mount and not already_mounted:
+                    arguments.update(
+                        filename=str(path), format="raw", **{"read-only-mode": "read-only"}
+                    )
+                    await instance.qmp.execute("blockdev-change-medium", arguments)
+                elif not mount and inserted:
+                    arguments["force"] = False
+                    await instance.qmp.execute("eject", arguments)
             observed = await instance.qmp.execute("query-block")
-            after: dict[str, Any] = next(
-                (item for item in observed if item.get("device") == "palette-tools"), {}
-            )
+            after = _tools_drive(observed) or {}
             inserted = after.get("inserted")
             confirmed = (
                 bool(
                     inserted
                     and inserted.get("ro")
+                    and not after.get("tray_open", False)
                     and Path(inserted.get("file", "")).resolve() == path
                 )
                 if mount
-                else bool(after) and not inserted
+                else not inserted
             )
             if not confirmed:
                 raise PaletteError(
                     ErrorCode.ACTION_OUTCOME_UNKNOWN, "工具盘状态尚未确认, 请检查客户机光驱后重试"
                 )
+            if not mount or (inserted or {}).get("node-name") != _MEDIA_NODE:
+                await _delete_detached_node(instance.qmp)
         elif request.instance_id is not None:
             raise PaletteError(ErrorCode.STALE_FRAME, "虚拟机运行实例已改变, 请刷新后重试")
         updated = definition.model_copy(

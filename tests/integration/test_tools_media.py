@@ -83,28 +83,27 @@ async def test_live_mount_and_eject_touch_only_tools_drive(service, tools_iso, t
     instance = service.manager.find(vm_id)
     revision = desktop.get(vm_id).revision
     request = {"revision": revision, "instance_id": instance.view.instance_id}
+    original = await instance.qmp.execute("query-block")
     result = await change_tools_media(desktop, vm_id, request, mount=True)
     assert result["live"] and result["attached"]
     records = read_command_log(instance)
-    commands = [item for item in records if item["command"] == "blockdev-change-medium"]
-    assert len(commands) == 1
-    assert commands[0]["arguments"] == {
-        "id": "/machine/peripheral/palette-tools-cd",
-        "filename": str(tools_iso.resolve()),
-        "format": "raw",
-        "read-only-mode": "read-only",
-    }
+    additions = [item for item in records if item["command"] == "device_add"]
+    assert [item["arguments"]["driver"] for item in additions] == ["usb-bot", "scsi-cd"]
+    assert not any(item["command"] in {"eject", "blockdev-change-medium"} for item in records)
+    mounted = await instance.qmp.execute("query-block")
+    assert [item for item in mounted if "palette-tools-cd" not in item["qdev"]] == original
     assert instance.overrides.volumes[0].path == str(installer)
     assert desktop.get(vm_id).iso_attached
     await change_tools_media(
         desktop, vm_id, {**request, "revision": result["revision"]}, mount=False
     )
     eject = [item for item in read_command_log(instance) if item["command"] == "eject"]
-    assert eject[-1]["arguments"] == {"id": "/machine/peripheral/palette-tools-cd", "force": False}
+    assert eject[-1]["arguments"] == {"id": "palette-tools-cd", "force": False}
+    assert not any(item["command"] == "device_del" for item in read_command_log(instance))
 
 
 @pytest.mark.parametrize(
-    "failure", ["stale-instance", "stale-revision", "agent", "locked", "missing-drive"]
+    "failure", ["stale-instance", "stale-revision", "agent", "usb-bot", "scsi-cd", "missing-drive"]
 )
 async def test_live_failures_do_not_save_mount(service, tools_iso, failure):
     desktop = DesktopManager(service)
@@ -124,17 +123,54 @@ async def test_live_failures_do_not_save_mount(service, tools_iso, failure):
     elif failure == "agent":
         await service.driver.acquire(vm_id, instance_id=instance.view.instance_id, run_id="test")
         expected = ErrorCode.BUSY
-    elif failure == "locked":
-        write_behavior(instance, {"tools_media_fail": True})
+    elif failure in {"usb-bot", "scsi-cd"}:
+        write_behavior(instance, {"tools_add_fail": failure})
+        expected = ErrorCode.QMP_COMMAND_FAILED
     else:
         write_behavior(instance, {"tools_drive_missing": True})
-        expected = ErrorCode.STATE_CONFLICT
+        expected = ErrorCode.ACTION_OUTCOME_UNKNOWN
     with pytest.raises(PaletteError) as error:
         await change_tools_media(desktop, vm_id, request, mount=True)
     if expected:
         assert error.value.code == expected
     assert desktop.get(vm_id).tools_iso_sha256 is None
     assert desktop.get(vm_id).revision == revision
+    if failure in {"usb-bot", "scsi-cd"}:
+        assert await instance.qmp.execute("query-named-block-nodes") == []
+        write_behavior(instance, {})
+        assert (await change_tools_media(desktop, vm_id, request, mount=True))["attached"]
+
+
+async def test_repeated_mount_reuses_drive_without_ejecting_media(service, tools_iso):
+    desktop = DesktopManager(service)
+    vm_id = (await create(desktop))["vm_id"]
+    await desktop.start(vm_id)
+    instance = service.manager.find(vm_id)
+    request = {"revision": desktop.get(vm_id).revision, "instance_id": instance.view.instance_id}
+    first = await change_tools_media(desktop, vm_id, request, mount=True)
+    await change_tools_media(desktop, vm_id, {**request, "revision": first["revision"]}, mount=True)
+    commands = read_command_log(instance)
+    assert sum(item["command"] == "device_add" for item in commands) == 2
+    assert not any(item["command"] in {"eject", "blockdev-change-medium"} for item in commands)
+
+
+async def test_new_tools_version_reloads_media_at_the_same_path(service, tools_iso):
+    desktop = DesktopManager(service)
+    vm_id = (await create(desktop))["vm_id"]
+    await desktop.start(vm_id)
+    instance = service.manager.find(vm_id)
+    request = {"revision": desktop.get(vm_id).revision, "instance_id": instance.view.instance_id}
+    first = await change_tools_media(desktop, vm_id, request, mount=True)
+    tools_iso.write_bytes(b"updated tools".ljust(32768, b"\0"))
+    manifest = json.loads(tools_iso.with_suffix(".json").read_text(encoding="utf-8"))
+    manifest["sha256"] = hashlib.sha256(tools_iso.read_bytes()).hexdigest()
+    tools_iso.with_suffix(".json").write_text(json.dumps(manifest), encoding="utf-8")
+    await change_tools_media(desktop, vm_id, {**request, "revision": first["revision"]}, mount=True)
+    changes = [
+        item for item in read_command_log(instance) if item["command"] == "blockdev-change-medium"
+    ]
+    assert len(changes) == 1 and changes[0]["arguments"]["id"] == "palette-tools-cd"
+    assert desktop.get(vm_id).tools_iso_sha256 == manifest["sha256"]
 
 
 @pytest.mark.parametrize("damage", ["iso", "manifest", "missing", "architecture"])
@@ -179,17 +215,22 @@ async def test_linux_preset_rejects_windows_media(service, tools_iso):
     assert error.value.code == ErrorCode.UNSUPPORTED_CAPABILITY
 
 
-async def test_guest_refused_eject_is_not_reported_as_ejected(service, tools_iso):
+@pytest.mark.parametrize("failure", ["ignored", "locked"])
+async def test_guest_refused_eject_is_not_reported_as_ejected(service, tools_iso, failure):
     desktop = DesktopManager(service)
     vm_id = (await create(desktop))["vm_id"]
     await desktop.start(vm_id)
     instance = service.manager.find(vm_id)
     request = {"revision": desktop.get(vm_id).revision, "instance_id": instance.view.instance_id}
     mounted = await change_tools_media(desktop, vm_id, request, mount=True)
-    write_behavior(instance, {"tools_eject_ignored": True})
+    write_behavior(
+        instance, {"tools_eject_ignored" if failure == "ignored" else "tools_media_fail": True}
+    )
     with pytest.raises(PaletteError) as error:
         await change_tools_media(
             desktop, vm_id, {**request, "revision": mounted["revision"]}, mount=False
         )
-    assert error.value.code == ErrorCode.ACTION_OUTCOME_UNKNOWN
+    assert error.value.code == (
+        ErrorCode.ACTION_OUTCOME_UNKNOWN if failure == "ignored" else ErrorCode.QMP_COMMAND_FAILED
+    )
     assert desktop.get(vm_id).tools_iso_sha256 is not None

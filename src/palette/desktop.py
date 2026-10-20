@@ -6,6 +6,7 @@ import os
 import re
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import psutil
@@ -133,6 +134,7 @@ class DesktopManager:
                 iso_attached=draft.iso_attached,
             )
             self._validate_media(self.settings(definition), definition.iso_attached)
+            await self._validate_drives(profile, self.settings(definition))
             self._save(definition)
             return definition.model_dump(mode="json")
 
@@ -151,6 +153,7 @@ class DesktopManager:
             await validate_hardware(self.probe, definition.profile, update.settings, previous)
             self._check_conflicts(definition.profile, update.settings, previous)
             self._validate_media(update.settings, update.iso_attached)
+            await self._validate_drives(definition.profile, update.settings)
             data = definition.draft.model_dump()
             data.update(update.model_dump(exclude={"revision", "iso_attached"}))
             data["iso_attached"] = update.iso_attached
@@ -272,6 +275,33 @@ class DesktopManager:
         if settings.boot_order == "cdrom" and not (settings.iso_path and attached):
             raise PaletteError(ErrorCode.INVALID_ARGUMENT, "光盘优先需要挂载 ISO")
 
+    async def _validate_drives(self, profile: Profile, settings: HardwareSettings) -> None:
+        chains: list[tuple[set[Path], Path | None]] = []
+        for drive in settings.drives:
+            if not drive.path or not drive.attached:
+                continue
+            path = validate_caller_path(drive.path, what="附加驱动器")
+            chain = {path}
+            if drive.media == "disk":
+                info = await self.service.manager.images_for(profile).inspect_image(path)
+                if info.format != drive.format:
+                    raise PaletteError(ErrorCode.IMAGE_INVALID, "附加磁盘镜像格式与文件不一致")
+                chain = set(info.chain)
+                if not drive.read_only and Path(profile.images.base).is_file():
+                    base = await self.service.manager.images_for(profile).inspect_image(
+                        validate_caller_path(profile.images.base, what="基础镜像")
+                    )
+                    if path in base.chain:
+                        raise PaletteError(ErrorCode.INVALID_ARGUMENT, "附加磁盘不能写入基础镜像链")
+            writer = None if drive.read_only else path
+            if any(
+                (writer is not None and writer in other)
+                or (other_writer is not None and other_writer in chain)
+                for other, other_writer in chains
+            ):
+                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "读写磁盘不能重复挂载同一镜像")
+            chains.append((chain, writer))
+
     @staticmethod
     def _resource_conflicts(profile: Profile, vcpus: int, memory_mib: int) -> None:
         flags = {argument.split("=", 1)[0] for argument in profile.qemu.extra_args}
@@ -378,6 +408,20 @@ class DesktopManager:
                     else 2,
                 ),
             )
+        await self._validate_drives(definition.profile, settings)
+        volumes += tuple(
+            ExtraVolume(
+                path=str(validate_caller_path(drive.path, what="附加驱动器"))
+                if drive.path and drive.attached
+                else None,
+                media=drive.media,
+                format=drive.format,
+                read_only=drive.read_only,
+                device_id=drive.id,
+            )
+            for drive in settings.drives
+            if drive.media == "cdrom" or drive.attached
+        )
         overrides = LaunchOverrides(volumes=volumes, tools_iso=tools_iso)
 
         def ready(instance: VmInstance) -> None:

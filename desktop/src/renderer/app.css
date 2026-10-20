@@ -227,6 +227,10 @@ body:has(.console-panel:fullscreen) .workspace-topbar { -webkit-app-region: no-d
 .forward-row { display: grid; grid-template-columns: 120px minmax(0, 1fr) minmax(0, 1fr) auto; gap: 10px; align-items: end; }
 .settings-disk-section { display: grid; justify-items: start; gap: 16px; margin-bottom: 24px; padding-bottom: 24px; border-bottom: 1px solid var(--border); }
 .settings-disk-section .configuration-grid { width: 100%; }
+.drive-add-actions, .drive-card-heading { display: flex; align-items: center; gap: 12px; }
+.drive-card { display: grid; gap: 16px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; min-width: 0; }
+.drive-card-heading { justify-content: space-between; }
+.drive-card-heading strong { font-size: 14px; font-weight: 600; }
 .settings-preserved { padding-top: 20px; margin-top: 20px; border-top: 1px solid var(--border); }
 .settings-error { margin-top: 20px; font-size: 13px; line-height: 1.6; }
 .settings-notice, .settings-upgrade { padding: 12px 16px; background: var(--muted); border-radius: var(--radius-xl); font-size: 13px; line-height: 1.6; margin-bottom: 16px; }

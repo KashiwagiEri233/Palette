@@ -365,11 +365,12 @@ class ExtraVolume:
     ``virtio-blk-pci`` shape as the instance disk.
     """
 
-    path: str
+    path: str | None
     media: Literal["disk", "cdrom"] = "disk"
     format: str = "raw"
     read_only: bool = True
     boot_index: int | None = None
+    device_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -500,9 +501,9 @@ def _extra_volume_args(
         # depend on which default devices the machine happens to keep.
         argv += ["-device", "virtio-scsi-pci,id=scsi0"]
     for index, volume in enumerate(volumes):
-        node = f"extra{index}"
-        native_path = _windows_drive_config(
-            volume.path,
+        node = volume.device_id or f"extra{index}"
+        native_path = bool(volume.path) and _windows_drive_config(
+            volume.path or "",
             {
                 "id": node,
                 "if": "none",
@@ -511,7 +512,7 @@ def _extra_volume_args(
             },
             config_sections,
         )
-        if not native_path:
+        if volume.path and not native_path:
             argv += [
                 "-blockdev",
                 json.dumps(
@@ -536,9 +537,16 @@ def _extra_volume_args(
             ]
         if volume.media == "cdrom":
             boot = f",bootindex={volume.boot_index}" if volume.boot_index is not None else ""
-            argv += ["-device", f"scsi-cd,drive={node},bus=scsi0.0{boot}"]
+            backend = f",drive={node}" if volume.path else ""
+            if volume.device_id:
+                # USB optical drives need no guest VirtIO storage driver.
+                argv += ["-device", f"usb-bot,id={node}-usb,bus=xhci.0"]
+                argv += ["-device", f"scsi-cd,id={node}{backend},bus={node}-usb.0{boot}"]
+            else:
+                argv += ["-device", f"scsi-cd{backend},bus=scsi0.0{boot}"]
         else:
-            argv += ["-device", f"virtio-blk-pci,drive={node}"]
+            identity = f",id={node}" if volume.device_id else ""
+            argv += ["-device", f"virtio-blk-pci,drive={node}{identity}"]
         notes.append(f"attached a caller-supplied {volume.media}")
     return argv
 
@@ -556,7 +564,6 @@ def build_launch_plan(
     start_paused: bool = True,
     managed_console: bool = False,
     clipboard_available: bool = True,
-    tools_drive: bool = False,
     tools_iso: Path | None = None,
     extra_volumes: Sequence[ExtraVolume] = (),
     caller_args: Sequence[str] = (),
@@ -703,7 +710,7 @@ def build_launch_plan(
         boot_index=1 if any(volume.boot_index == 0 for volume in extra_volumes) else 0,
     )
     argv += _extra_volume_args(extra_volumes, notes, config_sections)
-    if tools_drive:
+    if tools_iso is not None:
         options = {
             "id": "palette-tools",
             "if": "none",
@@ -711,9 +718,7 @@ def build_launch_plan(
             "readonly": "on",
             "format": "raw",
         }
-        if tools_iso is None:
-            argv += ["-drive", "id=palette-tools,if=none,media=cdrom,readonly=on"]
-        elif not _windows_drive_config(str(tools_iso), options, config_sections):
+        if not _windows_drive_config(str(tools_iso), options, config_sections):
             # QemuOpts doubles literal commas; -drive does not accept JSON.
             argv += [
                 "-drive",
@@ -724,7 +729,9 @@ def build_launch_plan(
             ]
         argv += [
             "-device",
-            "usb-storage,id=palette-tools-cd,drive=palette-tools,bus=xhci.0,removable=on",
+            "usb-bot,id=palette-tools-usb,bus=xhci.0",
+            "-device",
+            "scsi-cd,id=palette-tools-cd,drive=palette-tools,bus=palette-tools-usb.0",
         ]
     if config_sections:
         # Relative to cwd so a non-ASCII runtime directory is never sent via argv.

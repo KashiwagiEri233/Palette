@@ -443,7 +443,9 @@ class VmManager:
                 "base_image": str(overrides.image) if overrides.image else profile.images.base,
                 "base_from_caller": overrides.image is not None,
                 "overlay": str(paths.overlay),
-                "attached_volumes": [str(volume.path) for volume in overrides.volumes],
+                "attached_volumes": [
+                    str(volume.path) for volume in overrides.volumes if volume.path
+                ],
                 "state": str(VmState.STARTING),
                 "host_boot_epoch": instance.view.boot_epoch,
                 "firmware_code": profile.qemu.firmware.code,
@@ -468,6 +470,9 @@ class VmManager:
         volumes = []
         volume_chain: list[str] = []
         for volume in overrides.volumes:
+            if volume.path is None:
+                volumes.append(volume)
+                continue
             info = await images.inspect_image(
                 Path(volume.path), image_format="raw" if volume.media == "cdrom" else None
             )
@@ -505,7 +510,6 @@ class VmManager:
             caller_args=overrides.qemu_args,
             managed_console=self.console_enabled,
             clipboard_available=clipboard_available,
-            tools_drive=on_storage_ready is not None,
             tools_iso=overrides.tools_iso,
         )
         instance.plan = plan

@@ -57,12 +57,36 @@ class NetworkSettings(SettingsModel):
         return self
 
 
+class DriveSettings(SettingsModel):
+    id: str = Field(pattern=r"^drive-[a-z0-9_-]{1,16}$")
+    media: Literal["disk", "cdrom"]
+    path: str | None = Field(default=None, min_length=1, max_length=4096)
+    format: Literal["raw", "qcow2"] = "raw"
+    read_only: bool = True
+    attached: bool = True
+
+    @model_validator(mode="after")
+    def valid_media(self) -> DriveSettings:
+        if self.media == "disk" and not self.path:
+            raise ValueError("附加磁盘需要选择镜像文件")
+        if self.media == "cdrom" and (self.format != "raw" or not self.read_only):
+            raise ValueError("光驱只支持只读 ISO")
+        return self
+
+
 class HardwareSettings(SettingsModel):
     display: DisplaySettings
     network: NetworkSettings = Field(default_factory=NetworkSettings)
     audio_enabled: bool = False
     iso_path: str | None = Field(default=None, min_length=1, max_length=4096)
     boot_order: Literal["auto", "disk", "cdrom"] = "auto"
+    drives: list[DriveSettings] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def unique_drives(self) -> HardwareSettings:
+        if len({drive.id for drive in self.drives}) != len(self.drives):
+            raise ValueError("设备与驱动器 ID 不得重复")
+        return self
 
 
 def settings_from_profile(profile: Profile, iso_path: str | None = None) -> HardwareSettings:

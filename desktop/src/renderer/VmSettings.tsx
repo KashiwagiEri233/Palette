@@ -5,6 +5,7 @@ import { Label } from '@/components/ui/label'
 import { FormSelect } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog'
 import { FolderIcon, PlusIcon } from '@/components/icons'
+import { DriveFields } from './DriveFields'
 import type { HardwareCapabilities, HardwareSettings, OwnerInfo, VmDraft, VmRecord, VmSettingsResult } from '../shared/types'
 import { displayNames, networkNames, sections, sizeLabel, validateVmSettings, errorSection, type SettingsSection } from './lib/vm-settings'
 
@@ -103,6 +104,7 @@ export function VmSettings({ vm, owner, onClose, onSaved }: { vm: VmRecord; owne
             {section === 'general' && <div className="form-stack"><div><Label htmlFor="edit-name">名称</Label><Input id="edit-name" maxLength={120} value={draft.name} onChange={event => setDraft({ ...draft, name: event.target.value })} /></div><dl className="configuration-grid"><div><dt>系统配置</dt><dd>{draft.profile_id}</dd></div><div><dt>架构</dt><dd>{vm.status.guest_arch ?? '沿用原配置'}</dd></div></dl><div><Label>原始来源</Label><p className="path-value">{draft.path}</p><p className="field-hint">原始镜像保持只读，虚拟机修改保存在独立磁盘中。</p></div></div>}
             {section === 'resources' && <div className="form-stack"><ResourceInputs draft={draft} change={(key, value) => setDraft({ ...draft, [key]: value })} /><p className="field-hint">宿主资源：{result.capabilities.host.vcpus ?? '—'} 个逻辑核心 / {sizeLabel(result.capabilities.host.memory_mib * 1024 ** 2)} 内存。设置较高资源可能影响其他应用。</p></div>}
             {section === 'disk' && <div className="settings-disk-section"><dl className="configuration-grid"><div><dt>配置容量</dt><dd>{result.disk.configured_gib} GiB</dd></div><div><dt>实盘容量</dt><dd>{sizeLabel(result.disk.virtual_bytes)}</dd></div><div><dt>宿主占用</dt><dd>{sizeLabel(result.disk.actual_bytes)}</dd></div></dl><Button variant="outline" disabled={dirty || !owner?.features.includes('disk-resize')} onClick={() => setResize(true)}>扩容磁盘</Button><p className="field-hint">仅支持增大容量；扩容后需在客户机内扩展分区。{dirty ? '请先保存或丢弃其他修改，再扩容。' : ''}</p></div>}
+            {section === 'devices' && <DriveFields settings={settings} change={setSettings} />}
             {['disk', 'display', 'network', 'audio'].includes(section) && <HardwareFields section={section} settings={settings} change={setSettings} caps={result.capabilities} attached={attached} setAttached={setAttached} draft={draft} setDraft={setDraft} running={!editable} disabled={!editable || saving} />}
           </fieldset>
           {section === 'network' && (result.preserved_network.hostfwd.length > 0 || result.preserved_network.extra_options) && <div className="settings-preserved"><Label>沿用的 profile 网络参数</Label><p className="path-value">{[result.preserved_network.extra_options, ...result.preserved_network.hostfwd].filter(Boolean).join('\n')}</p><p className="field-hint">这些已有参数会保留；修改它们需要编辑可信 profile。</p></div>}

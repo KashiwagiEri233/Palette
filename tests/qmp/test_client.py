@@ -290,7 +290,8 @@ class TestAllowList:
         assert "system_powerdown" in ALLOWED_COMMANDS
         assert "human-monitor-command" not in ALLOWED_COMMANDS
         assert "migrate" not in ALLOWED_COMMANDS
-        assert "device_add" not in ALLOWED_COMMANDS
+        assert "device_add" in ALLOWED_COMMANDS
+        assert "blockdev-add" in ALLOWED_COMMANDS
 
 
 class TestProbe:

@@ -45,16 +45,20 @@ class TestArgumentVector:
             profile,
             overlay=tmp_path / "o.qcow2",
             workdir=tmp_path,
-            tools_drive=True,
             tools_iso=tools,
             extra_volumes=[ExtraVolume(path=str(installer), media="cdrom", boot_index=0)],
         )
         drive = plan.argv[plan.argv.index("-drive") + 1]
         assert "id=palette-tools" in drive and "readonly=on" in drive
         assert "tools,, media.iso" in drive
-        device = next(arg for arg in plan.argv if arg.startswith("usb-storage,"))
-        assert "bus=xhci.0" in device and "bootindex" not in device
+        assert "usb-bot,id=palette-tools-usb,bus=xhci.0" in plan.argv
+        device = next(arg for arg in plan.argv if arg.startswith("scsi-cd,id=palette-tools-cd,"))
+        assert "bus=palette-tools-usb.0" in device and "bootindex" not in device
         assert any(arg.startswith("scsi-cd,") and "bootindex=0" in arg for arg in plan.argv)
+
+    def test_tools_drive_is_not_added_until_media_is_selected(self, profile, tmp_path):
+        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
+        assert not any("palette-tools" in arg for arg in plan.argv)
 
     def test_no_shell_is_involved(self, profile, tmp_path: Path) -> None:
         plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)

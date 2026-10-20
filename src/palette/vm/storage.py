@@ -36,7 +36,7 @@ class VmStorage:
         paths = {Path(profile.images.base).resolve()}
         if overrides.image is not None:
             paths.add(overrides.image.resolve())
-        paths.update(Path(volume.path).resolve() for volume in overrides.volumes)
+        paths.update(Path(volume.path).resolve() for volume in overrides.volumes if volume.path)
         if storage is not None:
             paths.add(storage.overlay.resolve())
             if storage.hardware_vars is not None:
@@ -84,7 +84,9 @@ class VmStorage:
                 protected.append(instance.paths.root)
                 protected.append(instance.paths.overlay)
                 protected.append(instance.overrides.image or Path(instance.profile.images.base))
-                protected.extend(Path(volume.path) for volume in instance.overrides.volumes)
+                protected.extend(
+                    Path(volume.path) for volume in instance.overrides.volumes if volume.path
+                )
         images = self.images_for(profile)
         if delete_all:
             images.keep_overlays = False

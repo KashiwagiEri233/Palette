@@ -1,9 +1,9 @@
 import type { HardwareSettings, Profile, VmDraft } from '../../shared/types'
 
-export type SettingsSection = 'general' | 'resources' | 'disk' | 'display' | 'network' | 'audio'
+export type SettingsSection = 'general' | 'resources' | 'disk' | 'devices' | 'display' | 'network' | 'audio'
 export const sections: { id: SettingsSection; label: string }[] = [
   { id: 'general', label: '常规' }, { id: 'resources', label: '处理器与内存' },
-  { id: 'disk', label: '磁盘与启动' }, { id: 'display', label: '显示' },
+  { id: 'disk', label: '磁盘与启动' }, { id: 'devices', label: '设备与驱动器' }, { id: 'display', label: '显示' },
   { id: 'network', label: '网络' }, { id: 'audio', label: '声音' }
 ]
 export const displayNames: Record<string, string> = { VGA: '标准 VGA', 'virtio-vga': 'VirtIO VGA', 'virtio-gpu-pci': 'VirtIO GPU', ramfb: 'RAMFB' }
@@ -23,6 +23,11 @@ export function validateVmSettings(draft: VmDraft, settings?: HardwareSettings |
   if (!Number.isInteger(draft.memory_mib) || draft.memory_mib < 256 || draft.memory_mib > 1048576) return { section: 'resources', field: 'settings-memory', message: '内存必须为 256–1048576 MiB。' }
   if (!Number.isInteger(draft.disk_gib) || draft.disk_gib < 1 || draft.disk_gib > 4096) return { section: 'disk', field: 'disk', message: '磁盘容量必须为 1–4096 GiB 的整数。' }
   if (!settings) return null
+  const drives = settings.drives ?? []
+  if (drives.length > 8) return { section: 'devices', field: 'add-drive', message: '最多添加 8 个附加驱动器。' }
+  for (const [index, drive] of drives.entries()) {
+    if (drive.media === 'disk' && !drive.path) return { section: 'devices', field: `drive-path-${drive.id}`, message: `磁盘 ${index + 1} 需要选择镜像。` }
+  }
   const { width, height, default_resolution: resolution } = settings.display
   if (resolution && (!Number.isInteger(width) || !Number.isInteger(height) || width < 2 || height < 2 || width > 8192 || height > 8192 || width * height > 16777216)) return { section: 'display', field: 'display-width', message: '分辨率须为 2–8192 的整数，且总像素不超过 16777216。' }
   const mac = settings.network.mac
@@ -44,6 +49,7 @@ export function sizeLabel(bytes: number | null): string {
 }
 
 export function errorSection(message: string): SettingsSection | null {
+  if (/drives|附加|驱动器|设备 ID|读写磁盘/i.test(message)) return 'devices'
   if (/display|显卡|分辨率/i.test(message)) return 'display'
   if (/network|forward|mac|port|网卡|网络|端口/i.test(message)) return 'network'
   if (/iso|boot|光盘|介质/i.test(message)) return 'disk'

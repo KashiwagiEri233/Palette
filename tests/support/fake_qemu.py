@@ -65,6 +65,11 @@ COMMANDS = [
     "query-cpus-fast",
     "query-block",
     "blockdev-change-medium",
+    "blockdev-add",
+    "blockdev-del",
+    "query-named-block-nodes",
+    "device_add",
+    "device_del",
     "eject",
     "qom-list",
     "input-send-event",
@@ -106,6 +111,28 @@ class FakeQemu:
         self.vnc_port: int | None = None
         self.tools_drive = any("id=palette-tools," in item for item in argv)
         self.tools_file: str | None = None
+        self.tools_node: str | None = None
+        self.tools_nodes: dict[str, dict] = {}
+        self.tools_usb = any("id=palette-tools-usb," in item for item in argv)
+        self.other_blocks: list[dict] = []
+        for index, value in enumerate(argv):
+            if value == "-blockdev":
+                node = json.loads(argv[index + 1])
+                if node.get("driver") == "file" and node.get("node-name", "").startswith("extra"):
+                    self.other_blocks.append(
+                        {
+                            "device": node["node-name"],
+                            "qdev": "/machine/peripheral/system-cd",
+                            "removable": True,
+                            "inserted": {"file": node["filename"], "ro": True},
+                        }
+                    )
+            elif value == "-drive" and "id=palette-tools," in argv[index + 1]:
+                options = argv[index + 1].replace(",,", "\0").split(",")
+                self.tools_file = next(
+                    (item[5:].replace("\0", ",") for item in options if item.startswith("file=")),
+                    None,
+                )
         if "-vnc" in argv:
             self.start_vnc()
 
@@ -290,18 +317,54 @@ class FakeQemu:
             self.reply(message_id, [{"cpu-index": 0, "target": "x86_64", "thread-id": os.getpid()}])
         elif command == "query-block":
             block = {
-                "device": "palette-tools",
-                "qdev": "/machine/peripheral/palette-tools-cd",
+                "device": "" if self.tools_node else "palette-tools",
+                "qdev": "palette-tools-cd",
                 "removable": True,
             }
             if self.tools_file:
-                block["inserted"] = {"file": self.tools_file, "ro": True}
+                block["inserted"] = {
+                    "file": self.tools_file,
+                    "ro": True,
+                    "node-name": self.tools_node,
+                }
             self.reply(
                 message_id,
-                [block]
-                if self.tools_drive and not self.behavior().get("tools_drive_missing")
-                else [],
+                self.other_blocks
+                + (
+                    [block]
+                    if self.tools_drive and not self.behavior().get("tools_drive_missing")
+                    else []
+                ),
             )
+        elif command == "query-named-block-nodes":
+            self.reply(message_id, list(self.tools_nodes.values()))
+        elif command == "blockdev-add":
+            if arguments["node-name"] in self.tools_nodes:
+                self.send(
+                    {"id": message_id, "error": {"class": "GenericError", "desc": "duplicate node"}}
+                )
+            else:
+                self.tools_nodes[arguments["node-name"]] = arguments
+                self.reply(message_id, {})
+        elif command == "blockdev-del":
+            self.tools_nodes.pop(arguments["node-name"], None)
+            self.reply(message_id, {})
+        elif command == "device_add":
+            if self.behavior().get("tools_add_fail") == arguments["driver"]:
+                self.send(
+                    {"id": message_id, "error": {"class": "GenericError", "desc": "hotplug failed"}}
+                )
+            else:
+                if arguments["driver"] == "usb-bot":
+                    self.tools_usb = True
+                elif arguments["driver"] == "scsi-cd":
+                    self.tools_drive = True
+                    self.tools_node = arguments["drive"]
+                    self.tools_file = self.tools_nodes[self.tools_node]["file"]["filename"]
+                self.reply(message_id, {})
+        elif command == "device_del":
+            self.tools_usb = False
+            self.reply(message_id, {})
         elif command in {"blockdev-change-medium", "eject"}:
             behavior = self.behavior()
             if behavior.get("tools_media_fail"):
@@ -318,7 +381,17 @@ class FakeQemu:
                     )
                 self.reply(message_id, {})
         elif command == "qom-list":
-            self.reply(message_id, [])
+            self.reply(
+                message_id,
+                [
+                    {"name": name, "type": kind}
+                    for name, kind, present in (
+                        ("palette-tools-usb", "child<usb-bot>", self.tools_usb),
+                        ("palette-tools-cd", "child<scsi-cd>", self.tools_drive),
+                    )
+                    if present
+                ],
+            )
         elif command == "input-send-event":
             self.reply(message_id, {})
             behavior = self.behavior()
