@@ -12,6 +12,7 @@ from palette.desktop import DesktopManager
 from palette.errors import ErrorCode, PaletteError
 from palette.operator.protocol import DesktopCommand
 from palette.runtime import RuntimeOwner
+from palette.vm_settings import settings_from_profile
 
 
 def payload(service, **changes):
@@ -98,3 +99,23 @@ async def test_os_presets_route_is_read_only_and_advertised(service):
         assert not service.manager.known() and not owner.desktop.definitions
     finally:
         await owner.close()
+
+
+async def test_virtio_vga_persists_and_starts_without_rewriting_custom_defaults(service):
+    desktop = DesktopManager(service)
+    base = service.config.profile("default")
+    settings = settings_from_profile(base)
+    settings.display.model = "virtio-vga"
+    settings.display.default_resolution = True
+    settings.display.width, settings.display.height = 1600, 900
+    vm_id = (await desktop.create(payload(service, settings=settings.model_dump())))["vm_id"]
+    restored = DesktopManager(service)
+    for _ in range(2):
+        await restored.start(vm_id)
+        instance = service.manager.find(vm_id)
+        assert "virtio-vga,id=video0,xres=1600,yres=900" in instance.plan.argv
+        assert any("bus=xhci.0,display=video0" in arg for arg in instance.plan.argv)
+        await restored.stop(vm_id, force=True)
+    assert restored.get(vm_id).draft.settings.display.model == "virtio-vga"
+    assert restored.get(vm_id).profile.devices.display_model == "virtio-vga"
+    assert base.devices.display_model == "VGA"

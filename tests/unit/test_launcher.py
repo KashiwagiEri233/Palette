@@ -36,6 +36,26 @@ def plan_for(profile, *, overlay: Path, workdir: Path, **kwargs):
 
 
 class TestArgumentVector:
+    def test_tools_optical_drive_is_separate_read_only_and_has_no_boot_priority(
+        self, profile, tmp_path
+    ):
+        tools = tmp_path / "tools, media.iso"
+        installer = tmp_path / "windows.iso"
+        plan = plan_for(
+            profile,
+            overlay=tmp_path / "o.qcow2",
+            workdir=tmp_path,
+            tools_drive=True,
+            tools_iso=tools,
+            extra_volumes=[ExtraVolume(path=str(installer), media="cdrom", boot_index=0)],
+        )
+        drive = plan.argv[plan.argv.index("-drive") + 1]
+        assert "id=palette-tools" in drive and "readonly=on" in drive
+        assert "tools,, media.iso" in drive
+        device = next(arg for arg in plan.argv if arg.startswith("usb-storage,"))
+        assert "bus=xhci.0" in device and "bootindex" not in device
+        assert any(arg.startswith("scsi-cd,") and "bootindex=0" in arg for arg in plan.argv)
+
     def test_no_shell_is_involved(self, profile, tmp_path: Path) -> None:
         plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
         assert isinstance(plan.argv, list)

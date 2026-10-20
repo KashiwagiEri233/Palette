@@ -272,11 +272,14 @@ def test_launcher_uses_private_ports_and_can_omit_clipboard(profile, tmp_path):
     assert sum(arg.startswith("virtio-serial-pci") for arg in plan.argv) == 1
 
 
-def test_features_degrade_independently_and_resize_requires_live_session(profile, monkeypatch):
+@pytest.mark.parametrize("model", ["virtio-gpu-pci", "virtio-vga"])
+def test_features_degrade_independently_and_resize_requires_live_session(
+    profile, monkeypatch, model
+):
     session = GuestSession("test-only")
     profile = profile.model_copy(
         update={
-            "devices": profile.devices.model_copy(update={"display_model": "virtio-gpu-pci"}),
+            "devices": profile.devices.model_copy(update={"display_model": model}),
             "guest_desktop": GuestDesktopConfig(resize=True),
         }
     )

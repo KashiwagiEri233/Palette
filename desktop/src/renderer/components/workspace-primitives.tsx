@@ -1,5 +1,5 @@
 import { Fragment, type ComponentProps, type ReactNode } from 'react'
-import { MoreHorizontal, Play, Power, RotateCw, Pause, Settings2, Trash2, Square, RotateCcw } from '@/components/icons/workbench'
+import { MoreHorizontal, Play, Power, RotateCw, Pause, Settings2, Trash2, Square, RotateCcw, Disc } from '@/components/icons/workbench'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -38,12 +38,14 @@ export function VmActions({ vm, busy, onAction, compact = false, inline = false 
     { action: 'restart', label: '重启', Icon: RotateCw, disabled: state !== 'RUNNING' || !vm.persistent },
     { action: 'pause', label: '暂停', Icon: Pause, disabled: true, title: '当前版本暂不支持暂停' },
     { action: 'settings', label: '虚拟机设置', Icon: Settings2, disabled: !vm.persistent },
+    { action: 'tools.mount', label: '安装增强工具与驱动', Icon: Disc, disabled: !vm.persistent || vm.definition?.draft.os_preset === 'linux' || vm.status.guest_arch !== 'x86_64' || !['RUNNING', 'STOPPED', 'FAILED'].includes(state) },
+    { action: 'tools.eject', label: '弹出增强工具光盘', Icon: Disc, disabled: !vm.definition?.tools_iso_attached || !['RUNNING', 'STOPPED', 'FAILED'].includes(state) },
     { action: 'force', label: '强制停止', Icon: Square, disabled: !active, destructive: true },
     { action: 'reset', label: '恢复初始状态', Icon: RotateCcw, disabled: active, destructive: true },
     { action: 'delete', label: '删除虚拟机', Icon: Trash2, disabled: active || !vm.persistent, destructive: true },
   ]
   const primaryActions = actions.filter(({ action }) => [active ? 'stop' : 'start', 'restart', 'pause', 'settings', 'delete'].includes(action))
-  const menuActions = inline ? actions.filter(({ action }) => ['force', 'reset'].includes(action)) : actions
+  const menuActions = inline ? actions.filter(({ action }) => ['tools.mount', 'tools.eject', 'force', 'reset'].includes(action)) : actions
 
   return <>
     {inline && primaryActions.map(({ action, label, Icon, disabled, title, destructive }) => <Button

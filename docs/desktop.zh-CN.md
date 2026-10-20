@@ -85,12 +85,14 @@ npm --prefix desktop run preview
 | 建议配置 | Windows | Linux |
 | --- | --- | --- |
 | CPU / 内存 / 磁盘 | 4 核 / 8 GiB / 80 GiB | 2 核 / 4 GiB / 32 GiB |
-| x86_64 显示 / 网卡 | VGA / e1000 | VirtIO GPU / VirtIO Net |
+| x86_64 显示 / 网卡 | VirtIO VGA / e1000 | VirtIO VGA / VirtIO Net |
 | ARM64 显示 / 网卡 | RAMFB / VirtIO Net | VirtIO GPU / VirtIO Net |
+
+x86_64 预设优先使用 `virtio-vga`；所选 QEMU 缺少该设备时，Windows 使用 `VGA`，Linux 使用 `virtio-gpu-pci`，向导会显示回退原因。没有受支持候选的目标标记为不可用。ARM64 的 Windows 使用 `ramfb`，Linux 使用 `virtio-gpu-pci`。新默认值仅用于新建或主动重选预设；已有虚拟机及自定义 Profile 保留原配置。
 
 网络模式、音频、存储控制器及固件沿用基础 Profile。在第三步可直接修改 CPU 核数、内存和磁盘大小，无需打开高级设置；创建按最终输入值保存。返回上一步或后台刷新保留编辑，更换配置前会确认是否覆盖已有修改。CPU、内存不得超过宿主总资源，磁盘容量不得小于导入镜像的虚拟容量；错误会在创建前提示。
 
-预设代表用户选择的目标系统，不自动识别镜像内系统，也不安装驱动、配置 TPM 或绕过 Windows 安装检查。请自行准备匹配架构、固件和驱动的介质。Windows 增强工具与驱动安装 ISO、菜单装载功能留待后续版本。
+预设代表用户选择的目标系统，不自动识别镜像内系统，也不安装驱动、配置 TPM 或绕过 Windows 安装检查。请自行准备匹配架构、固件和驱动的介质。Windows x64 增强工具与驱动安装 ISO 和菜单装载见[增强工具指南](guest-enhancements.zh-CN.md)。
 
 第二步可选择两种来源：
 
@@ -135,7 +137,7 @@ Windows 下，中文目录或文件名的 ISO、磁盘及固件通过按系统�
 | **常规** | 查看或修改虚拟机显示名称、备注说明与基础元数据 |
 | **处理器与内存** | **vCPU**：`1–64` 核；**内存**：`256–1,048,576 MiB`。界面展示的宿主机物理核心与内存仅作参考，不代表资源预留 |
 | **磁盘与启动** | **受管磁盘扩容**：独立确认操作（需先保存或丢弃其他未保存修改），仅支持增大，上限 `4096 GiB`。界面清晰区分“配置容量”、“实盘容量”与“宿主占用”。扩容仅修改受管可写层，不改动基础镜像与 UEFI 变量，且不会自动扩展客户机内部文件系统分区。若扩容意外中断，后台会根据实盘与操作记录自动恢复；无法确认完整性时阻止启动，绝不自动缩回磁盘。<br>**ISO 与启动顺序**：镜像和 ISO 来源的 VM 均可挂载、更换或移除 ISO；启动顺序支持**自动**（首次启动优先光盘介质，后续优先硬盘）、**硬盘优先**与**光盘优先**（要求已挂载介质） |
-| **显示** | 根据客户机架构与本机 QEMU `-device help` 能力动态过滤可用显卡（如 `VGA`、`virtio-gpu-pci`、`ramfb`）。支持为兼容显卡设置默认启动分辨率提示（`ramfb` 由固件或客户机决定，界面会说明限制） |
+| **显示** | 根据客户机架构与本机 QEMU `-device help` 能力动态过滤可用显卡（如 `VGA`、`virtio-vga`、`virtio-gpu-pci`、`ramfb`）。支持为兼容显卡设置默认启动分辨率提示（`ramfb` 由固件或客户机决定，界面会说明限制） |
 | **网络** | 支持 **离线（`offline`）**、**沙箱隔离（`restricted-lab`）** 与 **NAT（`nat`）** 三种模式；支持选择网卡型号、自定义 MAC 地址以及配置 TCP/UDP 端口转发。新增端口转发固定仅监听宿主机 `127.0.0.1` |
 | **声音** | 通过 **Intel HDA** 将客户机音频输出到宿主机默认音频设备，**不采集麦克风**。要求 QEMU 具备对应宿主音频后端（macOS `CoreAudio`、Windows `DirectSound`、Linux `PipeWire`/`PulseAudio`/`ALSA`）且客户机已安装声卡驱动；缺少后端时会明确报错 |
 
@@ -189,6 +191,15 @@ npm --prefix desktop run test:e2e
 ```
 
 Electron Playwright 端到端测试（`npm --prefix desktop run test:e2e`）使用独立临时配置目录、受监督的 fake QEMU 子进程与真实的本机 WebSocket RFB 连接，自动验证创建虚拟机、修改硬件设置、控制台画面连接、人工接管与退出确认流程。实机客户机验收步骤详见[端到端验收测试指南](acceptance-test.zh-CN.md)。
+
+可选的 VirtIO VGA 测试使用真实 x86_64 QEMU 启动一次性 BIOS 客户机。例如在 PowerShell 中运行：
+
+```powershell
+$env:PALETTE_VIRTIO_VGA_QEMU = 'C:/Program Files/qemu/qemu-system-x86_64.exe'
+uv run pytest tests/e2e/test_virtio_vga.py
+```
+
+测试验证默认分辨率参数被接受、截图、认证 VNC、键盘和鼠标的显示设备绑定，以及键盘输入引起的实际画面变化。测试使用 TCG，并为最小 BIOS 客户机关闭 SMM；此结果不代表已完成 Windows/Linux 驱动或客户机桌面分辨率验收。
 
 ## 可选虚拟机增强工具
 

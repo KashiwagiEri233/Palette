@@ -98,7 +98,7 @@ class RuntimeOwner:
         if method == "os_presets.list":
             from .os_presets import list_os_presets
 
-            return list_os_presets(self.service.config)
+            return await list_os_presets(self.service.config, self.desktop.probe)
         if method == "profiles":
             from .platforms import native_profile_id
 
@@ -134,6 +134,12 @@ class RuntimeOwner:
             return {"vms": await self.desktop.list()}
         if method == "vms.create":
             return await self.desktop.create(payload)
+        if method in {"vms.tools.mount", "vms.tools.eject"}:
+            from .tools_media import change_tools_media
+
+            return await change_tools_media(
+                self.desktop, vm_id, payload, mount=method.endswith("mount")
+            )
         if method == "vms.update":
             return await self.desktop.update(vm_id, payload)
         if method == "vms.settings.get":

@@ -6,7 +6,7 @@ export const sections: { id: SettingsSection; label: string }[] = [
   { id: 'disk', label: '磁盘与启动' }, { id: 'display', label: '显示' },
   { id: 'network', label: '网络' }, { id: 'audio', label: '声音' }
 ]
-export const displayNames: Record<string, string> = { VGA: '标准 VGA', 'virtio-gpu-pci': 'VirtIO GPU', ramfb: 'RAMFB' }
+export const displayNames: Record<string, string> = { VGA: '标准 VGA', 'virtio-vga': 'VirtIO VGA', 'virtio-gpu-pci': 'VirtIO GPU', ramfb: 'RAMFB' }
 export const networkNames = { 'restricted-lab': '隔离网络', offline: '离线', nat: 'NAT' }
 
 export function profileSettings(profile: Profile, isoPath: string | null = null): HardwareSettings {

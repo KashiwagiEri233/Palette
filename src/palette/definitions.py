@@ -95,6 +95,7 @@ class VmDefinition(BaseModel):
     storage_owner: str | None = None
     seed_owner: str | None = None
     iso_attached: bool = True
+    tools_iso_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     created_at: str
     updated_at: str
 

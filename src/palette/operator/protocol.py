@@ -78,6 +78,8 @@ class DesktopCommand(StrictModel):
         "doctor",
         "vms.list",
         "vms.create",
+        "vms.tools.mount",
+        "vms.tools.eject",
         "vms.update",
         "vms.settings.get",
         "vms.disk.resize",

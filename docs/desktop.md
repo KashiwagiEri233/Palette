@@ -85,12 +85,14 @@ First select a **Preset** or **Custom** configuration. Presets offer Windows and
 | Suggested configuration | Windows | Linux |
 | --- | --- | --- |
 | CPU / RAM / disk | 4 cores / 8 GiB / 80 GiB | 2 cores / 4 GiB / 32 GiB |
-| x86_64 display / NIC | VGA / e1000 | VirtIO GPU / VirtIO Net |
+| x86_64 display / NIC | VirtIO VGA / e1000 | VirtIO VGA / VirtIO Net |
 | ARM64 display / NIC | RAMFB / VirtIO Net | VirtIO GPU / VirtIO Net |
+
+The x86_64 presets prefer `virtio-vga`; if absent from the selected QEMU, Windows uses `VGA` and Linux uses `virtio-gpu-pci`, with an explanation in the wizard. Targets with no supported candidate are unavailable. ARM64 uses `ramfb` for Windows and `virtio-gpu-pci` for Linux. These defaults apply when creating a VM or explicitly reselecting a preset; saved VMs and custom Profiles retain their settings.
 
 Network mode, audio, storage controller and firmware inherit the base Profile. Step three exposes CPU cores, memory and disk size directly, without opening advanced settings; the final edited values are saved. Back navigation and background refresh preserve edits, and replacing a modified configuration requires confirmation. CPU/memory cannot exceed host totals, and disk size cannot be smaller than the imported image's virtual capacity; validation occurs before creation.
 
-A preset records the intended guest family, without detecting the installed OS, installing drivers, configuring TPM or bypassing Windows setup checks. Supply media with matching architecture, firmware and drivers. The Windows enhancement/driver ISO and its menu mounting action belong to a later release.
+A preset records the intended guest family, without detecting the installed OS, installing drivers, configuring TPM or bypassing Windows setup checks. Supply media with matching architecture, firmware and drivers. For the Windows x64 tools/driver ISO and menu mounting action, see [guest enhancements](guest-enhancements.md).
 
 Step two offers two source types:
 
@@ -135,7 +137,7 @@ Open **VM Settings** directly from the VM management row, or from the VM's actio
 | **General** | View or update the VM display name and notes |
 | **Processor & Memory** | **vCPUs**: `1–64` cores; **Memory**: `256–1,048,576 MiB`. Host CPU/RAM figures are shown for reference and do not reserve host capacity |
 | **Disk & Boot** | **Managed Disk Expansion**: Confirmed as an independent operation (requires saving or discarding other form edits first), grow-only up to `4096 GiB`. The UI distinguishes configured capacity, actual disk virtual size, and host bytes used. Expansion modifies only the managed writable layer, leaving base images and UEFI vars untouched, and does not automatically grow guest OS partitions. Interrupted resizes recover from on-disk state and operation journals, blocking boot if integrity cannot be verified.<br>**ISO & Boot Order**: Attach, swap, or eject an ISO on both image-backed and ISO-backed VMs. Boot order supports **Automatic** (CD-ROM first on initial boot, disk first thereafter), **Disk First**, and **CD-ROM First** (requires mounted media) |
-| **Display** | Dynamically filters GPU models (`VGA`, `virtio-gpu-pci`, `ramfb`) based on guest architecture and local QEMU `-device help`. Supported GPUs accept a default resolution hint (`ramfb` is controlled by firmware/guest and explains this constraint in the UI) |
+| **Display** | Dynamically filters GPU models (`VGA`, `virtio-vga`, `virtio-gpu-pci`, `ramfb`) based on guest architecture and local QEMU `-device help`. Supported GPUs accept a default resolution hint (`ramfb` is controlled by firmware/guest and explains this constraint in the UI) |
 | **Network** | Choose **Offline (`offline`)**, **Restricted Lab (`restricted-lab`)**, or **NAT (`nat`)**, select the NIC model, set a custom MAC address, and configure TCP/UDP port forwards. New port forwards bind strictly to `127.0.0.1` |
 | **Audio** | Routes guest audio through **Intel HDA** to the host's default audio output device (**microphone capture is never enabled**). Requires a supported QEMU audio backend (`CoreAudio` on macOS, `DirectSound` on Windows, `PipeWire`/`PulseAudio`/`ALSA` on Linux) and guest HDA drivers; missing backends fail with a clear diagnostic |
 
@@ -189,6 +191,15 @@ npm --prefix desktop run test:e2e
 ```
 
 The Electron Playwright suite (`npm --prefix desktop run test:e2e`) runs against an isolated config root, supervised fake QEMU child processes, and real localhost RFB connections to verify VM creation, hardware settings, live console streaming, human takeover, and shutdown dialogs. For physical guest verification, follow the [acceptance test guide](acceptance-test.md).
+
+An optional VirtIO VGA test boots a disposable BIOS guest with real x86_64 QEMU. For example, in PowerShell:
+
+```powershell
+$env:PALETTE_VIRTIO_VGA_QEMU = 'C:/Program Files/qemu/qemu-system-x86_64.exe'
+uv run pytest tests/e2e/test_virtio_vga.py
+```
+
+It verifies resolution parameter acceptance, framebuffer capture, authenticated VNC, keyboard/tablet display bindings, and a visible response to keyboard input. The test uses TCG and disables SMM for its minimal BIOS guest; it does not establish Windows/Linux driver or guest desktop resolution acceptance.
 
 ## Optional Guest Enhancements
 

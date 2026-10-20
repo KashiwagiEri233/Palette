@@ -5,7 +5,7 @@ import { dirname, join, resolve, relative, isAbsolute } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { call } from './ipc'
 import { RuntimeShutdown, VmShutdownTimeout } from './shutdown'
-import type { DesktopMethod, OwnerInfo } from '../shared/types'
+import type { DesktopMethod, OwnerInfo, VmRecord } from '../shared/types'
 import { workspaceMethods } from '../shared/workspace'
 import { ConversationRepository } from './conversations'
 import { agentMethods } from '../shared/agent'
@@ -50,7 +50,7 @@ function conversations(): ConversationRepository {
   if (!repository) { repository = new ConversationRepository(app.getPath('userData'), root); repositories.set(root, repository) }
   return repository
 }
-const methods = new Set<DesktopMethod>(['profiles', 'doctor', 'vms.list', 'vms.create', 'vms.update', 'vms.start', 'vms.stop', 'vms.restart', 'vms.reset', 'vms.delete', 'display.ticket', 'display.sync', 'control.acquire', 'control.input', 'control.heartbeat', 'control.release'])
+const methods = new Set<DesktopMethod>(['profiles', 'doctor', 'vms.list', 'vms.create', 'vms.tools.mount', 'vms.tools.eject', 'vms.update', 'vms.start', 'vms.stop', 'vms.restart', 'vms.reset', 'vms.delete', 'display.ticket', 'display.sync', 'control.acquire', 'control.input', 'control.heartbeat', 'control.release'])
 methods.add('guest.status')
 methods.add('control.display.resize')
 methods.add('image.info')
@@ -179,12 +179,41 @@ app.whenReady().then(async () => {
         if (!url) throw new Error('链接地址无效')
         await shell.openExternal(url)
       }
-      else if (payload.action === 'menu') Menu.buildFromTemplate([
+      else if (payload.action === 'menu') {
+        const root = runtimeRoot
+        let selected: VmRecord | undefined
+        if (vmId) {
+          try {
+            const listed = await call(root, 'vms.list') as { vms: VmRecord[] }
+            selected = listed.vms.find(vm => vm.vm_id === vmId)
+          } catch { /* File/edit/view menus remain available while the backend is offline. */ }
+        }
+        const changeMedia = async (mount: boolean) => {
+          if (!selected?.definition) return
+          try {
+            if (handlingClose || root !== runtimeRoot) throw new Error('后台连接已改变，请重新打开菜单')
+            await call(root, mount ? 'vms.tools.mount' : 'vms.tools.eject', selected.vm_id, {
+              revision: selected.definition.revision,
+              instance_id: ['STOPPED', 'FAILED'].includes(selected.status.state) ? null : selected.status.instance_id
+            })
+            if (mount) await dialog.showMessageBox(window, { type: 'info', title: '安装增强工具与驱动', message: selected.status.state === 'RUNNING' ? '增强工具光盘已装载' : '增强工具光盘将在下次启动时装载', detail: `虚拟机：${selected.name}\n在 Windows 客户机中打开工具光驱，运行 Install.cmd 并确认管理员权限。完成后按安装程序提示重启客户机。`, buttons: ['知道了'] })
+          } catch (error) {
+            await dialog.showMessageBox(window, { type: 'error', title: '增强工具光盘', message: '工具盘操作失败', detail: error instanceof Error ? error.message : String(error), buttons: ['知道了'] })
+          }
+        }
+        Menu.buildFromTemplate([
         { label: '文件', submenu: [{ label: '关闭窗口', click: () => window.close() }] },
+        { label: '虚拟机', submenu: [
+          { label: selected?.name ?? (vmId ? '虚拟机不可用' : '请先选择虚拟机'), enabled: false },
+          { type: 'separator' },
+          { id: 'install-windows-tools', label: '安装增强工具与驱动', enabled: !!selected?.persistent && selected.definition?.draft.os_preset !== 'linux' && selected.status.guest_arch === 'x86_64' && ['RUNNING', 'STOPPED', 'FAILED'].includes(selected.status.state), click: () => { void changeMedia(true) } },
+          { id: 'eject-windows-tools', label: '弹出增强工具光盘', enabled: !!selected?.definition?.tools_iso_attached && ['RUNNING', 'STOPPED', 'FAILED'].includes(selected.status.state), click: () => { void changeMedia(false) } }
+        ] },
         { label: '编辑', submenu: [{ role: 'undo', label: '撤销' }, { role: 'redo', label: '重做' }, { type: 'separator' }, { role: 'cut', label: '剪切' }, { role: 'copy', label: '复制' }, { role: 'paste', label: '粘贴' }, { role: 'selectAll', label: '全选' }] },
         { label: '视图', submenu: [{ role: 'resetZoom', label: '实际大小' }, { role: 'zoomIn', label: '放大' }, { role: 'zoomOut', label: '缩小' }, { role: 'togglefullscreen', label: '切换全屏' }] },
         { label: '帮助', submenu: [{ label: `Palette ${app.getVersion()}`, enabled: false }] }
-      ]).popup({ window })
+        ]).popup({ window })
+      }
       else throw new Error('窗口操作无效')
       return { accepted: true }
     }

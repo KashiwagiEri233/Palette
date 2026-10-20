@@ -150,17 +150,21 @@ class CapabilityProbe:
                 return self._empty("无法读取 QEMU 设备能力")
             names = set(re.findall(r'^\s*name "([^"]+)"', devices[1], re.MULTILINE))
             candidates = (
-                ["VGA", "virtio-gpu-pci"]
+                ["VGA", "virtio-gpu-pci", "virtio-vga"]
                 if profile.qemu.arch == "x86_64"
                 else ["ramfb", "virtio-gpu-pci"]
             )
-            if profile.devices.display_model not in candidates:
+            if profile.devices.display_model not in candidates and not (
+                profile.qemu.arch != "x86_64" and profile.devices.display_model == "virtio-vga"
+            ):
                 candidates.append(profile.devices.display_model)
             displays = []
             for model in candidates:
                 if model not in names:
                     continue
                 code, out, err = await run_tool([*command, "-device", f"{model},help"], timeout=10)
+                if code != 0:
+                    continue
                 displays.append(
                     {
                         "model": model,

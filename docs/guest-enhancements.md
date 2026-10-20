@@ -22,6 +22,26 @@ sudo sh guest/linux/install.sh --uninstall
 
 Log out and in to stop an already running helper. The helper applies changed virtio-gpu preferred modes to connected virtual XRandR outputs and sends a readiness heartbeat only after a successful X11 display query. It does not run as root, accept commands, or expose a guest shell. Wayland and Windows guest automatic resolution are not implemented by this helper. Windows guests may install the upstream [SPICE tools](https://www.spice-space.org/download.html) and [QGA/virtio drivers](https://virtio-win.github.io/Knowledge-Base/Qemu-ga-win.html) for the other applicable capabilities; those require separate guest acceptance.
 
+## Windows x64 installation disc
+
+After running `uv sync --locked` on the host, build the offline installation disc:
+
+```sh
+uv run python scripts/build_windows_tools.py
+```
+
+The builder downloads the pinned official [VirtIO all-in-one installer](https://github.com/virtio-win/virtio-win-guest-tools-installer) 0.1.285 and SPICE WebDAV 2.4, verifies sizes and SHA-256 hashes from `guest/windows/payloads.json`, and produces `images/guest-tools/palette-tools-windows-x86_64.iso` and its matching `.json` manifest. The disc includes scripts, VirtIO drivers, QGA, SPICE Agent and WebDAV; installation needs no guest network. Downloads are cached in `.runtime/guest-tools-cache/`; `--offline` rebuilds from verified cached files. Updates require changing pinned URLs, sizes and hashes and repeating acceptance. Generated media and caches stay out of Git.
+
+For a separate configuration root, use `--output <config-root>/images/guest-tools`, or copy both the ISO and JSON there. Menus never download files or execute installers on the host. Missing or corrupt media reports an error.
+
+Select the Windows VM and choose **Application menu → Virtual machine → Install guest tools and drivers** (`应用菜单 → 虚拟机 → 安装增强工具与驱动`) in the title bar, or the VM's **More** menu. Running VMs receive the read-only disc immediately; stopped VMs save the selection for their next start. A dedicated USB optical drive uses Windows 10/11's built-in USB storage driver and preserves the original installation ISO and boot order. Instances started before the upgrade need a stop/start to add the tools drive. **Eject guest tools disc** in the same menus removes the disc without forcing locked media or uninstalling guest software.
+
+Inside Windows, open the disc, run **Install.cmd**, approve administrator elevation and restart after installation. The script verifies embedded files and runs upstream installers in sequence. Logs stay in `%ProgramData%\Palette\GuestTools\Logs`. Failures stop and report logs, retaining installed components for repair. Re-run to retry a failed installation, or repair/uninstall components using Windows Apps. The script never reboots automatically or changes driver-signing policy, TPM or Windows setup checks.
+
+The disc supports **x64** Windows 10/11 and Server 2016 or newer. ARM64 and Linux presets cannot mount this package; custom configurations require the operator to confirm Windows x64. Clipboard, Unicode paste, QGA file operations and WebDAV still require enabled host Profile channels; mounting does not change channel policy. Windows automatic resolution remains unavailable: the Linux X11 session helper does not apply. Mounting does not establish installation, and installation does not establish live services. Agents continue to use runtime handshakes and capabilities with baseline fallback.
+
+Mount/eject uses the shared runtime's VM operation lock, configuration revision and instance checks. An active Agent claim blocks the operation. QMP timeouts or unconfirmed media readback report errors without automatic replay or false completion. Updating the ISO on disk requires mounting it again to update saved records.
+
 ## Host profile configuration
 
 Normal bundled profiles enable these optional channels; `strict-example` keeps them off. Existing saved VM hardware choices are retained. Configuration defaults for custom profiles are off:
@@ -92,7 +112,8 @@ Trusted Profile `[[shared_folders]]` entries explicitly configure host exports, 
 | Electron console on Windows | Console flow and baseline control with the manual enhancement entry removed are tested; built-in pi SDK model-tool calls have separate contract tests |
 | Linux/macOS hosts | POSIX channel implementation included; no physical acceptance claimed on this Windows development host |
 | Debian/XFCE guest with installed tools | Installer/helper included; clipboard, live resizing, QGA operations and WebDAV mounting still require real desktop-image acceptance |
-| Windows/Wayland guests | No automatic-resolution helper; upstream QGA/SPICE/WebDAV capabilities require separate acceptance |
+| Windows x64 tools disc | Pinned payloads and ISO contents verified; real QEMU 11.1 validates the dedicated tools drive, read-only cold/live insertion and eject with original system media preserved; Windows installation and services still need guest acceptance |
+| Windows/Wayland guests | No automatic-resolution helper; in-guest QGA/SPICE/WebDAV capabilities require separate acceptance |
 
 `palette doctor` reports host virtio-serial and qemu-vdagent prerequisites as nonblocking checks. Runtime `vm_status.enhancements` and operator `guest.status` expose actual availability; QGA readiness never implies an interactive desktop is ready.
 

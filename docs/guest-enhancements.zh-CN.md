@@ -22,6 +22,26 @@ sudo sh guest/linux/install.sh --uninstall
 
 已经运行的助手需要注销后退出。助手仅对虚拟 XRandR 输出应用变化的 virtio-gpu 首选模式，成功查询 X11 画面后才发送就绪心跳；不以 root 运行、不接收命令、不提供 Shell。该助手暂不支持 Wayland 和 Windows 客户机的自动分辨率。Windows 客户机可按上游说明安装 [SPICE 工具](https://www.spice-space.org/download.html)和 [QGA/virtio 驱动](https://virtio-win.github.io/Knowledge-Base/Qemu-ga-win.html)以使用其他适用能力，但需要单独进行客户机验收。
 
+## Windows x64 安装光盘
+
+宿主执行 `uv sync --locked` 后，在仓库构建离线安装光盘：
+
+```sh
+uv run python scripts/build_windows_tools.py
+```
+
+构建器下载固定版本的官方 [VirtIO 一体化安装包](https://github.com/virtio-win/virtio-win-guest-tools-installer) 0.1.285 和 SPICE WebDAV 2.4，按 `guest/windows/payloads.json` 的大小及 SHA-256 校验，生成 `images/guest-tools/palette-tools-windows-x86_64.iso` 和同名 `.json` 清单。ISO 内含脚本、VirtIO 驱动、QGA、SPICE Agent 和 WebDAV 服务，安装时无需客户机联网。缓存位于 `.runtime/guest-tools-cache/`，`--offline` 可从已校验缓存重建。更新版本需同时更新固定地址、大小和摘要并重新验收。镜像与缓存不提交到 Git。
+
+独立配置目录使用 `--output <配置目录>/images/guest-tools`，或将 ISO 和 JSON 清单一起复制到该目录。菜单不自动下载文件或执行宿主安装程序；文件缺失或损坏会报错。
+
+选中 Windows 虚拟机，打开顶栏**应用菜单 → 虚拟机 → 安装增强工具与驱动**，或该虚拟机的**更多 → 安装增强工具与驱动**。运行中立即插入只读光盘，关机状态保存设置并在下次启动时装载。工具盘使用独立 USB 光驱，Windows 10/11 可用内置 USB 存储驱动读取，保留原安装 ISO 和启动顺序。升级前已启动的实例需关机后重新启动以添加工具光驱。相同菜单可**弹出增强工具光盘**，不强制弹出被占用介质，也不卸载客户机软件。
+
+在 Windows 客户机打开光驱运行 **Install.cmd**，确认管理员权限，完成后自行重启。脚本验证内置文件并顺序运行上游安装程序，日志保存在 `%ProgramData%\Palette\GuestTools\Logs`。失败停止并提示日志，已安装组件保留供修复；可重跑以重试失败的安装，或通过 Windows 应用列表修复、卸载各组件。不自动重启，不修改驱动签名策略、TPM 或系统安装检查。
+
+当前支持 Windows 10/11、Server 2016 及更新的 **x64** 系统。ARM64 和 Linux 预设不装载此包；自定义配置需自行确认客户机为 Windows x64。剪贴板、Unicode 粘贴、QGA 文件操作和 WebDAV 仍需宿主 Profile 启用对应通道；装载不会改变通道策略。Windows 自动分辨率尚未提供，Linux X11 会话助手不适用于 Windows。装载不代表安装成功，安装成功不代表服务在线，Agent 继续按运行时握手和实际能力判断、降级。
+
+装载和弹出经过共享后台操作锁、配置版本及实例校验；Agent 占用时拒绝操作。QMP 超时或回读无法确认状态会报错，不自动重放或误报完成。更新磁盘上的工具 ISO 后，需重新装载才能更新持久记录。
+
 ## 宿主配置
 
 普通内置 Profile 默认启用可选通道，`strict-example` 保持关闭。已有虚拟机保存的硬件选项不会自动改变；自定义 Profile 中这些配置的默认值为关闭：
@@ -92,7 +112,8 @@ dav://127.0.0.1:9843/
 | Windows Electron 控制台 | 原有控制台流程、移除人工增强入口后的基础控制流程已通过测试；内置 pi SDK 模型工具调用另有契约测试 |
 | Linux/macOS 宿主 | 已实现 POSIX 通道；当前 Windows 开发环境未完成这些宿主的实机验收 |
 | 已安装工具的 Debian/XFCE 客户机 | 已提供安装脚本和会话助手；剪贴板、实时分辨率、QGA 操作与 WebDAV 挂载仍需真实桌面镜像验收 |
-| Windows/Wayland 客户机 | 不提供本项目的自动分辨率助手；上游 QGA/SPICE/WebDAV 能力需要单独验收 |
+| Windows x64 工具盘 | 固定上游包及 ISO 内容已校验；真实 QEMU 11.1 验证独立工具光驱、只读冷/热装载和弹出，原系统光盘保留；Windows 内安装与服务功能尚需验收 |
+| Windows/Wayland 客户机 | 不提供本项目的自动分辨率助手；客户机内 QGA/SPICE/WebDAV 能力需要单独验收 |
 
 `palette doctor` 将宿主 virtio-serial、qemu-vdagent 依赖作为非阻断检查。运行时 `vm_status.enhancements` 与操作者 `guest.status` 提供实际可用状态；QGA 在线不代表交互桌面已就绪。
 

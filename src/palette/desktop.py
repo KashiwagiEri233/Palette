@@ -64,6 +64,7 @@ class DesktopManager:
                         "draft": definition.draft.model_dump(mode="json"),
                         "iso_attached": definition.iso_attached,
                         "revision": definition.revision,
+                        "tools_iso_attached": definition.tools_iso_sha256 is not None,
                     }
                     if definition
                     else None,
@@ -339,6 +340,14 @@ class DesktopManager:
             return await self._start(vm_id)
 
     async def _start(self, vm_id: str) -> dict[str, Any]:
+        definition = self.get(vm_id)
+        tools_iso = None
+        if definition.tools_iso_sha256 is not None:
+            from .tools_media import checked_tools_iso
+
+            tools_iso, digest = await checked_tools_iso(self.service.config, definition.profile)
+            if digest != definition.tools_iso_sha256:
+                raise PaletteError(ErrorCode.STATE_CONFLICT, "增强工具镜像已更新, 请重新装载后启动")
         await self.storage.recover_resize(vm_id)
         definition = await self.storage.seed(self.get(vm_id))
         storage = self.storage.paths(definition)
@@ -369,7 +378,7 @@ class DesktopManager:
                     else 2,
                 ),
             )
-        overrides = LaunchOverrides(volumes=volumes)
+        overrides = LaunchOverrides(volumes=volumes, tools_iso=tools_iso)
 
         def ready(instance: VmInstance) -> None:
             images = self.service.manager.images_for(instance.profile)

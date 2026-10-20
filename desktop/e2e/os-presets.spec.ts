@@ -51,6 +51,14 @@ test('OS presets precede sources, preserve resource edits and persist both guest
       await expect(dialog.getByLabel('CPU 核数')).toHaveValue(item.id === 'windows' ? '4' : '2')
       await expect(dialog.getByLabel('内存 / GiB')).toHaveValue(item.id === 'windows' ? '8' : '4')
       await expect(dialog.getByLabel('磁盘 / GiB')).toHaveValue(item.id === 'windows' ? '80' : '32')
+      const defaultDisplay = item.arch === 'x86_64' ? 'VirtIO VGA' : item.id === 'windows' ? 'RAMFB' : 'VirtIO GPU'
+      await dialog.getByRole('button', { name: '更多硬件选项', exact: true }).click()
+      await expect(dialog.getByRole('combobox', { name: '虚拟显卡', exact: true })).toHaveText(defaultDisplay)
+      if (!index) {
+        await dialog.getByRole('combobox', { name: '虚拟显卡', exact: true }).click()
+        await page.getByRole('option', { name: '标准 VGA', exact: true }).click()
+      }
+      await dialog.getByRole('button', { name: '收起硬件选项', exact: true }).click()
       await dialog.getByLabel('名称', { exact: true }).fill(`预设-${index}`)
       await dialog.getByLabel('CPU 核数').fill('1')
       await dialog.getByLabel('内存 / GiB').fill('0.5')
@@ -68,11 +76,20 @@ test('OS presets precede sources, preserve resource edits and persist both guest
         await expect(dialog.getByLabel('CPU 核数')).toHaveValue('1')
         await expect(dialog.getByLabel('内存 / GiB')).toHaveValue('0.5')
         await expect(dialog.getByLabel('磁盘 / GiB')).toHaveValue('40')
+        await dialog.getByRole('button', { name: '更多硬件选项', exact: true }).click()
+        // Background polling must retain an explicit hardware edit.
+        await page.waitForTimeout(2200)
+        await expect(dialog.getByRole('combobox', { name: '虚拟显卡', exact: true })).toHaveText('标准 VGA')
+        await expect(dialog.getByLabel('CPU 核数')).toHaveValue('1')
+        await expect(dialog.getByLabel('内存 / GiB')).toHaveValue('0.5')
+        await expect(dialog.getByLabel('磁盘 / GiB')).toHaveValue('40')
+        await dialog.getByRole('button', { name: '收起硬件选项', exact: true }).click()
         await page.screenshot({ path: 'test-results/os-presets-resources.png', animations: 'disabled' })
       }
       await dialog.getByRole('button', { name: '下一步', exact: true }).click()
       await expect(dialog.getByRole('heading', { name: '确认创建', exact: true })).toBeVisible()
       await expect(dialog.getByText('1 核 / 0.5 GiB', { exact: true })).toBeVisible()
+      await expect(dialog.getByText(!index ? '标准 VGA' : defaultDisplay, { exact: true })).toBeVisible()
       await dialog.getByRole('button', { name: '创建虚拟机', exact: true }).click()
       await expect(page.getByRole('heading', { name: `预设-${index}`, exact: true })).toBeVisible()
       const definition = await page.evaluate(async name => {
@@ -80,6 +97,7 @@ test('OS presets precede sources, preserve resource edits and persist both guest
         return result.vms.find(vm => vm.name === name)!
       }, `预设-${index}`)
       expect(definition.definition.draft).toMatchObject({ os_preset: item.id, vcpus: 1, memory_mib: 512, disk_gib: 40, source: item.source })
+      expect((definition.definition.draft.settings as { display: { model: string } }).display.model).toBe(!index ? 'VGA' : item.arch === 'x86_64' ? 'virtio-vga' : item.id === 'windows' ? 'ramfb' : 'virtio-gpu-pci')
       expect(definition.status.guest_arch).toBe(item.arch === 'ARM64' ? 'aarch64' : 'x86_64')
     }
     expect(errors).toEqual([])

@@ -386,10 +386,11 @@ class LaunchOverrides:
     image_format: str | None = None
     volumes: tuple[ExtraVolume, ...] = ()
     qemu_args: tuple[str, ...] = ()
+    tools_iso: Path | None = None
 
     @property
     def is_empty(self) -> bool:
-        return not (self.image or self.volumes or self.qemu_args)
+        return not (self.image or self.volumes or self.qemu_args or self.tools_iso)
 
     def describe(self) -> list[str]:
         """A shape summary for the audit trail: counts and kinds, never paths."""
@@ -400,6 +401,8 @@ class LaunchOverrides:
             parts.append(f"{len(self.volumes)} volume(s)")
         if self.qemu_args:
             parts.append(f"{len(self.qemu_args)} qemu arg(s)")
+        if self.tools_iso:
+            parts.append("tools CD-ROM")
         return parts
 
 
@@ -553,6 +556,8 @@ def build_launch_plan(
     start_paused: bool = True,
     managed_console: bool = False,
     clipboard_available: bool = True,
+    tools_drive: bool = False,
+    tools_iso: Path | None = None,
     extra_volumes: Sequence[ExtraVolume] = (),
     caller_args: Sequence[str] = (),
 ) -> LaunchPlan:
@@ -698,6 +703,29 @@ def build_launch_plan(
         boot_index=1 if any(volume.boot_index == 0 for volume in extra_volumes) else 0,
     )
     argv += _extra_volume_args(extra_volumes, notes, config_sections)
+    if tools_drive:
+        options = {
+            "id": "palette-tools",
+            "if": "none",
+            "media": "cdrom",
+            "readonly": "on",
+            "format": "raw",
+        }
+        if tools_iso is None:
+            argv += ["-drive", "id=palette-tools,if=none,media=cdrom,readonly=on"]
+        elif not _windows_drive_config(str(tools_iso), options, config_sections):
+            # QemuOpts doubles literal commas; -drive does not accept JSON.
+            argv += [
+                "-drive",
+                ",".join(
+                    f"{key}={value.replace(',', ',,')}"
+                    for key, value in {**options, "file": str(tools_iso)}.items()
+                ),
+            ]
+        argv += [
+            "-device",
+            "usb-storage,id=palette-tools-cd,drive=palette-tools,bus=xhci.0,removable=on",
+        ]
     if config_sections:
         # Relative to cwd so a non-ASCII runtime directory is never sent via argv.
         argv += ["-readconfig", "qemu-host-paths.conf"]

@@ -64,6 +64,8 @@ COMMANDS = [
     "set_password",
     "query-cpus-fast",
     "query-block",
+    "blockdev-change-medium",
+    "eject",
     "qom-list",
     "input-send-event",
     "screendump",
@@ -102,6 +104,8 @@ class FakeQemu:
         self.events: list[str] = []
         self.vnc_password = ""
         self.vnc_port: int | None = None
+        self.tools_drive = any("id=palette-tools," in item for item in argv)
+        self.tools_file: str | None = None
         if "-vnc" in argv:
             self.start_vnc()
 
@@ -284,7 +288,36 @@ class FakeQemu:
             )
         elif command == "query-cpus-fast":
             self.reply(message_id, [{"cpu-index": 0, "target": "x86_64", "thread-id": os.getpid()}])
-        elif command == "query-block" or command == "qom-list":
+        elif command == "query-block":
+            block = {
+                "device": "palette-tools",
+                "qdev": "/machine/peripheral/palette-tools-cd",
+                "removable": True,
+            }
+            if self.tools_file:
+                block["inserted"] = {"file": self.tools_file, "ro": True}
+            self.reply(
+                message_id,
+                [block]
+                if self.tools_drive and not self.behavior().get("tools_drive_missing")
+                else [],
+            )
+        elif command in {"blockdev-change-medium", "eject"}:
+            behavior = self.behavior()
+            if behavior.get("tools_media_fail"):
+                self.send(
+                    {
+                        "id": message_id,
+                        "error": {"class": "GenericError", "desc": "media is locked"},
+                    }
+                )
+            else:
+                if command != "eject" or not behavior.get("tools_eject_ignored"):
+                    self.tools_file = (
+                        arguments.get("filename") if command == "blockdev-change-medium" else None
+                    )
+                self.reply(message_id, {})
+        elif command == "qom-list":
             self.reply(message_id, [])
         elif command == "input-send-event":
             self.reply(message_id, {})
@@ -466,6 +499,7 @@ def main(argv: list[str]) -> int:
         sys.stdout.write(DEVICE_HELP)
         for name in (
             "virtio-gpu-pci",
+            "virtio-vga",
             "ramfb",
             "virtio-net-pci",
             "e1000",

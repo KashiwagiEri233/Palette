@@ -42,6 +42,8 @@ ALLOWED_COMMANDS = frozenset(
         "set_password",
         "query-cpus-fast",
         "query-block",
+        "blockdev-change-medium",
+        "eject",
         "qom-list",
         "input-send-event",
         "screendump",

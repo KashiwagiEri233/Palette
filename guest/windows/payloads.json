@@ -1,0 +1,17 @@
+{
+  "version": "1-virtio-0.1.285",
+  "payloads": [
+    {
+      "name": "virtio-win-guest-tools-0.1.285.exe",
+      "url": "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.285-1/virtio-win-guest-tools.exe",
+      "sha256": "c8b4a9fe87e1fc5d8e843495e082dea53420587fe04740b1084d85089343f04d",
+      "size_bytes": 30769857
+    },
+    {
+      "name": "spice-webdavd-x64-2.4.msi",
+      "url": "https://www.spice-space.org/download/windows/spice-webdavd/spice-webdavd-x64-2.4.msi",
+      "sha256": "f278c17fca6b129eb5c9a46b8634af2ecfaf3bca8903eb9a5c7874f0e45f82b9",
+      "size_bytes": 12472832
+    }
+  ]
+}

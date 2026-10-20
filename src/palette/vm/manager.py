@@ -505,6 +505,8 @@ class VmManager:
             caller_args=overrides.qemu_args,
             managed_console=self.console_enabled,
             clipboard_available=clipboard_available,
+            tools_drive=on_storage_ready is not None,
+            tools_iso=overrides.tools_iso,
         )
         instance.plan = plan
         process = await spawn_qemu(
