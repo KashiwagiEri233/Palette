@@ -16,6 +16,8 @@ import pytest
 from palette.audit import NullAuditLog
 from palette.config import HostConfig, PaletteConfig, Profile
 from palette.desktop import DesktopManager
+from palette.managed_disk_delete import delete_managed_disk
+from palette.managed_drives import managed_drive_path
 from palette.service import PaletteService
 from palette.tools_media import change_tools_media
 from palette.vm.launcher import run_tool
@@ -100,9 +102,28 @@ async def test_real_multiple_optical_drives_and_tools_hotplug_preserve_system_me
         settings = settings_from_profile(profile, str(installer)).model_dump()
         settings["boot_order"] = "disk"
         settings["drives"] = [
+            *settings["drives"],
+            {"id": "drive-blank", "media": "disk", "size_gib": 1, "interface": "usb"},
+            {
+                "id": "drive-scsi",
+                "media": "disk",
+                "size_gib": 1,
+                "format": "raw",
+                "interface": "scsi",
+            },
+            {
+                "id": "drive-nvme",
+                "media": "disk",
+                "path": str(data_overlay),
+                "format": "qcow2",
+                "interface": "nvme",
+                "import_copy": True,
+                "read_only": False,
+            },
             {"id": "drive-data", "media": "disk", "path": str(data), "read_only": False},
             {
                 "id": "drive-overlay",
+                "interface": "ide",
                 "media": "disk",
                 "path": str(data_overlay),
                 "format": "qcow2",
@@ -128,6 +149,14 @@ async def test_real_multiple_optical_drives_and_tools_hotplug_preserve_system_me
                 }
             )
         )["vm_id"]
+        definition = desktop.get(vm_id)
+        managed = next(
+            drive for drive in desktop.settings(definition).drives if drive.id == "drive-blank"
+        )
+        blank_path = managed_drive_path(desktop, definition, managed)
+        info = await service.manager.images_for(profile).inspect_image(blank_path)
+        assert info.format == "qcow2" and info.virtual_size == 1024**3
+        assert info.chain == (blank_path,)
         await desktop.start(vm_id)
         instance = service.manager.find(vm_id)
         original = await instance.qmp.execute("query-block")
@@ -140,7 +169,18 @@ async def test_real_multiple_optical_drives_and_tools_hotplug_preserve_system_me
             and not item["inserted"]["ro"]
             for item in original
         )
+        assert any(
+            item.get("qdev") == "drive-blank" and not item["inserted"]["ro"] for item in original
+        )
         assert sum(item.get("inserted", {}).get("ro", False) for item in original) >= 2
+        devices = await instance.qmp.execute("qom-list", {"path": "/machine/peripheral"})
+        for model in ("nvme", "ide-hd", "scsi-hd", "usb-bot"):
+            assert any(item["type"] == f"child<{model}>" for item in devices)
+        copied = desktop.get(vm_id).data_disks["drive-nvme"]
+        from palette.managed_drives import managed_disk_path
+
+        imported = managed_disk_path(desktop, vm_id, copied)
+        assert imported != data_overlay and copied.virtual_size == 1024**2
         request = {
             "revision": desktop.get(vm_id).revision,
             "instance_id": instance.view.instance_id,
@@ -169,10 +209,76 @@ async def test_real_multiple_optical_drives_and_tools_hotplug_preserve_system_me
         ] == original
         assert not next(item for item in blocks if item.get("qdev") == cd["qdev"]).get("inserted")
         await desktop.stop(vm_id, force=True)
+        qemu_io = str(qemu.with_name("qemu-io" + qemu.suffix))
+        code, _, err = await run_tool(
+            [qemu_io, "-f", "qcow2", "-c", "write -P 0x5a 0 4096", str(blank_path)],
+            timeout=30,
+        )
+        assert code == 0, err
         await desktop.start(vm_id)
         restarted = service.manager.find(vm_id)
         blocks = await restarted.qmp.execute("query-block")
         assert len(blocks) == len(original)
+        await desktop.stop(vm_id, force=True)
+        await desktop.reset(vm_id)
+        await desktop.stop(vm_id, force=True)
+        assert managed_drive_path(desktop, desktop.get(vm_id), managed) == blank_path
+        code, _, err = await run_tool(
+            [qemu_io, "-f", "qcow2", "-c", "read -P 0x5a 0 4096", str(blank_path)],
+            timeout=30,
+        )
+        assert code == 0, err
+        await delete_managed_disk(
+            desktop,
+            vm_id,
+            {
+                "revision": desktop.get(vm_id).revision,
+                "drive_id": managed.id,
+            },
+        )
+        assert not blank_path.exists() and not blank_path.parents[1].exists()
+        assert managed.id not in desktop.get(vm_id).data_disks
+        await desktop.start(vm_id)
+        instance = service.manager.find(vm_id)
+        blocks = await instance.qmp.execute("query-block")
+        assert not any("drive-blank" in item.get("qdev", "") for item in blocks)
+        initial_path = instance.paths.overlay
+        await desktop.stop(vm_id, force=True)
+        current = await desktop.get_settings(vm_id)
+        await desktop.resize_disk(
+            vm_id,
+            {
+                "revision": current["revision"],
+                "drive_id": "drive-scsi",
+                "disk_gib": 2,
+            },
+        )
+        current = await desktop.get_settings(vm_id)
+        await desktop.update(
+            vm_id,
+            {
+                "revision": current["revision"],
+                "name": current["draft"]["name"],
+                "vcpus": 1,
+                "memory_mib": 256,
+                "network": "offline",
+                "iso_attached": False,
+                "settings": {
+                    **current["settings"],
+                    "drives": [
+                        drive
+                        for drive in current["settings"]["drives"]
+                        if drive["id"] != "drive-primary"
+                    ],
+                },
+            },
+        )
+        assert not initial_path.exists()
+        await desktop.start(vm_id)
+        instance = service.manager.find(vm_id)
+        blocks = await instance.qmp.execute("query-block")
+        assert not any("drive-primary" in item.get("qdev", "") for item in blocks)
+        assert any("drive-data" in item.get("qdev", "") for item in blocks)
     finally:
         if vm_id and service.manager.find(vm_id):
             await desktop.stop(vm_id, force=True)

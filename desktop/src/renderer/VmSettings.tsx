@@ -1,13 +1,16 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { FormSelect } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog'
-import { FolderIcon, PlusIcon } from '@/components/icons'
+import { PlusIcon } from '@/components/icons'
+import { CreateDrive } from './CreateDrive'
+import { moveDrive } from './lib/drives'
 import { DriveFields } from './DriveFields'
-import type { HardwareCapabilities, HardwareSettings, OwnerInfo, VmDraft, VmRecord, VmSettingsResult } from '../shared/types'
-import { displayNames, networkNames, sections, sizeLabel, validateVmSettings, errorSection, type SettingsSection } from './lib/vm-settings'
+import { VmSettingsNavigation, driveLabel } from './VmSettingsNavigation'
+import type { DriveSettings, HardwareCapabilities, HardwareSettings, ManagedDiskInfo, OwnerInfo, VmDraft, VmRecord, VmSettingsResult } from '../shared/types'
+import { displayNames, networkNames, sections, sizeLabel, validateVmSettings, errorSection, withDrives, type SettingsSection } from './lib/vm-settings'
 
 const errorText = (error: unknown): string => String(error instanceof Error ? error.message : error).replace(/^Error invoking remote method '[^']+': Error: /, '')
 const resolutions = ['1024x768', '1280x800', '1366x768', '1920x1080', '2560x1440', '3840x2160']
@@ -16,21 +19,20 @@ export function ResourceInputs({ draft, change }: { draft: VmDraft; change: (key
   return <div className="resource-fields"><div><Label htmlFor="settings-cpu">CPU 核数</Label><Input id="settings-cpu" type="number" min={1} max={64} value={draft.vcpus} onChange={event => change('vcpus', Number(event.target.value))} /></div><div><Label htmlFor="settings-memory">内存 / GiB</Label><Input id="settings-memory" type="number" min={0.25} max={1024} step={0.25} value={draft.memory_mib / 1024} onChange={event => change('memory_mib', Number(event.target.value) * 1024)} /></div></div>
 }
 
-export function HardwareFields({ section, settings, change, caps, attached, setAttached, draft, setDraft, includeMode = true, running = false, disabled = false }: {
+export function HardwareFields({ section, settings, change, caps, draft, setDraft, includeMode = true, running = false, disabled = false }: {
   section: SettingsSection; settings: HardwareSettings; change: (settings: HardwareSettings) => void; caps: HardwareCapabilities | null;
-  attached: boolean; setAttached: (value: boolean) => void; draft: VmDraft; setDraft: (draft: VmDraft) => void; includeMode?: boolean; running?: boolean; disabled?: boolean
+  draft: VmDraft; setDraft: (draft: VmDraft) => void; includeMode?: boolean; running?: boolean; disabled?: boolean
 }) {
-  const [fileError, setFileError] = useState('')
+  const optical = (settings.drives ?? []).filter(drive => drive.media === 'cdrom')
+  const bootable = optical.filter(drive => drive.attached && drive.path)
   const display = settings.display
   const resolutionSupported = caps?.displays.find(item => item.model === display.model)?.resolution ?? false
   const network = settings.network
   const [customResolution, setCustomResolution] = useState(false)
   return <div className="form-stack">
     {section === 'disk' && <>
-      <div><Label htmlFor="settings-iso">安装介质</Label><div className="file-field"><Input id="settings-iso" readOnly value={settings.iso_path ?? ''} placeholder="未选择 ISO" /><Button variant="secondary" onClick={() => void window.palette.chooseFile('iso').then(path => { if (path) { change({ ...settings, iso_path: path }); setAttached(true); setFileError('') } }).catch(error => setFileError(errorText(error)))}><FolderIcon className="size-4" />选择 ISO</Button></div></div>
-      {fileError && <p role="alert" className="text-destructive">{fileError}</p>}
-      <div><Label htmlFor="settings-iso-state">介质状态</Label><FormSelect id="settings-iso-state" disabled={disabled} value={attached && settings.iso_path ? 'attached' : 'ejected'} onValueChange={value => { const next = value === 'attached'; setAttached(next); if (!next && settings.boot_order === 'cdrom') change({ ...settings, boot_order: 'auto' }) }} options={[{ value: 'ejected', label: '未挂载' }, { value: 'attached', label: '挂载 ISO', disabled: !settings.iso_path }]} /></div>
-      <div><Label htmlFor="boot-order">启动顺序</Label><FormSelect id="boot-order" disabled={disabled} value={settings.boot_order} onValueChange={value => change({ ...settings, boot_order: value as HardwareSettings['boot_order'] })} options={[{ value: 'auto', label: '自动' }, { value: 'disk', label: '硬盘优先' }, { value: 'cdrom', label: '光盘优先', disabled: !settings.iso_path || !attached }]} /><p className="field-hint">自动模式在首次启动时优先安装介质，后续优先硬盘。已保存的 UEFI 启动项仍可能影响系统选择。</p></div>
+      <div><Label htmlFor="boot-order">启动顺序</Label><FormSelect id="boot-order" disabled={disabled} value={settings.boot_order} onValueChange={value => change({ ...settings, boot_order: value as HardwareSettings['boot_order'] })} options={[{ value: 'auto', label: '自动' }, { value: 'disk', label: '硬盘优先' }, { value: 'cdrom', label: '光盘优先', disabled: !bootable.length }]} /><p className="field-hint">自动模式首次启动时优先可用光驱，后续优先硬盘；同类介质按侧栏顺序启动。已保存的 UEFI 启动项仍可能影响系统选择。</p></div>
+      <div><Label htmlFor="boot-drive">启动光驱</Label><FormSelect id="boot-drive" disabled={disabled || !bootable.length} value={settings.boot_drive_id ?? ''} onValueChange={value => change({ ...settings, boot_drive_id: value || null })} options={[{ value: '', label: '首个可用光驱' }, ...optical.map(drive => ({ value: drive.id, label: driveLabel(drive, settings.drives ?? []), disabled: !drive.attached || !drive.path }))]} /><p className="field-hint">在侧栏选择光驱可装载、更换或弹出介质。</p></div>
     </>}
     {section === 'display' && <>
       <div><Label htmlFor="display-model">虚拟显卡</Label><FormSelect id="display-model" disabled={disabled} value={display.model} onValueChange={model => change({ ...settings, display: { ...display, model, default_resolution: caps?.displays.find(item => item.model === model)?.resolution ?? false } })} options={[...(!caps?.displays.some(item => item.model === display.model) ? [{ value: display.model, label: `${displayNames[display.model] ?? display.model}（当前配置）` }] : []), ...(caps?.displays.map(item => ({ value: item.model, label: displayNames[item.model] ?? item.model })) ?? [])]} /><p className="field-hint">更换显卡可能需要客户机安装对应驱动。</p></div>
@@ -56,64 +58,94 @@ export function HardwareFields({ section, settings, change, caps, attached, setA
 }
 
 export function VmSettings({ vm, owner, onClose, onSaved }: { vm: VmRecord; owner: OwnerInfo | null; onClose: () => void; onSaved: () => Promise<void> }) {
-  const supported = owner?.features.includes('vm-settings-v2') ?? false
+  const supported = !!owner?.features.includes('vm-settings-v2') && owner.features.includes('vm-drives-v1')
   const [result, setResult] = useState<VmSettingsResult | null>(null)
   const [draft, setDraft] = useState<VmDraft | null>(null)
   const [settings, setSettings] = useState<HardwareSettings | null>(null)
-  const [attached, setAttached] = useState(false)
   const [section, setSection] = useState<SettingsSection>('general')
+  const [driveId, setDriveId] = useState<string | null>(null)
+  const [creating, setCreating] = useState(false)
+  const [removing, setRemoving] = useState<{ id: string; label: string } | null>(null)
+  const [deletedIds, setDeletedIds] = useState<string[]>([])
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
   const [leave, setLeave] = useState(false)
-  const [resize, setResize] = useState(false)
+  const [resize, setResize] = useState<string | null>(null)
   const [capacity, setCapacity] = useState(0)
   const [notice, setNotice] = useState('')
-  const dirty = !!result && JSON.stringify({ draft, settings, attached }) !== JSON.stringify({ draft: result.draft, settings: result.settings, attached: result.iso_attached })
+  const body = useRef<HTMLDivElement>(null)
+  const dirty = !!result && (deletedIds.length > 0 || JSON.stringify({ draft, settings }) !== JSON.stringify({ draft: result.draft, settings: result.settings }))
   const editable = !!result?.editable && ['STOPPED', 'FAILED'].includes(vm.status.state)
-  function apply(data: VmSettingsResult): void { setResult(data); setDraft(data.draft); setSettings(data.settings); setAttached(data.iso_attached); setCapacity(Math.ceil(Math.max(data.disk.configured_gib, (data.disk.virtual_bytes ?? 0) / 1024 ** 3)) + 1) }
-  useEffect(() => { let live = true; if (supported) void window.palette.request('vms.settings.get', vm.vm_id).then(data => { if (live) apply(data as VmSettingsResult) }).catch(error => { if (live) setError(errorText(error)) }); return () => { live = false } }, [vm.vm_id, supported])
-  function close(): void { if (!saving) { if (dirty) setLeave(true); else onClose() } }
-  async function save(exit = false): Promise<void> {
-    if (!editable || !result || !draft || !settings) return
-    const invalid = validateVmSettings(draft, settings, attached)
-    if (invalid) { setSection(invalid.section); setError(invalid.message); setLeave(false); requestAnimationFrame(() => document.getElementById(invalid.field)?.focus()); return }
-    setSaving(true); setError('')
-    try {
-      await window.palette.request('vms.update', vm.vm_id, { revision: result.revision, name: draft.name.trim(), vcpus: draft.vcpus, memory_mib: draft.memory_mib, network: draft.network, settings, iso_attached: attached })
-      await onSaved(); if (exit) onClose()
-    } catch (error) { const message = errorText(error); setLeave(false); setError(message); const target = errorSection(message); if (target) { setSection(target); requestAnimationFrame(() => document.querySelector<HTMLElement>('.settings-fieldset input, .settings-fieldset [data-slot=select-trigger]')?.focus()) } }
-    finally { setSaving(false) }
+  const drives = settings?.drives ?? []
+  const activeDrive = drives.find(drive => drive.id === driveId) ?? (section === 'devices' ? drives[0] : undefined)
+  const retained = Object.entries(result?.managed_disks ?? {}).filter(([id]) => !drives.some(drive => drive.id === id) && !deletedIds.includes(id))
+  const resizeInfo = resize ? result?.managed_disks?.[resize] : undefined
+  const resizeMinimum = resizeInfo ? Math.max(resizeInfo.size_gib, (resizeInfo.virtual_bytes ?? 0) / 1024 ** 3) : 0
+  useEffect(() => { body.current?.scrollTo(0, 0) }, [section, driveId])
+  function selectSection(value: SettingsSection) { setSection(value); setDriveId(null); setError('') }
+  function selectDrive(id: string) { setSection('devices'); setDriveId(id); setError('') }
+  function apply(data: VmSettingsResult) { setResult(data); setDraft(data.draft); setSettings(data.settings); setDeletedIds([]) }
+  useEffect(() => { let live = true; if (supported) void window.palette.request('vms.settings.get', vm.vm_id).then(data => { if (live) apply(data as VmSettingsResult) }).catch(reason => { if (live) setError(errorText(reason)) }); return () => { live = false } }, [vm.vm_id, supported])
+  function close() { if (!saving && !creating) { if (dirty) setLeave(true); else onClose() } }
+  function addDrive(drive: DriveSettings) { if (editable && drives.length < 9) { setSettings(previous => previous ? withDrives(previous, [...(previous.drives ?? []), drive]) : previous); setCreating(false); selectDrive(drive.id) } }
+  function reorder(id: string, offset: -1 | 1) { if (editable && !saving) { setSettings(previous => previous ? withDrives(previous, moveDrive(previous.drives ?? [], id, offset)) : previous); selectDrive(id) } }
+  function requestRemove(id: string) { if (editable && !saving) { const drive = drives.find(item => item.id === id); setRemoving({ id, label: drive ? driveLabel(drive, drives) : id }) } }
+  function remove() {
+    if (!removing || !editable || saving) return
+    const index = drives.findIndex(drive => drive.id === removing.id)
+    const remaining = drives.filter(drive => drive.id !== removing.id)
+    if (result?.managed_disks?.[removing.id]) setDeletedIds(previous => [...new Set([...previous, removing.id])])
+    setSettings(previous => previous ? withDrives(previous, remaining) : previous)
+    setRemoving(null)
+    const next = remaining[Math.min(Math.max(index, 0), remaining.length - 1)]
+    if (next) selectDrive(next.id); else selectSection('disk')
   }
-  async function expand(): Promise<void> {
-    if (!editable || !result) return
+  async function save(exit = false) {
+    if (!editable || !result || !draft || !settings || saving) return
+    const invalid = validateVmSettings(draft, settings)
+    if (invalid) { setSection(invalid.section); if (invalid.section === 'devices') setDriveId(drives.find(drive => invalid.field.includes(drive.id))?.id ?? drives[0]?.id ?? null); setError(invalid.message); setLeave(false); return }
     setSaving(true); setError('')
     try {
-      await window.palette.request('vms.disk.resize', vm.vm_id, { revision: result.revision, disk_gib: capacity })
+      const reply = await window.palette.request('vms.update', vm.vm_id, { revision: result.revision, name: draft.name.trim(), vcpus: draft.vcpus, memory_mib: draft.memory_mib, network: draft.network, settings, iso_attached: false, delete_drives: deletedIds }) as { pending_disk_deletions?: string[] }
       apply(await window.palette.request('vms.settings.get', vm.vm_id) as VmSettingsResult)
-      setResize(false); setNotice('磁盘已扩容。请在客户机中扩展分区。')
-      await onSaved()
-    } catch (error) { setError(errorText(error)); setResize(false) }
+      setLeave(false); await onSaved()
+      if (reply.pending_disk_deletions?.length) { selectSection('disk'); setError('配置已保存，部分磁盘文件清理失败。请在未使用的磁盘中重试删除并保存。') }
+      else if (exit) onClose()
+    } catch (reason) {
+      const message = errorText(reason); setLeave(false); setError(message)
+      try { const latest = await window.palette.request('vms.settings.get', vm.vm_id) as VmSettingsResult; if (latest.revision !== result.revision) apply(latest) } catch { /* Retain edits if the backend is unavailable. */ }
+      const target = errorSection(message); if (target) setSection(target)
+    } finally { setSaving(false) }
+  }
+  async function expand() {
+    if (!editable || !result || !resize) return
+    setSaving(true); setError('')
+    try { await window.palette.request('vms.disk.resize', vm.vm_id, { revision: result.revision, drive_id: resize, disk_gib: capacity }); apply(await window.palette.request('vms.settings.get', vm.vm_id) as VmSettingsResult); selectDrive(resize); setResize(null); setNotice('磁盘已扩容。请在客户机中扩展分区。'); await onSaved() }
+    catch (reason) { setError(errorText(reason)); setResize(null) }
     finally { setSaving(false) }
   }
   return <>
-    <Dialog open onOpenChange={open => { if (!open) close() }}><DialogContent className="vm-settings-dialog"><DialogHeader><DialogTitle>虚拟机设置</DialogTitle><DialogDescription>{vm.name}{result && !editable ? ' · 关机后可修改硬件配置' : ' · 修改在下次启动时生效'}</DialogDescription></DialogHeader>
-      {!supported ? <p role="status" className="settings-upgrade">当前后台需要升级才能管理完整配置。请在关闭虚拟机后更新并重新启动后台，再重新连接。</p> : !result || !draft || !settings ? <p role="status">{error || '正在读取配置…'}</p> : <div className="vm-settings-layout">
-        <nav className="vm-settings-navigation" aria-label="设置分类">{sections.map(item => <Button key={item.id} variant="ghost" aria-pressed={section === item.id} onClick={() => { setSection(item.id); setError('') }}>{item.label}</Button>)}<div className="vm-settings-summary"><strong>{draft.name || vm.name}</strong><span>{draft.vcpus} 核 · {draft.memory_mib / 1024} GiB</span><span>{draft.disk_gib} GiB · {networkNames[draft.network]}</span></div></nav>
-        <div className="vm-settings-body"><h2>{sections.find(item => item.id === section)?.label}</h2>{notice && <p role="status" className="settings-notice">{notice}</p>}
+    <Dialog open onOpenChange={value => { if (!value) close() }}><DialogContent className="vm-settings-dialog"><DialogHeader><DialogTitle>虚拟机设置</DialogTitle><DialogDescription>{vm.name} · {editable ? '更改会在保存后生效' : '关机后可修改硬件配置'}</DialogDescription></DialogHeader>
+      {!supported ? <p role="status">当前后台需要升级：请重启后台并重新连接，以加载驱动器管理功能。</p> : !result || !draft || !settings ? <p role="status">{error || '正在读取配置…'}</p> : <div className="vm-settings-layout">
+        <VmSettingsNavigation section={section} driveId={activeDrive?.id ?? null} drives={drives} selectSection={selectSection} selectDrive={selectDrive} createDrive={() => setCreating(true)} move={reorder} remove={requestRemove} canEdit={editable && !saving} canCreate={editable && !saving && drives.length < 9} summary={{ name: draft.name || vm.name, resources: `${draft.vcpus} 核 · ${draft.memory_mib / 1024} GiB`, disk: `${drives.filter(drive => drive.media === 'disk').length} 块磁盘 · ${networkNames[draft.network]}` }} />
+        <div ref={body} className="vm-settings-body"><h2>{section === 'devices' && activeDrive ? driveLabel(activeDrive, drives) : sections.find(item => item.id === section)?.label}</h2>{notice && <p role="status" className="settings-notice">{notice}</p>}
           <fieldset disabled={!editable || saving} className="settings-fieldset">
-            {section === 'general' && <div className="form-stack"><div><Label htmlFor="edit-name">名称</Label><Input id="edit-name" maxLength={120} value={draft.name} onChange={event => setDraft({ ...draft, name: event.target.value })} /></div><dl className="configuration-grid"><div><dt>系统配置</dt><dd>{draft.profile_id}</dd></div><div><dt>架构</dt><dd>{vm.status.guest_arch ?? '沿用原配置'}</dd></div></dl><div><Label>原始来源</Label><p className="path-value">{draft.path}</p><p className="field-hint">原始镜像保持只读，虚拟机修改保存在独立磁盘中。</p></div></div>}
-            {section === 'resources' && <div className="form-stack"><ResourceInputs draft={draft} change={(key, value) => setDraft({ ...draft, [key]: value })} /><p className="field-hint">宿主资源：{result.capabilities.host.vcpus ?? '—'} 个逻辑核心 / {sizeLabel(result.capabilities.host.memory_mib * 1024 ** 2)} 内存。设置较高资源可能影响其他应用。</p></div>}
-            {section === 'disk' && <div className="settings-disk-section"><dl className="configuration-grid"><div><dt>配置容量</dt><dd>{result.disk.configured_gib} GiB</dd></div><div><dt>实盘容量</dt><dd>{sizeLabel(result.disk.virtual_bytes)}</dd></div><div><dt>宿主占用</dt><dd>{sizeLabel(result.disk.actual_bytes)}</dd></div></dl><Button variant="outline" disabled={dirty || !owner?.features.includes('disk-resize')} onClick={() => setResize(true)}>扩容磁盘</Button><p className="field-hint">仅支持增大容量；扩容后需在客户机内扩展分区。{dirty ? '请先保存或丢弃其他修改，再扩容。' : ''}</p></div>}
-            {section === 'devices' && <DriveFields settings={settings} change={setSettings} />}
-            {['disk', 'display', 'network', 'audio'].includes(section) && <HardwareFields section={section} settings={settings} change={setSettings} caps={result.capabilities} attached={attached} setAttached={setAttached} draft={draft} setDraft={setDraft} running={!editable} disabled={!editable || saving} />}
+            {section === 'general' && <div className="form-stack"><div><Label htmlFor="edit-name">名称</Label><Input id="edit-name" maxLength={120} value={draft.name} onChange={event => setDraft({ ...draft, name: event.target.value })} /></div><dl className="configuration-grid"><div><dt>系统配置</dt><dd>{draft.profile_id}</dd></div><div><dt>架构</dt><dd>{vm.status.guest_arch ?? '沿用原配置'}</dd></div></dl><div><Label>原始来源</Label><p className="path-value">{draft.path}</p></div></div>}
+            {section === 'resources' && <div className="form-stack"><ResourceInputs draft={draft} change={(key, value) => setDraft({ ...draft, [key]: value })} /><p className="field-hint">宿主资源：{result.capabilities.host.vcpus ?? '—'} 个逻辑核心 / {sizeLabel(result.capabilities.host.memory_mib * 1024 ** 2)} 内存。</p></div>}
+            {section === 'disk' && retained.length > 0 && <div className="settings-disk-section"><h3>未使用的磁盘</h3>{retained.map(([id, info]) => <div className="settings-preserved" key={id} data-retained-drive-id={id}><Label>{id} · {info.size_gib} GiB{info.deleting ? ' · 待完成删除' : ''}</Label><p className="path-value">{info.path}</p><Button variant="destructive" onClick={() => requestRemove(id)}>删除驱动器…</Button></div>)}</div>}
+            {section === 'devices' && activeDrive && <DriveFields key={activeDrive.id} drive={activeDrive} info={result.managed_disks?.[activeDrive.id]} caps={result.capabilities} change={drive => { setError(''); setSettings(previous => previous ? withDrives(previous, (previous.drives ?? []).map(item => item.id === drive.id ? drive : item)) : previous) }} remove={() => requestRemove(activeDrive.id)} resize={result.managed_disks?.[activeDrive.id] && !result.managed_disks[activeDrive.id].deleting ? () => { const info = result.managed_disks![activeDrive.id]; setCapacity(Math.ceil(Math.max(info.size_gib, (info.virtual_bytes ?? 0) / 1024 ** 3)) + 1); setResize(activeDrive.id) } : undefined} resizeDisabled={dirty || !owner?.features.includes('disk-resize')} />}
+            {['disk', 'display', 'network', 'audio'].includes(section) && <HardwareFields section={section} settings={settings} change={setSettings} caps={result.capabilities} draft={draft} setDraft={setDraft} running={!editable} disabled={!editable || saving} />}
           </fieldset>
-          {section === 'network' && (result.preserved_network.hostfwd.length > 0 || result.preserved_network.extra_options) && <div className="settings-preserved"><Label>沿用的 profile 网络参数</Label><p className="path-value">{[result.preserved_network.extra_options, ...result.preserved_network.hostfwd].filter(Boolean).join('\n')}</p><p className="field-hint">这些已有参数会保留；修改它们需要编辑可信 profile。</p></div>}
+          {section === 'network' && (result.preserved_network.hostfwd.length > 0 || result.preserved_network.extra_options) && <div className="settings-preserved"><Label>沿用的 profile 网络参数</Label><p className="path-value">{[result.preserved_network.extra_options, ...result.preserved_network.hostfwd].filter(Boolean).join('\n')}</p></div>}
+          {deletedIds.length > 0 && <p role="status" className="field-hint">保存时将删除 {deletedIds.length} 个受管磁盘文件。取消设置可放弃删除。</p>}
           {error && <p role="alert" className="text-destructive settings-error">{error}</p>}
         </div>
       </div>}
       <DialogFooter><Button variant="secondary" disabled={saving} onClick={close}>{editable ? '取消' : '关闭'}</Button>{supported && result && <Button disabled={!editable || !dirty || saving} onClick={() => void save(true)}>{saving ? '保存中…' : '保存'}</Button>}</DialogFooter>
     </DialogContent></Dialog>
+    {creating && result && <CreateDrive caps={result.capabilities} onAdd={addDrive} onClose={() => setCreating(false)} />}
+    <Dialog open={!!removing} onOpenChange={value => { if (!value) setRemoving(null) }}><DialogContent><DialogHeader><DialogTitle>删除驱动器？</DialogTitle><DialogDescription>{removing && result?.managed_disks?.[removing.id] ? '保存设置后将永久删除此磁盘文件及其中数据。取消设置会保留磁盘。' : '此设备将从配置中移除，外部源文件与 ISO 保留。取消设置可放弃删除。'}</DialogDescription></DialogHeader>{removing && <><p>{removing.label}</p>{result?.managed_disks?.[removing.id] && <p className="path-value">{result.managed_disks[removing.id].path}</p>}</>}<DialogFooter><Button variant="secondary" onClick={() => setRemoving(null)}>取消</Button><Button variant="destructive" onClick={remove}>删除</Button></DialogFooter></DialogContent></Dialog>
     <Dialog open={leave} onOpenChange={setLeave}><DialogContent><DialogHeader><DialogTitle>保存配置修改？</DialogTitle><DialogDescription>离开前可以保存修改，或丢弃本次编辑。</DialogDescription></DialogHeader><DialogFooter><Button variant="ghost" disabled={saving} onClick={() => setLeave(false)}>继续编辑</Button><Button variant="secondary" disabled={saving} onClick={onClose}>丢弃修改</Button><Button disabled={saving || !editable} onClick={() => void save(true)}>保存并关闭</Button></DialogFooter></DialogContent></Dialog>
-    <Dialog open={resize} onOpenChange={open => { if (!saving) setResize(open) }}><DialogContent><DialogHeader><DialogTitle>扩容磁盘</DialogTitle><DialogDescription>磁盘容量只能增大，此操作不会自动扩展客户机分区。</DialogDescription></DialogHeader><div><Label htmlFor="resize-capacity">目标容量 / GiB</Label><Input id="resize-capacity" type="number" min={(result?.disk.configured_gib ?? 0) + 1} max={4096} value={capacity} onChange={event => setCapacity(Number(event.target.value))} /></div><DialogFooter><Button variant="secondary" disabled={saving} onClick={() => setResize(false)}>取消</Button><Button disabled={saving || !Number.isInteger(capacity) || capacity > 4096 || capacity <= Math.max(result?.disk.configured_gib ?? 0, (result?.disk.virtual_bytes ?? 0) / 1024 ** 3)} onClick={() => void expand()}>{saving ? '扩容中…' : '确认扩容'}</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={resize != null} onOpenChange={value => { if (!value && !saving) setResize(null) }}><DialogContent><DialogHeader><DialogTitle>扩容磁盘</DialogTitle><DialogDescription>容量只能增大，完成后需在客户机中扩展分区。</DialogDescription></DialogHeader><div><Label htmlFor="resize-capacity">目标容量 / GiB</Label><Input id="resize-capacity" type="number" value={capacity} onChange={event => setCapacity(Number(event.target.value))} /></div><DialogFooter><Button variant="secondary" disabled={saving} onClick={() => setResize(null)}>取消</Button><Button disabled={saving || !Number.isInteger(capacity) || capacity > 4096 || capacity <= resizeMinimum} onClick={() => void expand()}>确认扩容</Button></DialogFooter></DialogContent></Dialog>
   </>
 }

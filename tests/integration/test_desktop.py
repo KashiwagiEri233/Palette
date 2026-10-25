@@ -398,6 +398,9 @@ async def test_iso_blank_disk_and_install_media(service: PaletteService, tmp_pat
     assert any("virtio-blk-pci" in value and "bootindex=1" in value for value in instance.plan.argv)
     await desktop.stop(definition["vm_id"])
     current = await desktop.get_settings(definition["vm_id"])
+    next(drive for drive in current["settings"]["drives"] if drive["media"] == "cdrom")[
+        "attached"
+    ] = False
     await desktop.update(
         definition["vm_id"],
         {
@@ -411,7 +414,9 @@ async def test_iso_blank_disk_and_install_media(service: PaletteService, tmp_pat
         },
     )
     await desktop.start(definition["vm_id"])
-    assert not service.manager.get(definition["vm_id"]).overrides.volumes
+    volumes = service.manager.get(definition["vm_id"]).overrides.volumes
+    assert len(volumes) == 2
+    assert next(drive for drive in volumes if drive.media == "cdrom").path is None
 
 
 async def test_daemon_shares_ipc_and_binary_agent_image(service: PaletteService) -> None:

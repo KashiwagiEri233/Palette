@@ -29,6 +29,10 @@ class VmStorage:
         self.persistent_roots: set[Path] = set()
         self._references: dict[Path, int] = {}
 
+    def referenced_paths(self) -> tuple[Path, ...]:
+        """Paths held by in-flight storage operations, in stable order."""
+        return tuple(sorted(self._references))
+
     @contextmanager
     def protect(
         self, profile: Profile, overrides: LaunchOverrides, storage: InstancePaths | None

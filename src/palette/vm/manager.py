@@ -64,6 +64,7 @@ from .launcher import (
 )
 from .managed import ManagedProcess
 from .process_guard import ProcessGuard, create_process_guard
+from .shutdown import force_exit, wait_for_guest
 from .storage import VmStorage
 
 logger = logging.getLogger("palette.vm")
@@ -123,6 +124,9 @@ class VmInstance:
     started_monotonic: float = field(default_factory=time.monotonic)
     stop_requested: bool = False
     guest_shutdown: bool = False
+    force_shutdown: asyncio.Event = field(default_factory=asyncio.Event)
+    shutdown_resumed: bool = False
+    shutdown_in_progress: bool = False
     #: Host material the caller supplied for this instance. Kept so a reset rebuilds the
     #: instance that was asked for instead of quietly reverting to the profile's defaults.
     overrides: LaunchOverrides = field(default_factory=LaunchOverrides)
@@ -324,7 +328,8 @@ class VmManager:
                     raise PaletteError(
                         ErrorCode.IMAGE_INVALID, "persistent storage manifest is invalid"
                     )
-                await images.inspect_image(storage.overlay, image_format="qcow2")
+                if overrides.create_overlay:
+                    await images.inspect_image(storage.overlay, image_format="qcow2")
             paths = images.allocate_instance(vm_id, instance_id)
             if storage is not None:
                 paths.overlay = storage.overlay
@@ -457,12 +462,13 @@ class VmManager:
         #    caller-supplied image replaces the profile's pinned base here and nowhere else:
         #    the writable layer is still ours, per-instance, and discarded by reset.
         if storage is None:
-            await images.create_overlay(
-                paths,
-                base=overrides.image,
-                base_format=overrides.image_format,
-                size_gib=profile.images.size_gib if on_storage_ready is not None else None,
-            )
+            if overrides.create_overlay:
+                await images.create_overlay(
+                    paths,
+                    base=overrides.image,
+                    base_format=overrides.image_format,
+                    size_gib=profile.images.size_gib if on_storage_ready is not None else None,
+                )
             images.stage_firmware_vars(paths)
         if on_storage_ready is not None:
             on_storage_ready(instance)
@@ -470,6 +476,8 @@ class VmManager:
         volumes = []
         volume_chain: list[str] = []
         for volume in overrides.volumes:
+            if volume.use_overlay:
+                volume = replace(volume, path=str(paths.overlay))
             if volume.path is None:
                 volumes.append(volume)
                 continue
@@ -511,6 +519,7 @@ class VmManager:
             managed_console=self.console_enabled,
             clipboard_available=clipboard_available,
             tools_iso=overrides.tools_iso,
+            attach_primary=overrides.attach_primary,
         )
         instance.plan = plan
         process = await spawn_qemu(
@@ -784,6 +793,12 @@ class VmManager:
         keep_instance: bool = True,
         expected_instance_id: str | None = None,
     ) -> VmInstance:
+        if force:
+            target = self.find(vm_id)
+            expected_instance_id = expected_instance_id or (
+                target.view.instance_id if target is not None else None
+            )
+            self.escalate_shutdown(vm_id, expected_instance_id=expected_instance_id)
         async with self.operations.hold(vm_id):
             instance = self.get(vm_id)
             self.check_identity(instance, expected_instance_id)
@@ -796,14 +811,18 @@ class VmManager:
             return instance
 
     async def _stop_locked(self, instance: VmInstance, *, force: bool) -> None:
-        if instance.state in {VmState.STOPPED}:
+        if instance.state is VmState.STOPPED and (
+            instance.process is None or instance.process.returncode is not None
+        ):
             return
+        paused = instance.state is VmState.PAUSED
+        force = force or instance.force_shutdown.is_set()
         instance.stop_requested = True
         instance.view.state = str(VmState.STOPPING)
 
         # Revoke control first so nothing new can be submitted while we unwind.
         release = None
-        if instance.controller is not None:
+        if not force and instance.controller is not None:
             with contextlib.suppress(Exception):
                 release = await instance.controller.shutdown(release=True)
         if release is not None and not release.release_confirmed:
@@ -815,13 +834,9 @@ class VmManager:
 
         process = instance.process
         if process is not None and process.returncode is None:
-            if not force and instance.qmp is not None and instance.qmp.connected:
-                with contextlib.suppress(PaletteError):
-                    await instance.qmp.execute("system_powerdown")
+            if not force:
                 try:
-                    await self._await_exit(
-                        instance, timeout=instance.profile.timeouts.shutdown_seconds
-                    )
+                    force = await wait_for_guest(instance, resume=paused)
                 except PaletteError as exc:
                     # system_powerdown is a request, never a guarantee. Falling through to
                     # the forced path is the documented behaviour; failing the stop here
@@ -832,12 +847,12 @@ class VmManager:
                         exc.code,
                     )
             if process.returncode is None:
-                if force:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
-                await self._await_exit(
-                    instance, timeout=instance.profile.timeouts.force_kill_seconds, kill=True
-                )
+                force = True
+                try:
+                    await force_exit(instance)
+                except BaseException:
+                    instance.view.state = str(VmState.FAILED)
+                    raise
 
         try:
             await self._teardown(instance)
@@ -855,39 +870,6 @@ class VmManager:
                 instance_id=instance.view.instance_id,
                 forced=force,
             )
-
-    async def _await_exit(
-        self, instance: VmInstance, *, timeout: float, kill: bool = False
-    ) -> None:
-        process = instance.process
-        if process is None:
-            return
-        try:
-            await asyncio.wait_for(process.wait(), timeout=timeout)
-            return
-        except TimeoutError:
-            pass
-        if not kill:
-            raise PaletteError(
-                ErrorCode.TIMEOUT,
-                "the guest did not shut down within the configured budget",
-                details={
-                    "operation": "guest-shutdown",
-                    "vm_id": instance.view.vm_id,
-                    "instance_id": instance.view.instance_id,
-                    "timeout_seconds": timeout,
-                },
-            )
-        logger.warning("force-killing QEMU for %s", instance.view.vm_id)
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=5.0)
-        except TimeoutError:
-            instance.view.state = str(VmState.FAILED)
-            raise PaletteError(
-                ErrorCode.TIMEOUT, "QEMU exit could not be confirmed after killing it"
-            ) from None
 
     async def _teardown(self, instance: VmInstance, *, force: bool = False) -> None:
         """Release every host resource attached to one instance.
@@ -910,20 +892,24 @@ class VmManager:
         if instance.controller is not None:
             with contextlib.suppress(Exception):
                 await instance.controller.shutdown(release=False)
-        if instance.guest_tools is not None:
-            with contextlib.suppress(Exception):
-                await instance.guest_tools.close()
-        if instance.qemu_guest_agent is not None:
-            await instance.qemu_guest_agent.close()
-        if instance.guest_desktop is not None:
-            await instance.guest_desktop.close()
-        if instance.guest_session is not None:
-            await instance.guest_session.close()
-        if instance.guest_shares is not None:
-            await instance.guest_shares.close()
-        if instance.qmp is not None:
-            with contextlib.suppress(Exception):
-                await instance.qmp.close()
+        for name, channel in (
+            ("guest tools", instance.guest_tools),
+            ("guest agent", instance.qemu_guest_agent),
+            ("guest desktop", instance.guest_desktop),
+            ("guest session", instance.guest_session),
+            ("guest shares", instance.guest_shares),
+            ("QMP", instance.qmp),
+        ):
+            if channel is not None:
+                try:
+                    async with asyncio.timeout(
+                        min(3.0, instance.profile.timeouts.qmp_command_seconds)
+                    ):
+                        await channel.close()
+                except Exception:
+                    logger.warning(
+                        "could not close %s for %s", name, instance.view.vm_id, exc_info=True
+                    )
         process = instance.process
         if process is not None and process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
@@ -965,9 +951,14 @@ class VmManager:
             self.check_identity(instance, expected_instance_id, expect_absent)
             profile = instance.profile if instance is not None else self.config.profile(profile_id)
             overrides = instance.overrides if instance is not None else LaunchOverrides()
+            was_live = bool(instance and instance.process and instance.process.returncode is None)
             try:
                 if instance is not None:
                     await self._finish_cleanup(self._stop_locked(instance, force=False))
+                    if was_live and instance.force_shutdown.is_set():
+                        raise PaletteError(
+                            ErrorCode.STATE_CONFLICT, "reset cancelled by force stop"
+                        )
                 if self.audit:
                     self.audit.record(
                         "vm.reset",
@@ -996,6 +987,20 @@ class VmManager:
                 await instance.qemu_guest_agent.close_files()
             return instance.view.controller_epoch
 
+    def escalate_shutdown(self, vm_id: str, *, expected_instance_id: str | None = None) -> None:
+        """Called only after force-stop authorization, before joining the operation lock."""
+        instance = self.find(vm_id)
+        self.check_identity(instance, expected_instance_id)
+        if instance is not None:
+            instance.force_shutdown.set()
+            if (instance.shutdown_in_progress or instance.state is VmState.STOPPING) and (
+                instance.process is not None and instance.process.returncode is None
+            ):
+                # A shutdown may own the VM lock while waiting on an unresponsive
+                # channel. Its explicitly confirmed escape path must not need that lock.
+                with contextlib.suppress(OSError):
+                    instance.process.kill()
+
     async def graceful_stop(self, vm_id: str, *, expected_instance_id: str | None = None) -> None:
         """Desktop shutdown: a failed ACPI request must never turn into a kill."""
         async with self.operations.hold(vm_id):
@@ -1004,32 +1009,23 @@ class VmManager:
             if instance.process is None or instance.process.returncode is not None:
                 await self._finish_cleanup(self._stop_locked(instance, force=False))
                 return
-            if instance.qmp is None or not instance.qmp.connected:
-                raise PaletteError(ErrorCode.QMP_UNAVAILABLE, "graceful shutdown is unavailable")
             previous = instance.view.state
             previous_stop_requested = instance.stop_requested
             instance.stop_requested = True
             instance.view.state = str(VmState.STOPPING)
+            instance.shutdown_resumed = False
             try:
-                agent = instance.qemu_guest_agent
-                if agent is not None and agent.online and "guest-shutdown" in agent.commands:
-                    try:
-                        await agent.shutdown()
-                    except PaletteError as exc:
-                        if exc.code not in {
-                            ErrorCode.GUEST_TOOL_UNAVAILABLE,
-                            ErrorCode.UNSUPPORTED_CAPABILITY,
-                        }:
-                            raise
-                        await instance.qmp.execute("system_powerdown")
-                else:
-                    await instance.qmp.execute("system_powerdown")
-                await self._await_exit(instance, timeout=instance.profile.timeouts.shutdown_seconds)
+                forced = await wait_for_guest(instance, resume=previous == "PAUSED")
             except BaseException:
-                instance.view.state = previous
-                instance.stop_requested = previous_stop_requested
-                raise
-            await self._finish_cleanup(self._stop_locked(instance, force=False))
+                if instance.force_shutdown.is_set() or instance.process.returncode is not None:
+                    forced = instance.force_shutdown.is_set()
+                else:
+                    instance.view.state = "RUNNING" if instance.shutdown_resumed else previous
+                    instance.stop_requested = previous_stop_requested
+                    if instance.qmp is None or not instance.qmp.connected:
+                        self._on_qmp_disconnect(instance, None)
+                    raise
+            await self._finish_cleanup(self._stop_locked(instance, force=forced))
             self._apply_retention(vm_id, instance.profile)
 
     @staticmethod

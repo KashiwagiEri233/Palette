@@ -332,6 +332,7 @@ test('workspace navigation, persisted drafts, responsive panels, settings and co
       return status?.state === 'RUNNING' && status.instance_id !== startedInstance
     }, { timeout: 20_000 }).toBe(true)
     await managementRow.getByRole('button', { name: '关机', exact: true }).click()
+    await page.getByRole('dialog', { name: '强制停止虚拟机', exact: true }).getByRole('button', { name: '确认', exact: true }).click()
     await expect.poll(async () => (await readVmStatus())?.state, { timeout: 10_000 }).toBe('STOPPED')
     await verifyManagementActions(false)
     await page.locator('tbody').getByRole('button', { name: '工作区测试', exact: true }).click()
@@ -416,6 +417,7 @@ test('workspace navigation, persisted drafts, responsive panels, settings and co
     await captureAppearance('light')
     await page.getByRole('button', { name: '虚拟机管理', exact: true }).click()
     await managementRow.getByRole('button', { name: '关机', exact: true }).click()
+    await page.getByRole('dialog', { name: '强制停止虚拟机', exact: true }).getByRole('button', { name: '确认', exact: true }).click()
     await expect.poll(async () => (await readVmStatus())?.state, { timeout: 10_000 }).toBe('STOPPED')
     await managementRow.getByRole('button', { name: '删除虚拟机', exact: true }).click()
     await expect(deleteConfirmation).toBeVisible()

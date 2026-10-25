@@ -371,6 +371,8 @@ class ExtraVolume:
     read_only: bool = True
     boot_index: int | None = None
     device_id: str | None = None
+    interface: str | None = None
+    use_overlay: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,10 +390,19 @@ class LaunchOverrides:
     volumes: tuple[ExtraVolume, ...] = ()
     qemu_args: tuple[str, ...] = ()
     tools_iso: Path | None = None
+    attach_primary: bool = True
+    create_overlay: bool = True
 
     @property
     def is_empty(self) -> bool:
-        return not (self.image or self.volumes or self.qemu_args or self.tools_iso)
+        return not (
+            self.image
+            or self.volumes
+            or self.qemu_args
+            or self.tools_iso
+            or not self.attach_primary
+            or not self.create_overlay
+        )
 
     def describe(self) -> list[str]:
         """A shape summary for the audit trail: counts and kinds, never paths."""
@@ -490,16 +501,21 @@ def _windows_drive_config(
 
 
 def _extra_volume_args(
-    volumes: Sequence[ExtraVolume], notes: list[str], config_sections: list[str]
+    volumes: Sequence[ExtraVolume], notes: list[str], config_sections: list[str], profile: Profile
 ) -> list[str]:
     """Attach caller-supplied disks and CD-ROMs behind explicit blockdev nodes."""
     if not volumes:
         return []
     argv: list[str] = []
-    if any(volume.media == "cdrom" for volume in volumes):
+    if any(
+        volume.interface == "scsi"
+        or (volume.media == "cdrom" and not volume.device_id and volume.interface is None)
+        for volume in volumes
+    ):
         # Added unconditionally when an optical drive is requested: the controller must not
         # depend on which default devices the machine happens to keep.
         argv += ["-device", "virtio-scsi-pci,id=scsi0"]
+    ide_index = 0
     for index, volume in enumerate(volumes):
         node = volume.device_id or f"extra{index}"
         native_path = bool(volume.path) and _windows_drive_config(
@@ -535,18 +551,35 @@ def _extra_volume_args(
                     separators=(",", ":"),
                 ),
             ]
-        if volume.media == "cdrom":
-            boot = f",bootindex={volume.boot_index}" if volume.boot_index is not None else ""
-            backend = f",drive={node}" if volume.path else ""
-            if volume.device_id:
-                # USB optical drives need no guest VirtIO storage driver.
-                argv += ["-device", f"usb-bot,id={node}-usb,bus=xhci.0"]
-                argv += ["-device", f"scsi-cd,id={node}{backend},bus={node}-usb.0{boot}"]
-            else:
-                argv += ["-device", f"scsi-cd{backend},bus=scsi0.0{boot}"]
+        interface = volume.interface or (
+            "usb"
+            if volume.device_id and volume.media == "cdrom"
+            else "scsi"
+            if volume.media == "cdrom"
+            else "virtio"
+        )
+        boot = f",bootindex={volume.boot_index}" if volume.boot_index is not None else ""
+        backend = f",drive={node}" if volume.path else ""
+        identity = f",id={node}" if volume.device_id else ""
+        kind = "cd" if volume.media == "cdrom" else "hd"
+        if interface == "usb":
+            argv += ["-device", f"usb-bot,id={node}-usb,bus=xhci.0"]
+            argv += ["-device", f"scsi-{kind}{identity}{backend},bus={node}-usb.0{boot}"]
+        elif interface == "scsi":
+            argv += ["-device", f"scsi-{kind}{identity}{backend},bus=scsi0.0{boot}"]
+        elif interface == "ide":
+            q35 = profile.qemu.machine.split(",")[0].startswith(("q35", "pc-q35"))
+            if profile.qemu.arch != "x86_64" or ide_index >= (6 if q35 else 4):
+                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "IDE 设备数量或机器类型不受支持")
+            bus, unit = (ide_index, 0) if q35 else (ide_index // 2, ide_index % 2)
+            argv += ["-device", f"ide-{kind}{identity}{backend},bus=ide.{bus},unit={unit}{boot}"]
+            ide_index += 1
+        elif interface == "nvme" and volume.media == "disk":
+            argv += ["-device", f"nvme{identity}{backend},serial={node}{boot}"]
+        elif interface == "virtio" and volume.media == "disk":
+            argv += ["-device", f"virtio-blk-pci,drive={node}{identity}{boot}"]
         else:
-            identity = f",id={node}" if volume.device_id else ""
-            argv += ["-device", f"virtio-blk-pci,drive={node}{identity}"]
+            raise PaletteError(ErrorCode.INVALID_ARGUMENT, "不支持的磁盘接口或介质类型")
         notes.append(f"attached a caller-supplied {volume.media}")
     return argv
 
@@ -567,6 +600,7 @@ def build_launch_plan(
     tools_iso: Path | None = None,
     extra_volumes: Sequence[ExtraVolume] = (),
     caller_args: Sequence[str] = (),
+    attach_primary: bool = True,
 ) -> LaunchPlan:
     """Compose QEMU's arguments from the profile plus anything the caller supplied.
 
@@ -702,14 +736,15 @@ def build_launch_plan(
         f"head={devices.head}",
     ]
 
-    argv += _block_args(
-        overlay_path=overlay_path,
-        profile=profile,
-        notes=notes,
-        config_sections=config_sections,
-        boot_index=1 if any(volume.boot_index == 0 for volume in extra_volumes) else 0,
-    )
-    argv += _extra_volume_args(extra_volumes, notes, config_sections)
+    if attach_primary:
+        argv += _block_args(
+            overlay_path=overlay_path,
+            profile=profile,
+            notes=notes,
+            config_sections=config_sections,
+            boot_index=1 if any(volume.boot_index == 0 for volume in extra_volumes) else 0,
+        )
+    argv += _extra_volume_args(extra_volumes, notes, config_sections, profile)
     if tools_iso is not None:
         options = {
             "id": "palette-tools",

@@ -1,5 +1,6 @@
 import type { HardwareCapabilities, OsPreset, OsPresetTarget, Profile, VmDraft } from '../../shared/types'
-import { profileSettings } from './vm-settings'
+import { profileSettings, withDrives } from './vm-settings'
+import type { HardwareSettings } from '../../shared/types'
 
 export const osNames = { windows: 'Windows', linux: 'Linux', custom: '自定义' }
 export const archName = (arch: string): string => arch === 'aarch64' ? 'ARM64' : arch
@@ -29,6 +30,15 @@ export function creationResourceError(draft: VmDraft, caps: HardwareCapabilities
   return null
 }
 
-export function creationPayload(draft: VmDraft, attached: boolean): Record<string, unknown> {
-  return { ...draft, os_preset: draft.os_preset ?? 'custom', iso_attached: attached }
+export function sourceOptical(settings: HardwareSettings, path: string | null, oldPath: string): HardwareSettings {
+  const drives = settings.drives ?? []
+  const existing = drives.find(drive => drive.media === 'cdrom' && drive.path === oldPath)
+  const remaining = drives.filter(drive => drive.id !== existing?.id)
+  if (!path) return withDrives(settings, remaining)
+  const drive = existing ? { ...existing, path, attached: true } : { id: `drive-${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`, media: 'cdrom' as const, path, format: 'raw' as const, read_only: true, attached: true }
+  return withDrives(settings, existing ? drives.map(item => item.id === existing.id ? drive : item) : [drive, ...drives])
+}
+
+export function creationPayload(draft: VmDraft): Record<string, unknown> {
+  return { ...draft, os_preset: draft.os_preset ?? 'custom', iso_attached: false }
 }

@@ -38,7 +38,7 @@ test('Windows tools mount from the VM menu and application menu without replacin
     let definition = JSON.parse(await readFile(definitionPath, 'utf8'))
     expect(definition.tools_iso_sha256).toHaveLength(64)
     expect(definition.draft.path).toBe(installer)
-    expect(definition.iso_attached).toBe(true)
+    expect(definition.draft.settings.drives).toEqual([expect.objectContaining({ media: 'cdrom', path: installer, attached: true })])
     await page.getByRole('button', { name: '启动', exact: true }).click()
     await expect(page.getByText('仅查看', { exact: true })).toBeVisible({ timeout: 20000 })
     await page.getByRole('button', { name: 'Windows 工具测试 的操作' }).click()

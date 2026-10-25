@@ -81,10 +81,12 @@ class RuntimeOwner:
                 "desktop_protocol": 1,
                 "features": [
                     "vm-settings-v2",
+                    "vm-drives-v1",
                     "os-presets-v1",
                     "disk-resize",
                     "runtime-stop",
                     "vm-stop-identity",
+                    "vm-shutdown-v2",
                     "driver-claim-v1",
                     "guest-enhancements-v1",
                 ],
@@ -146,6 +148,10 @@ class RuntimeOwner:
             return await self.desktop.get_settings(vm_id)
         if method == "vms.disk.resize":
             return await self.desktop.resize_disk(vm_id, payload)
+        if method == "vms.disk.delete":
+            from .managed_disk_delete import delete_managed_disk
+
+            return await delete_managed_disk(self.desktop, vm_id, payload)
         if method == "hardware.capabilities":
             return await self.desktop.probe.get(
                 self.service.config.profile(payload.get("profile_id"))

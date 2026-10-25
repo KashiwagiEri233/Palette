@@ -38,6 +38,21 @@ def main(argv: list[str]) -> int:
         return cmd_create(rest)
     if command == "info":
         return cmd_info(rest)
+    if command == "convert":
+        options = _parse_flags(rest, with_value={"-f", "-O"})
+        source, target = options["positional"]
+        metadata = _read_chain(source)
+        if metadata is None or os.path.exists(target):
+            return 1
+        metadata = {
+            **metadata,
+            "driver": options["flags"].get("-O", "qcow2"),
+            "backing": None,
+            "backing_format": None,
+        }
+        with open(target, "wb") as handle:
+            handle.write(MAGIC + json.dumps(metadata).encode("utf-8"))
+        return 0
     if command == "resize":
         options = _parse_flags(rest, with_value={"-f"})
         path, size = options["positional"]

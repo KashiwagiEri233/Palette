@@ -3,42 +3,31 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { FormSelect } from '@/components/ui/select'
-import { FolderIcon, PlusIcon } from '@/components/icons'
-import type { DriveSettings, HardwareSettings } from '../shared/types'
+import type { DriveSettings, DriveInterface, HardwareCapabilities, ManagedDiskInfo } from '../shared/types'
+import { driveInterface, interfaceNames } from './lib/drives'
+import { sizeLabel } from './lib/vm-settings'
 
-export function DriveFields({ settings, change }: { settings: HardwareSettings; change: (settings: HardwareSettings) => void }) {
+export function DriveFields({ drive, change, remove, resize, resizeDisabled, info, caps }: { drive: DriveSettings; change: (drive: DriveSettings) => void; remove: () => void; resize?: () => void; resizeDisabled?: boolean; info?: ManagedDiskInfo; caps: HardwareCapabilities }) {
   const [error, setError] = useState('')
-  const drives = settings.drives ?? []
-  function update(id: string, patch: Partial<DriveSettings>) {
-    change({ ...settings, drives: drives.map(drive => drive.id === id ? { ...drive, ...patch } : drive) })
-  }
-  function add(media: DriveSettings['media'], path: string | null = null, format: DriveSettings['format'] = 'raw') {
-    change({ ...settings, drives: [...drives, { id: `drive-${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`, media, path, format, read_only: true, attached: true }] })
-  }
-  async function choose(drive?: DriveSettings) {
-    try {
-      const media = drive?.media ?? 'disk'
-      const path = await window.palette.chooseFile(media === 'cdrom' ? 'iso' : 'image')
-      if (!path) return
-      const format = media === 'cdrom' || /\.(raw|img)$/i.test(path) ? 'raw' : 'qcow2'
-      if (drive) update(drive.id, { path, format, attached: true })
-      else add('disk', path, format)
-      setError('')
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
+  const kind = driveInterface(drive)
+  const offered = caps.drive_interfaces?.[drive.media] ?? []
+  const internal = !!info || drive.size_gib != null || drive.import_copy
+  const allocated = info != null && info.allocated !== false
+  const options = [...(!offered.includes(kind) ? [{ value: kind, label: `${interfaceNames[kind]}（当前配置）` }] : []), ...offered.map(value => ({ value, label: interfaceNames[value] }))]
+  async function browse() {
+    try { const path = await window.palette.chooseFile(drive.media === 'cdrom' ? 'iso' : 'image'); if (path) { change({ ...drive, path, attached: true, format: drive.media === 'cdrom' || /\.(raw|img)$/i.test(path) ? 'raw' : 'qcow2' }); setError('') } }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
   return <div className="form-stack">
-    <div className="drive-add-actions"><Button id="add-drive" variant="outline" disabled={drives.length >= 8} onClick={() => void choose()}><PlusIcon className="size-4" />添加磁盘</Button><Button variant="outline" disabled={drives.length >= 8} onClick={() => add('cdrom')}><PlusIcon className="size-4" />添加光驱</Button></div>
-    <p className="field-hint">最多添加 8 个附加驱动器。磁盘接入已有镜像，光驱可空载或装载 ISO。系统磁盘和安装光盘在“磁盘与启动”中管理。</p>
-    {!drives.length && <p className="field-hint">尚未添加附加驱动器。</p>}
-    {drives.map((drive, index) => <section key={drive.id} className="drive-card" aria-label={`附加${drive.media === 'disk' ? '磁盘' : '光驱'} ${index + 1}`}>
-      <div className="drive-card-heading"><strong>{drive.media === 'disk' ? '磁盘' : '光驱'} {index + 1}</strong><Button variant="ghost" size="sm" aria-label={`移除驱动器 ${index + 1}`} onClick={() => change({ ...settings, drives: drives.filter(item => item.id !== drive.id) })}>移除</Button></div>
-      <div><Label htmlFor={`drive-path-${drive.id}`}>介质文件</Label><div className="file-field"><Input id={`drive-path-${drive.id}`} readOnly value={drive.path ?? ''} placeholder={drive.media === 'cdrom' ? '空光驱' : '选择磁盘镜像'} /><Button variant="secondary" onClick={() => void choose(drive)}><FolderIcon className="size-4" />选择{drive.media === 'cdrom' ? ' ISO' : '镜像'}</Button></div></div>
-      <div className="resource-fields"><div><Label htmlFor={`drive-state-${drive.id}`}>连接状态</Label><FormSelect id={`drive-state-${drive.id}`} value={drive.attached ? 'attached' : 'ejected'} onValueChange={value => update(drive.id, { attached: value === 'attached' })} options={[{ value: 'attached', label: drive.media === 'cdrom' && !drive.path ? '空载光驱' : '连接介质' }, { value: 'ejected', label: drive.media === 'cdrom' ? '弹出介质' : '断开磁盘' }]} /></div>
-      {drive.media === 'disk' ? <div><Label htmlFor={`drive-access-${drive.id}`}>访问方式</Label><FormSelect id={`drive-access-${drive.id}`} value={drive.read_only ? 'ro' : 'rw'} onValueChange={value => update(drive.id, { read_only: value === 'ro' })} options={[{ value: 'ro', label: '只读' }, { value: 'rw', label: '读写' }]} /></div> : <div><Label>访问方式</Label><p className="field-hint">只读 · USB 光驱</p></div>}</div>
-      {drive.media === 'disk' && <div><Label htmlFor={`drive-format-${drive.id}`}>镜像格式</Label><FormSelect id={`drive-format-${drive.id}`} value={drive.format} onValueChange={value => update(drive.id, { format: value as DriveSettings['format'] })} options={[{ value: 'qcow2', label: 'QCOW2' }, { value: 'raw', label: 'RAW' }]} /></div>}
-      {drive.media === 'disk' && <p className="field-hint">VirtIO 磁盘需要客户机对应驱动。{drive.read_only ? '镜像文件保持只读。' : '读写模式会直接修改所选镜像。'}</p>}
-    </section>)}
-    <p className="field-hint">移除只断开设备，不删除镜像文件。附加驱动器不改变系统启动顺序。</p>
+    <dl className="configuration-grid"><div><dt>介质类型</dt><dd>{drive.media === 'cdrom' ? '可移动光盘' : internal ? '虚拟机磁盘' : '外部磁盘'}</dd></div><div><dt>文件</dt><dd>{info?.source_name ?? info?.path?.split(/[\\/]/).at(-1) ?? drive.path?.split(/[\\/]/).at(-1) ?? '尚未分配'}</dd></div>{info && <><div><dt>虚拟容量</dt><dd>{sizeLabel(info.virtual_bytes ?? info.size_gib * 1024 ** 3)}</dd></div><div><dt>镜像格式</dt><dd>{(info.format ?? drive.format).toUpperCase()}</dd></div>{info.actual_bytes != null && <div><dt>宿主占用</dt><dd>{sizeLabel(info.actual_bytes)}</dd></div>}</>}</dl>
+    <div><Label htmlFor={`drive-interface-${drive.id}`}>接口</Label><FormSelect id={`drive-interface-${drive.id}`} value={kind} options={options} onValueChange={value => change({ ...drive, interface: value as DriveInterface })} /><p className="field-hint">客户机需要支持此存储接口。更改后在下次启动生效。</p></div>
+    {!internal && <div><Label htmlFor={`drive-path-${drive.id}`}>介质文件</Label><div className="file-field"><Input id={`drive-path-${drive.id}`} readOnly value={drive.path ?? ''} placeholder="空载" /><Button variant="outline" onClick={() => void browse()}>浏览…</Button></div></div>}
+    {!allocated && drive.size_gib != null && <div><Label htmlFor={`drive-capacity-${drive.id}`}>容量 / GiB</Label><Input id={`drive-capacity-${drive.id}`} type="number" min={1} max={4096} value={drive.size_gib} onChange={event => change({ ...drive, size_gib: Number(event.target.value) })} /></div>}
+    {drive.media === 'disk' && !info && <><div><Label htmlFor={`drive-format-${drive.id}`}>镜像格式</Label><FormSelect id={`drive-format-${drive.id}`} value={drive.format} onValueChange={format => change({ ...drive, format: format as 'raw' | 'qcow2' })} options={[{ value: 'qcow2', label: 'QCOW2' }, { value: 'raw', label: 'RAW' }]} /></div><p className="field-hint">{drive.import_copy ? '保存时复制并转换源镜像，源文件保留。' : internal ? '保存时创建磁盘文件，客户机内需初始化和格式化。' : '这是外部镜像；选择读写会直接修改原文件。'}</p></>}
+    <div className="resource-fields"><div><Label htmlFor={`drive-state-${drive.id}`}>连接状态</Label><FormSelect id={`drive-state-${drive.id}`} value={drive.attached ? 'attached' : 'ejected'} onValueChange={value => change({ ...drive, attached: value === 'attached' })} options={[{ value: 'attached', label: drive.media === 'cdrom' && !drive.path ? '空载光驱' : '连接介质' }, { value: 'ejected', label: drive.media === 'cdrom' ? '弹出介质' : '断开磁盘' }]} /></div>{drive.media === 'disk' && <div><Label htmlFor={`drive-access-${drive.id}`}>访问方式</Label><FormSelect id={`drive-access-${drive.id}`} value={drive.read_only ? 'ro' : 'rw'} onValueChange={value => change({ ...drive, read_only: value === 'ro' })} options={[{ value: 'ro', label: '只读' }, { value: 'rw', label: '读写' }]} /></div>}</div>
+    {info?.path && <p className="path-value">{info.path}</p>}
+    {resize && <div><Button variant="outline" disabled={resizeDisabled} onClick={resize}>扩容磁盘</Button><p className="field-hint">容量只能增大；需先保存或丢弃其他修改。</p></div>}
+    <div className="drive-remove"><Button variant="destructive" onClick={remove}>删除驱动器…</Button><p className="field-hint">{info ? '保存后删除此磁盘文件及设备，取消设置可放弃删除。' : '删除在保存后生效；外部源文件和 ISO 保留。'}</p></div>
     {error && <p role="alert" className="text-destructive">{error}</p>}
   </div>
 }

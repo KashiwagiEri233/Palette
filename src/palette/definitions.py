@@ -48,6 +48,7 @@ class VmUpdate(BaseModel):
     network: Literal["offline", "restricted-lab", "nat"]
     iso_attached: bool
     settings: HardwareSettings
+    delete_drives: list[str] = Field(default_factory=list, max_length=256)
 
     @field_validator("name")
     @classmethod
@@ -59,6 +60,7 @@ class DiskResize(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     revision: int = Field(ge=0)
     disk_gib: int = Field(ge=1, le=4096)
+    drive_id: str = Field(default="drive-primary", pattern=r"^drive-[a-z0-9_-]{1,16}$")
 
 
 class ResizeOperation(BaseModel):
@@ -68,6 +70,7 @@ class ResizeOperation(BaseModel):
     before_bytes: int = Field(ge=1)
     target_bytes: int = Field(ge=1)
     disk_gib: int = Field(ge=1, le=4096)
+    drive_id: str = Field(default="drive-primary", pattern=r"^drive-[a-z0-9_-]{1,16}$")
 
     @model_validator(mode="after")
     def consistent_capacity(self) -> ResizeOperation:
@@ -85,6 +88,22 @@ def sync_directory(path: Path) -> None:
             os.close(fd)
 
 
+class ManagedDisk(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    owner: str = Field(pattern=r"^(?:data|inst)_[0-9a-f]{12}$")
+    size_gib: int = Field(ge=1, le=4096)
+    deleting: bool = False
+    format: Literal["qcow2", "raw"] = "qcow2"
+    virtual_size: int | None = Field(default=None, ge=1)
+    source_name: str | None = Field(default=None, max_length=4096)
+
+
+class DiskDelete(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    revision: int = Field(ge=0)
+    drive_id: str = Field(pattern=r"^drive-[a-z0-9_-]{1,16}$")
+
+
 class VmDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: Literal[1, 2] = 2
@@ -94,6 +113,8 @@ class VmDefinition(BaseModel):
     profile: Profile
     storage_owner: str | None = None
     seed_owner: str | None = None
+    data_disks: dict[str, ManagedDisk] = Field(default_factory=dict, max_length=256)
+    drives_initialized: bool = False
     iso_attached: bool = True
     tools_iso_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     created_at: str
@@ -144,6 +165,11 @@ class DefinitionRepository:
             for owner in (definition.storage_owner, definition.seed_owner)
             if owner is not None
         }
+        roots.update(
+            self.guard.resolve("vms", definition.vm_id, disk.owner)
+            for definition in self.definitions.values()
+            for disk in definition.data_disks.values()
+        )
         self.manager.persistent_roots.clear()
         self.manager.persistent_roots.update(roots)
 

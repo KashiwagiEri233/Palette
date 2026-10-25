@@ -61,6 +61,66 @@ async function cleanup(root: string, applications: ElectronApplication[]): Promi
   await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 })
 }
 
+test('power buttons confirm forced shutdown, cancel safely and preserve persistent disks', async () => {
+  test.setTimeout(120000)
+  const root = await fixture()
+  const applications: ElectronApplication[] = []
+  try {
+    const application = await launch(root)
+    applications.push(application)
+    const page = await application.firstWindow()
+    const vmId = await page.evaluate(async path => {
+      const vm = await window.palette.request('vms.create', undefined, { name: '电源键测试', profile_id: 'default', source: 'image', path, vcpus: 1, memory_mib: 512, disk_gib: 24, network: 'offline' }) as { vm_id: string }
+      return vm.vm_id
+    }, join(root, 'base.qcow2'))
+    const status = () => page.evaluate(async id => {
+      const { vms } = await window.palette.request('vms.list') as { vms: { vm_id: string; status: { state: string; instance_id: string; process_running: boolean } }[] }
+      return vms.find(vm => vm.vm_id === id)!.status
+    }, vmId)
+    for (const entry of ['list', 'console', 'menu']) {
+      await page.evaluate(async id => { await window.palette.request('vms.start', id) }, vmId)
+      const before = await status()
+      const definition = JSON.parse(await readFile(join(root, '.runtime', 'definitions', `${vmId}.json`), 'utf8'))
+      const disk = join(root, '.runtime', 'vms', vmId, definition.storage_owner, 'disk', 'overlay.qcow2')
+      const diskBefore = await readFile(disk)
+      await writeFile(`${disk}.behavior.json`, JSON.stringify({ ignore_powerdown: true }))
+      await page.getByRole('button', { name: '虚拟机管理', exact: true }).click()
+      const row = page.getByRole('row').filter({ hasText: '电源键测试' })
+      await expect(row.getByText('运行中', { exact: true })).toBeVisible()
+      if (entry !== 'list') await row.getByRole('button', { name: '打开', exact: true }).click()
+      const pressPower = async () => {
+        if (entry === 'list') await row.getByRole('button', { name: '关机', exact: true }).click()
+        else if (entry === 'console') await page.locator('.console-panel').getByRole('button', { name: '关机', exact: true }).click()
+        else {
+          await page.locator('.desktop-main').getByRole('button', { name: '电源键测试 的操作', exact: true }).click()
+          await page.getByRole('menuitem', { name: '关机', exact: true }).click()
+        }
+      }
+      const confirmation = page.getByRole('dialog', { name: '强制停止虚拟机', exact: true })
+      await pressPower()
+      await expect(confirmation).toContainText('电源键测试')
+      await expect(confirmation).toContainText('强制断电')
+      await expect(confirmation).toContainText('尚未保存的数据可能丢失')
+      await expect(confirmation).toContainText('可能损坏客户机文件系统')
+      await confirmation.getByRole('button', { name: '取消', exact: true }).click()
+      expect(await status()).toMatchObject({ state: 'RUNNING', instance_id: before.instance_id, process_running: true })
+      await pressPower()
+      await page.keyboard.press('Escape')
+      await expect(confirmation).toBeHidden()
+      expect((await status()).state).toBe('RUNNING')
+      await pressPower()
+      if (entry === 'console') await screenshot(page, 'test-results/power-force-confirmation.png')
+      await confirmation.getByRole('button', { name: '确认', exact: true }).click()
+      await expect(confirmation).toBeHidden({ timeout: 10000 })
+      expect(await status()).toMatchObject({ state: 'STOPPED', process_running: false })
+      expect(await readFile(disk)).toEqual(diskBefore)
+      const commands = (await readFile(`${disk}.log.jsonl`, 'utf8')).trim().split('\n').map(line => JSON.parse(line).command)
+      expect(commands).not.toContain('system_powerdown')
+      expect(commands).toContain('quit')
+    }
+  } finally { await cleanup(root, applications) }
+})
+
 test('empty window always confirms, cancels repeatedly and completely stops its daemon', async () => {
   const root = await fixture()
   const applications: ElectronApplication[] = []
@@ -133,7 +193,7 @@ test('running VM survives window-only exit; shutdown failure preserves window an
     await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close())
     const duplicate = await page.evaluate(async () => { try { await window.palette.finishClose('shutdown'); return '' } catch (error) { return String(error) } })
     expect(duplicate).toContain('正在退出')
-    await expect(page.getByRole('dialog').getByRole('alert')).toContainText('虚拟机未在规定时间内完成正常关机', { timeout: 15000 })
+    await expect(page.getByRole('dialog').getByRole('alert')).toContainText('虚拟机未完成正常关机', { timeout: 15000 })
     await expect(page.getByRole('button', { name: '完全退出', exact: true })).toBeEnabled()
     await expect(page.getByRole('button', { name: '强制停止此虚拟机并退出…', exact: true })).toBeVisible()
     expect(backendInfo(root)!.pid).toBe(pid)
@@ -167,14 +227,15 @@ test('quit during a manual shutdown stays responsive and refreshes the failed VM
     await page.getByRole('button', { name: '虚拟机管理', exact: true }).click()
     const row = page.getByRole('row', { includeHidden: true }).filter({ hasText: '并发关机测试' })
     await expect(row.getByText('运行中', { exact: true })).toBeVisible()
-    await row.getByRole('button', { name: '关机', exact: true }).click()
+    await row.getByRole('button', { name: '并发关机测试 的操作', exact: true }).click()
+    await page.getByRole('menuitem', { name: '请求正常关机', exact: true }).click()
     await closePrompt(application)
     const dialog = page.getByRole('dialog')
     await dialog.getByRole('button', { name: '完全退出', exact: true }).click()
     await expect(dialog.getByRole('alert')).toContainText('虚拟机操作尚未完成', { timeout: 1000 })
     await expect(dialog.getByRole('button', { name: '仅关闭窗口', exact: true })).toBeEnabled()
     await expect(row.getByText('关机中', { exact: true })).toBeVisible()
-    await expect(page.locator('.desktop-error')).toContainText('虚拟机未在规定时间内完成正常关机', { timeout: 10000 })
+    await expect(page.locator('.desktop-error')).toContainText('正常关机未完成', { timeout: 10000 })
     // Polling is suspended while the dialog is open; recovery must refresh explicitly.
     await expect(row.getByText('运行中', { exact: true })).toBeVisible()
     await expect(row.getByRole('button', { name: '关机', exact: true, includeHidden: true })).toBeEnabled()
@@ -227,6 +288,11 @@ test('complete exit requires force confirmation for the timed-out VM and preserv
     const forceExit = page.getByRole('button', { name: '强制停止此虚拟机并退出…', exact: true })
     await expect(forceExit).toBeVisible({ timeout: 15000 })
     await expect(page.getByRole('dialog').getByRole('alert')).toContainText('超时客户机')
+    const healthy = await page.evaluate(async id => {
+      const { vms } = await window.palette.request('vms.list') as { vms: { vm_id: string; status: { state: string } }[] }
+      return vms.find(vm => vm.vm_id === id)!.status.state
+    }, ids[1])
+    expect(healthy).toBe('STOPPED')
     await forceExit.click()
     const confirmation = page.getByRole('dialog', { name: '强制停止虚拟机', exact: true })
     await expect(confirmation).toContainText('超时客户机')
@@ -248,6 +314,67 @@ test('complete exit requires force confirmation for the timed-out VM and preserv
     for (const disk of disks) expect(await readFile(disk.path)).toEqual(disk.before)
   } finally { await cleanup(root, applications) }
 })
+
+for (const action of ['关机', '重启'] as const) {
+test(`force stop interrupts a pending ${action} without waiting for its timeout`, async () => {
+  test.setTimeout(90000)
+  const root = await fixture()
+  const applications: ElectronApplication[] = []
+  try {
+    const profilePath = join(root, 'profiles', 'default.toml')
+    await writeFile(profilePath, (await readFile(profilePath, 'utf8')).replace(/shutdown_seconds = [\d.]+/, 'shutdown_seconds = 60.0'))
+    const application = await launch(root)
+    applications.push(application)
+    const page = await application.firstWindow()
+    const vmId = await page.evaluate(async path => {
+      const vm = await window.palette.request('vms.create', undefined, { name: '中断关机测试', profile_id: 'default', source: 'image', path, vcpus: 1, memory_mib: 512, disk_gib: 24, network: 'offline' }) as { vm_id: string }
+      await window.palette.request('vms.start', vm.vm_id)
+      return vm.vm_id
+    }, join(root, 'base.qcow2'))
+    const definition = JSON.parse(await readFile(join(root, '.runtime', 'definitions', `${vmId}.json`), 'utf8'))
+    const disk = join(root, '.runtime', 'vms', vmId, definition.storage_owner, 'disk', 'overlay.qcow2')
+    const before = await readFile(disk)
+    await writeFile(`${disk}.behavior.json`, JSON.stringify({ ignore_powerdown: true }))
+    await page.getByRole('button', { name: '虚拟机管理', exact: true }).click()
+    const row = page.getByRole('row').filter({ hasText: '中断关机测试' })
+    await row.getByRole('button', { name: '打开', exact: true }).click()
+    const consolePanel = page.locator('.console-panel')
+    await expect(consolePanel.locator('canvas')).toBeVisible()
+    if (action === '关机') {
+      await page.locator('.desktop-main').getByRole('button', { name: '中断关机测试 的操作', exact: true }).click()
+      await page.getByRole('menuitem', { name: '请求正常关机', exact: true }).click()
+    } else {
+      await consolePanel.getByRole('button', { name: action, exact: true }).click()
+    }
+    const progress = page.locator('.desktop-shutdown-status')
+    await expect(progress).toContainText('正在等待')
+    await expect(page.getByText('关机中', { exact: true })).toBeVisible()
+    await expect(consolePanel.locator('canvas')).toBeVisible()
+    await expect(consolePanel.getByText('仅查看', { exact: true })).toBeVisible()
+    await expect(consolePanel.locator('.console-placeholder')).toHaveCount(0)
+    await expect(consolePanel.getByRole('button', { name: '接管', exact: true })).toBeDisabled()
+    await screenshot(page, `test-results/shutdown-uncovered-${action === '关机' ? 'stop' : 'restart'}.png`)
+    await page.getByRole('button', { name: '虚拟机管理', exact: true }).click()
+    await expect(row.getByText('关机中', { exact: true })).toBeVisible()
+    await progress.getByRole('button', { name: '强制停止…', exact: true }).click()
+    const confirmation = page.getByRole('dialog', { name: '强制停止虚拟机', exact: true })
+    await expect(confirmation.getByRole('button', { name: '确认', exact: true })).toBeEnabled()
+    await confirmation.getByRole('button', { name: '取消', exact: true }).click()
+    await expect(progress).toBeVisible()
+    await progress.getByRole('button', { name: '强制停止…', exact: true }).click()
+    await screenshot(page, action === '关机' ? 'test-results/shutdown-force-interrupt.png' : 'test-results/shutdown-restart-force-interrupt.png')
+    await confirmation.getByRole('button', { name: '确认', exact: true }).click()
+    await expect(confirmation).toBeHidden({ timeout: 6000 })
+    await expect(row.getByText('已关机', { exact: true })).toBeVisible({ timeout: 6000 })
+    await expect(progress).toHaveCount(0)
+    await expect(page.locator('.desktop-error')).toHaveCount(0)
+    expect(await readFile(disk)).toEqual(before)
+    await closePrompt(application)
+    await exit(application, '完全退出')
+    expect(backendInfo(root)).toBeNull()
+  } finally { await cleanup(root, applications) }
+})
+}
 
 test('complete exit stops the embedded MCP process while its stdin remains open', async () => {
   test.setTimeout(90000)

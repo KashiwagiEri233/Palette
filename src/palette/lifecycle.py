@@ -178,8 +178,15 @@ class LifecycleService:
     ) -> LifecycleResult:
         authorized = self.manager.find(vm_id)
         expected = expected_instance_id or (authorized.view.instance_id if authorized else None)
+        if force and authorized is not None:
+            if actor == "agent":
+                self.control.require_agent(vm_id)
+            authorized.policy.require_lifecycle("force_stop", actor=actor)
+            self.manager.escalate_shutdown(vm_id, expected_instance_id=expected)
         async with self.manager.operations.hold(vm_id):
-            self.manager.check_identity(self.manager.find(vm_id), expected)
+            self.manager.check_identity(
+                self.manager.find(vm_id), expected, expect_absent=authorized is None
+            )
             if self.is_persistent(vm_id):
                 assert self.desktop is not None  # noqa: S101
                 definition = self.desktop.get(vm_id)
@@ -196,13 +203,19 @@ class LifecycleService:
             instance.policy.require_lifecycle("force_stop" if force else "stop", actor=actor)
             if actor == "agent":
                 self.control.require_agent(vm_id)
-            else:
-                await self.control.revoke(vm_id)
-            await self.manager.shutdown_instance(
-                vm_id,
-                mode=ShutdownMode.FORCE if force else ShutdownMode.WITH_FALLBACK,
-                expected_instance_id=expected or instance.view.instance_id,
-            )
+            instance.shutdown_in_progress = True
+            try:
+                if actor != "agent" and not force:
+                    await self.control.revoke(vm_id)
+                await self.manager.shutdown_instance(
+                    vm_id,
+                    mode=ShutdownMode.FORCE if force else ShutdownMode.WITH_FALLBACK,
+                    expected_instance_id=expected or instance.view.instance_id,
+                )
+                if actor != "agent" and force:
+                    await self.control.revoke(vm_id)
+            finally:
+                instance.shutdown_in_progress = False
             return LifecycleResult(
                 ok=True,
                 vm_id=vm_id,

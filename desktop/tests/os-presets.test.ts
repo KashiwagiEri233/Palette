@@ -11,13 +11,13 @@ describe('OS preset configuration', () => {
   it('applies guest suggestions over the host profile while preserving the source and name', () => {
     const result = configurationDraft(profile, previous, linux, linux.targets[0])
     expect(result).toMatchObject({ os_preset: 'linux', profile_id: 'host-windows', name: previous.name, path: previous.path, source: 'iso', vcpus: 2, memory_mib: 4096, disk_gib: 32, network: 'offline' })
-    expect(result.settings).toMatchObject({ display: { model: 'virtio-vga', default_resolution: false }, network: { model: 'virtio-net-pci' }, iso_path: previous.path, audio_enabled: false })
+    expect(result.settings).toMatchObject({ display: { model: 'virtio-vga', default_resolution: false }, network: { model: 'virtio-net-pci' }, iso_path: null, audio_enabled: false, drives: [{ media: 'cdrom', path: previous.path, attached: true }] })
     expect(profile.devices.display_model).toBe('VGA')
   })
   it('sends user CPU, memory and disk changes without reapplying suggestions', () => {
     const result = configurationDraft(profile, previous, linux, linux.targets[0])
     const edited = { ...result, vcpus: 3, memory_mib: 6144, disk_gib: 72 }
-    expect(creationPayload(edited, true)).toMatchObject({ os_preset: 'linux', vcpus: 3, memory_mib: 6144, disk_gib: 72, iso_attached: true })
+    expect(creationPayload(edited)).toMatchObject({ os_preset: 'linux', vcpus: 3, memory_mib: 6144, disk_gib: 72, iso_attached: false })
   })
   it('custom keeps profile defaults and does not attach disk images as CD-ROMs', () => {
     const result = configurationDraft(profile, { ...previous, source: 'image', path: '/disk.raw' })

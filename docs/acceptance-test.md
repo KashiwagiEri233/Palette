@@ -158,6 +158,7 @@ The script writes `report.json`, `02-before.png`, `03-click.png`, and (after a d
 | **Scale mapping** | Click the same target under fit-to-window, 1:1, and high-DPI scaling | Lands on the exact target in both MCP (image pixels) and GUI (mapped coordinates) |
 | **Fullscreen** | Enter and exit Console fullscreen | Stream remains intact; exiting fullscreen releases human control |
 | **Persistent restart** | Shut down gracefully and start the VM again | New `instance_id`; persistent disk and UEFI vars preserved; prior frames retired |
+| **Power button** | Click Shut Down in the console, VM list, and VM menu; cancel once, then confirm using a disposable guest that ignores ACPI | Confirmation names the VM and warns about unsaved data and filesystem corruption; cancel preserves the running instance; confirm force stops it without an ACPI request and retains persistent disks |
 | **Close Window Only** | Close the GUI window and choose **Close Window Only** | `daemon` and VM stay running; MCP continues observing; reopening GUI reconnects to the same instance |
 | **Quit Completely** | Close the GUI window and choose **Quit Completely** | Gracefully shuts down running VMs, stops `daemon`, verifies process exit, and closes the window while preserving persistent disks |
 | **Shutdown failure** | Trigger **Quit Completely** when ACPI shutdown times out | Window remains open displaying the error with options to retry, cancel, or close window only |

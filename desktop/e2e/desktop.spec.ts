@@ -142,6 +142,7 @@ test('desktop lifecycle, streaming, control, font loading and exit confirmation'
     await expect(page.getByRole('button', { name: '全屏', exact: true })).toBeVisible()
     await page.locator('.desktop-main').getByRole('button', { name: '开发环境 的操作' }).click()
     await page.getByRole('menuitem', { name: '关机', exact: true }).click()
+    await page.getByRole('dialog', { name: '强制停止虚拟机', exact: true }).getByRole('button', { name: '确认', exact: true }).click()
     await expect(page.getByRole('button', { name: '启动', exact: true })).toBeVisible({ timeout: 10_000 })
     await page.getByRole('button', { name: '启动', exact: true }).click()
     await expect(page.getByText('仅查看', { exact: true })).toBeVisible({ timeout: 20_000 })

@@ -58,6 +58,7 @@ methods.add('os_presets.list')
 methods.add('hardware.capabilities')
 methods.add('vms.settings.get')
 methods.add('vms.disk.resize')
+methods.add('vms.disk.delete')
 protocol.registerSchemesAsPrivileged([{ scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }])
 
 function run(args: string[]): Promise<string> {

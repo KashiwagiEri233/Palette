@@ -5,9 +5,10 @@ import { Label } from '@/components/ui/label'
 import { FormSelect } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog'
 import { FolderIcon } from '@/components/icons'
+import { DriveSummary } from './DriveSummary'
 import { HardwareFields, ResourceInputs } from './VmSettings'
 import { sections, displayNames, validateVmSettings, type SettingsSection } from './lib/vm-settings'
-import { archName, configurationDraft, creationPayload, creationResourceError, osNames } from './lib/os-presets'
+import { archName, configurationDraft, creationPayload, creationResourceError, osNames, sourceOptical } from './lib/os-presets'
 import type { HardwareCapabilities, OsPresetCatalog, OsPresetId, Profile, VmDraft } from '../shared/types'
 
 const errorText = (error: unknown): string => error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': Error: /, '') : String(error)
@@ -32,7 +33,6 @@ export function CreateVm({ open, source, onClose, profiles, defaultProfile, onCr
   const [capsError, setCapsError] = useState('')
   const [image, setImage] = useState<{ format: string; virtual_size: number } | null>(null)
   const [imageError, setImageError] = useState('')
-  const [isoAttached, setIsoAttached] = useState(true)
   const [leaving, setLeaving] = useState(false)
   const [pending, setPending] = useState<Choice | null>(null)
   const modified = useRef(false)
@@ -52,7 +52,7 @@ export function CreateVm({ open, source, onClose, profiles, defaultProfile, onCr
     setStep(0); setError(''); setCatalog(null); setCatalogError(''); setCaps(null); setCapsError('')
     setMode('preset')
     setArch(base?.qemu.arch ?? 'x86_64'); setEmulation(false); setAdvanced(false); setHardwareSection('display')
-    setIsoAttached(true); setLeaving(false); setPending(null); modified.current = false
+    setLeaving(false); setPending(null); modified.current = false
     let live = true
     void window.palette.request('os_presets.list').then(data => {
       if (live) { const result = data as OsPresetCatalog; setCatalog(result); setArch(result.host_arch === 'aarch64' ? 'aarch64' : 'x86_64') }
@@ -94,7 +94,7 @@ export function CreateVm({ open, source, onClose, profiles, defaultProfile, onCr
     }
     setDraft(previous => configurationDraft(nextProfile, previous, preset, nextTarget))
     setMode(choice.id === 'custom' ? 'custom' : 'preset'); setArch(nextProfile.qemu.arch)
-    setEmulation(false); setIsoAttached(true); setError(''); setPending(null); modified.current = false
+    setEmulation(false); setError(''); setPending(null); modified.current = false
   }
   function choose(choice: Choice): void { if (modified.current) setPending(choice); else apply(choice) }
   function close(): void { if (!saving) { if (draft.path || draft.name || modified.current) setLeaving(true); else onClose() } }
@@ -103,15 +103,13 @@ export function CreateVm({ open, source, onClose, profiles, defaultProfile, onCr
       const path = await window.palette.chooseFile(draft.source)
       if (!path) return
       modified.current = true; setError('')
-      setDraft(previous => ({ ...previous, path, image_format: /\.(raw|img)$/i.test(path) ? 'raw' : 'qcow2', settings: previous.settings ? { ...previous.settings, iso_path: previous.source === 'iso' ? path : previous.settings.iso_path } : undefined }))
-      if (draft.source === 'iso') setIsoAttached(true)
+      setDraft(previous => ({ ...previous, path, image_format: /\.(raw|img)$/i.test(path) ? 'raw' : 'qcow2', settings: previous.settings && previous.source === 'iso' ? sourceOptical(previous.settings, path, previous.path) : previous.settings }))
     } catch (reason) { setError(errorText(reason)) }
   }
   function changeSource(value: VmDraft['source']): void {
     if (value === draft.source) return
     modified.current = true; setError('')
-    setDraft(previous => ({ ...previous, source: value, path: '', settings: previous.settings ? { ...previous.settings, iso_path: null, boot_order: 'auto' } : undefined }))
-    setIsoAttached(true)
+    setDraft(previous => ({ ...previous, source: value, path: '', settings: previous.settings ? sourceOptical(previous.settings, null, previous.path) : undefined }))
   }
   function sourceProblem(): string | null {
     if (!draft.path) return '请选择来源文件。'
@@ -123,7 +121,7 @@ export function CreateVm({ open, source, onClose, profiles, defaultProfile, onCr
     return null
   }
   function configurationProblem(): boolean {
-    const invalid = validateVmSettings(draft, draft.settings, isoAttached)
+    const invalid = validateVmSettings(draft, draft.settings)
     const resourceError = creationResourceError(draft, caps, minimumDisk)
     const unsupported = caps?.available ? (
       !caps.displays.some(item => item.model === draft.settings?.display.model) ? '所选显卡不受支持，请在更多硬件选项中调整。' : null
@@ -147,7 +145,7 @@ export function CreateVm({ open, source, onClose, profiles, defaultProfile, onCr
     if (problem) { setStep(1); setLeaving(false); setError(problem); return }
     if (configurationProblem()) { setLeaving(false); return }
     setSaving(true); setError('')
-    try { const result = await window.palette.request('vms.create', undefined, creationPayload(draft, isoAttached)) as { vm_id: string }; await onCreated(result.vm_id) }
+    try { const result = await window.palette.request('vms.create', undefined, creationPayload(draft)) as { vm_id: string }; await onCreated(result.vm_id) }
     catch (reason) { setLeaving(false); setError(errorText(reason)) }
     finally { setSaving(false) }
   }
@@ -180,9 +178,9 @@ export function CreateVm({ open, source, onClose, profiles, defaultProfile, onCr
       <div><Label htmlFor="network">网络</Label><FormSelect id="network" value={draft.network} onValueChange={value => change('network', value as VmDraft['network'])} options={Object.entries(networkNames).map(([value, label]) => ({ value, label }))} /></div>
       {!caps && <p role="status" className="field-hint">{capsError || '正在检查硬件能力…'}</p>}
       {caps && <p className="field-hint">宿主资源：{caps.host.vcpus ?? '—'} 核 / {(caps.host.memory_mib / 1024).toFixed(1)} GiB 内存。</p>}
-      <div className="create-advanced"><Button variant="ghost" aria-expanded={advanced} onClick={() => setAdvanced(value => !value)}>{advanced ? '收起硬件选项' : '更多硬件选项'}</Button>{advanced && draft.settings && <><div className="hardware-tabs">{sections.filter(item => ['disk', 'display', 'network', 'audio'].includes(item.id)).map(item => <Button key={item.id} variant="ghost" aria-pressed={hardwareSection === item.id} onClick={() => setHardwareSection(item.id)}>{item.label}</Button>)}</div><HardwareFields section={hardwareSection} settings={draft.settings} change={settings => change('settings', settings)} caps={caps} attached={isoAttached} setAttached={setIsoAttached} draft={draft} setDraft={value => { modified.current = true; setDraft(value) }} includeMode={false} /></>}</div>
+      <div className="create-advanced"><Button variant="ghost" aria-expanded={advanced} onClick={() => setAdvanced(value => !value)}>{advanced ? '收起硬件选项' : '更多硬件选项'}</Button>{advanced && draft.settings && <><div className="hardware-tabs">{sections.filter(item => ['disk', 'display', 'network', 'audio'].includes(item.id)).map(item => <Button key={item.id} variant="ghost" aria-pressed={hardwareSection === item.id} onClick={() => setHardwareSection(item.id)}>{item.label}</Button>)}</div><HardwareFields section={hardwareSection} settings={draft.settings} change={settings => change('settings', settings)} caps={caps} draft={draft} setDraft={value => { modified.current = true; setDraft(value) }} includeMode={false} /></>}</div>
     </div>}
-    {step === 3 && <dl className="configuration-grid"><div><dt>名称</dt><dd>{draft.name}</dd></div><div><dt>系统预设</dt><dd>{osNames[draft.os_preset ?? 'custom']}</dd></div><div><dt>架构 / 加速</dt><dd>{archName(profile?.qemu.arch ?? arch)} / {profile?.qemu.accelerator}</dd></div><div><dt>CPU / 内存</dt><dd>{draft.vcpus} 核 / {draft.memory_mib / 1024} GiB</dd></div><div><dt>磁盘容量</dt><dd>{draft.disk_gib} GiB</dd></div><div><dt>网络</dt><dd>{networkNames[draft.network]}</dd></div>{draft.settings && <><div><dt>显示</dt><dd>{displayNames[draft.settings.display.model] ?? draft.settings.display.model}</dd></div><div><dt>声音</dt><dd>{draft.settings.audio_enabled ? '启用' : '关闭'}</dd></div><div><dt>启动顺序</dt><dd>{{ auto: '自动', disk: '硬盘优先', cdrom: '光盘优先' }[draft.settings.boot_order]}</dd></div></>}<div className="col-span-2"><dt>来源 · {draft.source === 'iso' ? 'ISO 安装' : '磁盘镜像'}</dt><dd className="path-value">{draft.path}</dd></div>{draft.settings?.iso_path && <div className="col-span-2"><dt>安装介质 · {isoAttached ? '已挂载' : '未挂载'}</dt><dd className="path-value">{draft.settings.iso_path}</dd></div>}</dl>}
+    {step === 3 && <dl className="configuration-grid"><div><dt>名称</dt><dd>{draft.name}</dd></div><div><dt>系统预设</dt><dd>{osNames[draft.os_preset ?? 'custom']}</dd></div><div><dt>架构 / 加速</dt><dd>{archName(profile?.qemu.arch ?? arch)} / {profile?.qemu.accelerator}</dd></div><div><dt>CPU / 内存</dt><dd>{draft.vcpus} 核 / {draft.memory_mib / 1024} GiB</dd></div><div><dt>磁盘容量</dt><dd>{draft.disk_gib} GiB</dd></div><div><dt>网络</dt><dd>{networkNames[draft.network]}</dd></div>{draft.settings && <><div><dt>显示</dt><dd>{displayNames[draft.settings.display.model] ?? draft.settings.display.model}</dd></div><div><dt>声音</dt><dd>{draft.settings.audio_enabled ? '启用' : '关闭'}</dd></div><div><dt>启动顺序</dt><dd>{{ auto: '自动', disk: '硬盘优先', cdrom: '光盘优先' }[draft.settings.boot_order]}</dd></div></>}<div className="col-span-2"><dt>来源 · {draft.source === 'iso' ? 'ISO 安装' : '磁盘镜像'}</dt><dd className="path-value">{draft.path}</dd></div><DriveSummary drives={draft.settings?.drives ?? []} /></dl>}
     {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
     <DialogFooter><Button variant="secondary" disabled={saving} onClick={() => { setError(''); if (step) setStep(step - 1); else close() }}>{step ? '上一步' : '取消'}</Button>{step < 3 ? <Button disabled={step === 0 ? !configured : step === 1 ? !draft.path || (draft.source === 'image' && !image && !imageError) : !caps && !capsError} onClick={next}>下一步</Button> : <Button disabled={saving} onClick={() => void create()}>{saving ? '创建中…' : '创建虚拟机'}</Button>}</DialogFooter>
   </DialogContent></Dialog>

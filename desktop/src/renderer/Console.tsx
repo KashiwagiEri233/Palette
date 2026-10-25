@@ -9,7 +9,7 @@ import { Play, Power, RotateCw, Monitor, AlertTriangle, MousePointer2, MoreHoriz
 import { ButtonGroup } from '@/components/ui/button-group'
 import { EmptyState } from '@/components/ui/empty-state'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
-import { IconButton } from './components/workspace-primitives'
+import { IconButton, activeVm } from './components/workspace-primitives'
 import { toast } from 'sonner'
 import type { GuestStatus } from '../shared/guest'
 
@@ -34,6 +34,10 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
   const scaleMenuOpen = useRef(false)
   const [acquiring, setAcquiring] = useState(false)
   const running = vm.status.state === 'RUNNING'
+  const shuttingDown = vm.status.state === 'STOPPING'
+  const displayActive = running || shuttingDown
+  const status = useRef(vm.status)
+  status.current = vm.status
   const [guestStatus, setGuestStatus] = useState<GuestStatus | null>(null)
   const [autoResize, setAutoResize] = useState(false)
   const autoResizeRef = useRef(false)
@@ -93,6 +97,8 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
     }
   }
 
+  useEffect(() => { if (!running) void release() }, [running])
+
   useEffect(() => {
     const syncFullscreen = (): void => setFullscreen(document.fullscreenElement === panel.current)
     const escapeFullscreen = (event: KeyboardEvent): void => {
@@ -124,8 +130,13 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
     let disposed = false
     let observer: MutationObserver | undefined
     setConnected(false); setDisplayError('')
-    if (!running || !vm.status.instance_id || !mount.current) return
+    if (!displayActive || !vm.status.instance_id || !mount.current) return
     const sync = async (): Promise<void> => {
+      if (status.current.state === 'STOPPING') {
+        const display = status.current.display
+        if (display) geometry.current = { ...display, epoch: status.current.display_epoch ?? 0 }
+        return
+      }
       const result = await window.palette.request('display.sync', vm.vm_id) as { status: VmStatus }
       const display = result.status.display
       if (display) geometry.current = { ...display, epoch: result.status.display_epoch ?? 0 }
@@ -169,7 +180,7 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
       window.removeEventListener('blur', lost); window.removeEventListener('palette-control-lost', lost)
       document.removeEventListener('visibilitychange', visibility); document.removeEventListener('fullscreenchange', fullscreen)
     }
-  }, [vm.vm_id, vm.status.instance_id, running, revision])
+  }, [vm.vm_id, vm.status.instance_id, displayActive, revision])
 
   useEffect(() => {
     const batch = window.setInterval(() => { void queue.current?.flush() }, 16)
@@ -180,7 +191,7 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
   }, [vm.vm_id])
 
   async function acquire(): Promise<void> {
-    if (acquiring || !connected) return
+    if (status.current.state !== 'RUNNING' || acquiring || !connected) return
     const attempt = ++acquisition.current
     setAcquiring(true)
     try {
@@ -231,10 +242,10 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
 
   return <section ref={panel} className="console-panel" onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) void release() }}>
     <div className="console-toolbar">
-      <div className="flex items-center gap-2"><span className={`status-dot ${connected ? 'online' : ''}`} /><span>{connected ? controlling ? '人工控制' : '仅查看' : '未连接'}</span>{onAction && <ButtonGroup aria-label="虚拟机电源操作"><IconButton label="关机" disabled={busy || !['RUNNING', 'PAUSED'].includes(vm.status.state)} onClick={() => onAction('stop')}><Power size={15} /></IconButton><IconButton label="重启" disabled={busy || !running || !vm.persistent} onClick={() => onAction('restart')}><RotateCw size={15} /></IconButton></ButtonGroup>}</div>
+      <div className="flex items-center gap-2"><span className={`status-dot ${connected ? 'online' : ''}`} /><span>{connected ? controlling ? '人工控制' : '仅查看' : '未连接'}</span>{onAction && <ButtonGroup aria-label="虚拟机电源操作"><IconButton label="关机" title="强制停止虚拟机，需确认" disabled={busy || !activeVm(vm)} onClick={() => onAction('power')}><Power size={15} /></IconButton><IconButton label="重启" disabled={busy || !running || !vm.persistent} onClick={() => onAction('restart')}><RotateCw size={15} /></IconButton></ButtonGroup>}</div>
       <div className="flex items-center gap-2">
         <label className="flex items-center gap-1 text-xs" title={guestStatus?.desktop.resize ? '接管时自动调整客户机分辨率' : '需要 virtio-gpu 和客户机会话工具'}><input type="checkbox" checked={autoResize} disabled={!guestStatus?.desktop.resize} onChange={event => { setAutoResize(event.target.checked); autoResizeRef.current = event.target.checked }} />自动分辨率</label>
-        <Button variant={controlling ? 'default' : 'secondary'} disabled={!connected || acquiring} onClick={() => controlling ? void release() : void acquire()}><PcMouseIcon className="size-4" />{acquiring ? '正在接管…' : controlling ? '结束控制' : '接管'}</Button>
+        <Button variant={controlling ? 'default' : 'secondary'} disabled={!running || !connected || acquiring} onClick={() => controlling ? void release() : void acquire()}><PcMouseIcon className="size-4" />{acquiring ? '正在接管…' : controlling ? '结束控制' : '接管'}</Button>
         <Select value={scale} items={{ fit: '适应窗口', native: '原始尺寸' }} onValueChange={value => { if (value) changeScale(value) }} onOpenChange={open => { scaleMenuOpen.current = open }}>
           <SelectTrigger aria-label="画面缩放" className="console-scale-select"><SelectValue /></SelectTrigger>
           <SelectContent container={panel} align="end">
@@ -260,7 +271,7 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
       onWheelCapture={event => { if (!lease.current) return; const horizontal = Math.abs(event.deltaX) > Math.abs(event.deltaY); const delta = horizontal ? event.deltaX : event.deltaY; if (delta) send({ type: 'wheel', direction: horizontal ? delta < 0 ? 'left' : 'right' : delta < 0 ? 'up' : 'down', steps: Math.min(8, Math.max(1, Math.round(Math.abs(delta) / 100))) }) }}>
       <div ref={mount} className="rfb-mount" />
       {controlling && <div className="human-control-label"><MousePointer2 size={14} />人工控制中<span>按 Ctrl+Alt 释放</span></div>}
-      {!connected && <EmptyState variant="plain" heading="h2" className="console-placeholder" icon={vm.status.state === 'FAILED' ? <AlertTriangle size={24} /> : <Monitor size={24} />} title={displayError || ({ STOPPED: '虚拟机已关机', STARTING: '正在启动虚拟机…', STOPPING: '正在关机…', PAUSED: '虚拟机已暂停', FAILED: '虚拟机发生故障' }[vm.status.state] ?? '正在连接画面…')} description={vm.status.last_error && `${vm.status.last_error.code}: ${vm.status.last_error.message}`} action={<>{onAction && ['STOPPED', 'FAILED'].includes(vm.status.state) && <Button size="sm" disabled={busy} onClick={() => onAction('start')}><Play size={16} />启动</Button>}{running && displayError && <Button variant="secondary" size="sm" onClick={() => setRevision(value => value + 1)}>重新连接</Button>}</>} />}
+      {!connected && !shuttingDown && <EmptyState variant="plain" heading="h2" className="console-placeholder" icon={vm.status.state === 'FAILED' ? <AlertTriangle size={24} /> : <Monitor size={24} />} title={displayError || ({ STOPPED: '虚拟机已关机', STARTING: '正在启动虚拟机…', PAUSED: '虚拟机已暂停', FAILED: '虚拟机发生故障' }[vm.status.state] ?? '正在连接画面…')} description={vm.status.last_error && `${vm.status.last_error.code}: ${vm.status.last_error.message}`} action={<>{onAction && ['STOPPED', 'FAILED'].includes(vm.status.state) && <Button size="sm" disabled={busy} onClick={() => onAction('start')}><Play size={16} />启动</Button>}{running && displayError && <Button variant="secondary" size="sm" onClick={() => setRevision(value => value + 1)}>重新连接</Button>}</>} />}
     </div>
     <div className="console-footer"><span>{geometry.current.width ? `${geometry.current.width} × ${geometry.current.height}` : '—'}</span>{controlling ? <div className="flex items-center gap-2"><Button variant="ghost" size="sm" onClick={() => chord(['ctrl', 'alt', 'delete'])}>Ctrl + Alt + Del</Button><Button variant="ghost" size="sm" onClick={() => chord(['meta_l'])}>Super</Button></div> : <span>画面仅用于查看，接管后可操作</span>}</div>
   </section>

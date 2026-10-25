@@ -52,7 +52,22 @@ async def test_settings_save_revision_and_launch(service: PaletteService, tmp_pa
     iso = tmp_path / "second.iso"
     iso.write_bytes(b"installer")
     payload.update(vcpus=2, memory_mib=1024, network="nat")
-    payload["settings"].update(iso_path=str(iso), boot_order="cdrom", audio_enabled=True)
+    payload["settings"].update(
+        drives=[
+            *data["settings"]["drives"],
+            {
+                "id": "drive-disc",
+                "media": "cdrom",
+                "path": str(iso),
+                "format": "raw",
+                "read_only": True,
+                "attached": True,
+                "size_gib": None,
+            },
+        ],
+        boot_order="cdrom",
+        audio_enabled=True,
+    )
     payload["settings"]["display"].update(default_resolution=True, width=1920, height=1080)
     payload["settings"]["network"].update(
         model="virtio-net-pci",
@@ -66,7 +81,11 @@ async def test_settings_save_revision_and_launch(service: PaletteService, tmp_pa
         await desktop.update(vm_id, payload)
     assert stale.value.code == ErrorCode.STATE_CONFLICT
     restored = DesktopManager(service)
-    assert (await restored.get_settings(vm_id))["settings"] == payload["settings"]
+    from palette.vm_settings import HardwareSettings
+
+    assert (await restored.get_settings(vm_id))["settings"] == HardwareSettings.model_validate(
+        payload["settings"]
+    ).model_dump()
     await restored.start(vm_id)
     instance = service.manager.get(vm_id)
     assert instance.plan is not None

@@ -319,9 +319,14 @@ class QemuGuestAgent:
             return {}
 
     async def close_files(self) -> None:
-        for token in list(self.transfers):
-            with contextlib.suppress(PaletteError):
-                await self.file_close(token)
+        try:
+            # Revoking control must also be bounded while another transfer owns the lock.
+            async with asyncio.timeout(self.timeout):
+                for token in list(self.transfers):
+                    with contextlib.suppress(PaletteError):
+                        await self.file_close(token)
+        except TimeoutError:
+            self.invalidate()
 
     async def close(self) -> None:
         self.invalidate()

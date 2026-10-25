@@ -64,10 +64,29 @@ class DriveSettings(SettingsModel):
     format: Literal["raw", "qcow2"] = "raw"
     read_only: bool = True
     attached: bool = True
+    size_gib: int | None = Field(default=None, ge=1, le=4096)
+    interface: Literal["virtio", "ide", "scsi", "nvme", "usb"] | None = None
+    import_copy: bool = False
 
     @model_validator(mode="after")
     def valid_media(self) -> DriveSettings:
-        if self.media == "disk" and not self.path:
+        if self.size_gib is not None:
+            if self.media != "disk" or self.path is not None:
+                raise ValueError("空白磁盘不能指定外部镜像或光驱类型")
+            if "format" not in self.model_fields_set:
+                self.format = "qcow2"
+            if "read_only" not in self.model_fields_set:
+                self.read_only = False
+        if self.import_copy and (self.media != "disk" or not self.path):
+            raise ValueError("导入磁盘需要源镜像文件")
+        if self.import_copy:
+            if "format" not in self.model_fields_set:
+                self.format = "qcow2"
+            if "read_only" not in self.model_fields_set:
+                self.read_only = False
+        if self.media == "cdrom" and self.interface in {"virtio", "nvme"}:
+            raise ValueError("此接口不支持光驱")
+        if self.media == "disk" and not self.path and self.size_gib is None:
             raise ValueError("附加磁盘需要选择镜像文件")
         if self.media == "cdrom" and (self.format != "raw" or not self.read_only):
             raise ValueError("光驱只支持只读 ISO")
@@ -80,7 +99,8 @@ class HardwareSettings(SettingsModel):
     audio_enabled: bool = False
     iso_path: str | None = Field(default=None, min_length=1, max_length=4096)
     boot_order: Literal["auto", "disk", "cdrom"] = "auto"
-    drives: list[DriveSettings] = Field(default_factory=list, max_length=8)
+    boot_drive_id: str | None = Field(default=None, pattern=r"^drive-[a-z0-9_-]{1,16}$")
+    drives: list[DriveSettings] = Field(default_factory=list, max_length=9)
 
     @model_validator(mode="after")
     def unique_drives(self) -> HardwareSettings:
@@ -99,8 +119,23 @@ def settings_from_profile(profile: Profile, iso_path: str | None = None) -> Hard
         ),
         network=NetworkSettings(model=profile.network.model, mac=profile.network.mac),
         audio_enabled=profile.audio.enabled,
-        iso_path=iso_path,
+        drives=[DriveSettings(id="drive-optical1", media="cdrom", path=iso_path)]
+        if iso_path
+        else [],
     )
+
+
+def normalize_optical(settings: HardwareSettings, *, attached: bool = True) -> HardwareSettings:
+    """Migrate persisted single-ISO settings into the ordinary drive list."""
+    if not settings.iso_path:
+        return settings
+    index = 1
+    while f"drive-optical{index}" in {drive.id for drive in settings.drives}:
+        index += 1
+    drive = DriveSettings(
+        id=f"drive-optical{index}", media="cdrom", path=settings.iso_path, attached=attached
+    )
+    return settings.model_copy(update={"iso_path": None, "drives": [drive, *settings.drives]})
 
 
 def apply_settings(profile: Profile, settings: HardwareSettings) -> Profile:
@@ -125,7 +160,13 @@ class CapabilityProbe:
         binary = locate_binary(profile, self.host)
         if binary is None:
             return self._empty("未找到 QEMU; 请先配置运行环境")
-        key = (binary, *profile.qemu.argv_prefix, profile.qemu.arch, profile.devices.display_model)
+        key = (
+            binary,
+            *profile.qemu.argv_prefix,
+            profile.qemu.arch,
+            profile.qemu.machine,
+            profile.devices.display_model,
+        )
         if key in self.cache:
             return self.cache[key]
         task = self._pending.get(key)
@@ -158,6 +199,7 @@ class CapabilityProbe:
             "reason": reason,
             "displays": [],
             "network_models": [],
+            "drive_interfaces": {"disk": [], "cdrom": []},
             "audio_backend": None,
             "audio_available": False,
             "host": {"vcpus": os.cpu_count(), "memory_mib": psutil.virtual_memory().total // 2**20},
@@ -213,6 +255,26 @@ class CapabilityProbe:
                 ],
                 audio_backend=backend,
                 audio_available=backend is not None and {"intel-hda", "hda-output"} <= names,
+                drive_interfaces={
+                    media: [
+                        interface
+                        for interface, devices in {
+                            "virtio": {"virtio-blk-pci"} if media == "disk" else set(),
+                            "ide": {"ide-hd" if media == "disk" else "ide-cd"}
+                            if profile.qemu.arch == "x86_64"
+                            and profile.qemu.machine.split(",")[0].startswith(("q35", "pc"))
+                            else set(),
+                            "scsi": {
+                                "virtio-scsi-pci",
+                                "scsi-hd" if media == "disk" else "scsi-cd",
+                            },
+                            "nvme": {"nvme"} if media == "disk" else set(),
+                            "usb": {"usb-bot", "scsi-hd" if media == "disk" else "scsi-cd"},
+                        }.items()
+                        if devices and devices <= names
+                    ]
+                    for media in ("disk", "cdrom")
+                },
             )
             return result
         except (OSError, TimeoutError, PaletteError):
@@ -226,6 +288,19 @@ async def validate_hardware(
     previous: HardwareSettings | None = None,
 ) -> dict[str, Any]:
     caps = await probe.get(profile)
+    old_drives = {drive.id: drive for drive in previous.drives} if previous else {}
+    ide_count = sum(drive.interface == "ide" for drive in settings.drives)
+    if ide_count > (6 if profile.qemu.machine.split(",")[0].startswith(("q35", "pc-q35")) else 4):
+        raise PaletteError(ErrorCode.INVALID_ARGUMENT, "IDE 驱动器数量超过当前机器限制")
+    for drive in settings.drives:
+        interface = drive.interface or ("usb" if drive.media == "cdrom" else "virtio")
+        old = old_drives.get(drive.id)
+        if (
+            old is None or (old.interface, old.media) != (drive.interface, drive.media)
+        ) and interface not in caps["drive_interfaces"][drive.media]:
+            raise PaletteError(
+                ErrorCode.UNSUPPORTED_CAPABILITY, "所选磁盘接口不受当前 QEMU 或机器类型支持"
+            )
     if previous is None or settings.display != previous.display:
         display = next(
             (item for item in caps["displays"] if item["model"] == settings.display.model), None

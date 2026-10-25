@@ -66,11 +66,11 @@ async def test_cold_mount_persists_without_starting_and_eject_preserves_install_
     restored = DesktopManager(service)
     assert restored.get(vm_id).tools_iso_sha256
     assert restored.get(vm_id).draft.path == str(installer)
-    assert restored.get(vm_id).iso_attached
+    assert restored.settings(restored.get(vm_id)).drives[0].attached
     result = await change_tools_media(restored, vm_id, {"revision": 1}, mount=False)
     assert not result["attached"]
     assert restored.get(vm_id).tools_iso_sha256 is None
-    assert restored.get(vm_id).iso_attached
+    assert restored.settings(restored.get(vm_id)).drives[0].attached
 
 
 async def test_live_mount_and_eject_touch_only_tools_drive(service, tools_iso, tmp_path):
@@ -92,8 +92,10 @@ async def test_live_mount_and_eject_touch_only_tools_drive(service, tools_iso, t
     assert not any(item["command"] in {"eject", "blockdev-change-medium"} for item in records)
     mounted = await instance.qmp.execute("query-block")
     assert [item for item in mounted if "palette-tools-cd" not in item["qdev"]] == original
-    assert instance.overrides.volumes[0].path == str(installer)
-    assert desktop.get(vm_id).iso_attached
+    assert next(
+        drive for drive in instance.overrides.volumes if drive.media == "cdrom"
+    ).path == str(installer)
+    assert desktop.settings(desktop.get(vm_id)).drives[0].attached
     await change_tools_media(
         desktop, vm_id, {**request, "revision": result["revision"]}, mount=False
     )

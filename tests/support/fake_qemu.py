@@ -222,6 +222,7 @@ class FakeQemu:
 
     # -- configuration ---------------------------------------------------------------
     def _find_overlay_path(self) -> str | None:
+        first = None
         for index, arg in enumerate(self.argv):
             if arg == "-blockdev" and index + 1 < len(self.argv):
                 try:
@@ -230,8 +231,11 @@ class FakeQemu:
                     continue
                 filename = node.get("filename")
                 if filename:
-                    return str(filename)
-        return None
+                    if node.get("node-name") == "drive-primary-file":
+                        return str(filename)
+                    if first is None:
+                        first = str(filename)
+        return first
 
     def behavior(self) -> dict:
         if not self.behavior_path or not os.path.isfile(self.behavior_path):
@@ -422,7 +426,7 @@ class FakeQemu:
         elif command == "system_powerdown":
             self.reply(message_id, {})
             self.send_event("POWERDOWN")
-            if self.behavior().get("ignore_powerdown"):
+            if self.paused or self.behavior().get("ignore_powerdown"):
                 # A guest that does not shut down: the manager must fall through to the
                 # forced path rather than waiting forever or claiming success.
                 return
@@ -579,6 +583,13 @@ def main(argv: list[str]) -> int:
             "rtl8139",
             "intel-hda",
             "hda-output",
+            "usb-bot",
+            "scsi-cd",
+            "scsi-hd",
+            "virtio-scsi-pci",
+            "ide-hd",
+            "ide-cd",
+            "nvme",
         ):
             print(f'name "{name}"')
         return 0

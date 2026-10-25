@@ -83,6 +83,7 @@ class DesktopCommand(StrictModel):
         "vms.update",
         "vms.settings.get",
         "vms.disk.resize",
+        "vms.disk.delete",
         "hardware.capabilities",
         "vms.start",
         "vms.stop",
