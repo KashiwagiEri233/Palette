@@ -42,6 +42,7 @@ from .operator.unix import UnixChannel
 from .service import PaletteService
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_AGENT_JSON_BYTES = 1 << 20
 
 
 class AgentCommand(StrictModel):
@@ -122,7 +123,7 @@ class AgentServer:
                 )
                 image = b""
             async with asyncio.timeout(10):
-                await send_frame(channel, response)
+                await send_frame(channel, response, max_bytes=MAX_AGENT_JSON_BYTES)
                 await channel.write(struct.pack(">I", len(image)) + image)
         except (
             OSError,
@@ -279,7 +280,11 @@ class RemoteService:
             await send_frame(channel, request)
             response = AgentResponse.model_validate(
                 decode_json(
-                    await receive_frame(channel, timeout=endpoint.operation_timeout_seconds)
+                    await receive_frame(
+                        channel,
+                        timeout=endpoint.operation_timeout_seconds,
+                        max_bytes=MAX_AGENT_JSON_BYTES,
+                    )
                 )
             )
             if (
@@ -455,6 +460,7 @@ class RemoteService:
         request_id: str,
         operation: str,
         parameters: dict[str, Any],
+        frame_id: str | None = None,
     ) -> tuple[GuestToolResult, bytes | None]:
         data, image = await self._call(
             "guest_enhancement",
@@ -465,6 +471,7 @@ class RemoteService:
                 "request_id": request_id,
                 "operation": operation,
                 "parameters": parameters,
+                **({"frame_id": frame_id} if frame_id is not None else {}),
             },
         )
         return GuestToolResult.model_validate(data), image

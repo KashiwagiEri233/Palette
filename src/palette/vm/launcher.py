@@ -431,6 +431,7 @@ class LaunchPlan:
     max_runtime_seconds: float | None = None
     host_path_config: bytes | None = None
     guest_agent_endpoint: str | None = None
+    guest_tools_endpoint: str | None = None
     webdav_endpoint: str | None = None
     session_endpoint: str | None = None
     clipboard_enabled: bool = False
@@ -632,6 +633,7 @@ def build_launch_plan(
     endpoints: dict[str, str] = {}
     if (
         profile.guest_agent.enabled
+        or profile.guest_tools.enabled
         or clipboard_enabled
         or profile.guest_desktop.shared_folders
         or profile.guest_desktop.resize
@@ -639,6 +641,7 @@ def build_launch_plan(
         argv += ["-device", "virtio-serial-pci,id=palette-serial"]
     for key, enabled, port in (
         ("qga", profile.guest_agent.enabled, "org.qemu.guest_agent.0"),
+        ("tools", profile.guest_tools.enabled, "org.palette.tools.0"),
         ("webdav", profile.guest_desktop.shared_folders, "org.spice-space.webdav.0"),
         ("session", profile.guest_desktop.resize, "org.palette.desktop.0"),
     ):
@@ -802,6 +805,7 @@ def build_launch_plan(
             "\n".join(config_sections).encode(locale.getencoding()) if config_sections else None
         ),
         guest_agent_endpoint=endpoints.get("qga"),
+        guest_tools_endpoint=endpoints.get("tools"),
         webdav_endpoint=endpoints.get("webdav"),
         session_endpoint=endpoints.get("session"),
         clipboard_enabled=clipboard_enabled,

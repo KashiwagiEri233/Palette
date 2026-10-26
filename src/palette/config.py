@@ -279,16 +279,27 @@ class LifecyclePolicy(_Strict):
 class GuestToolsConfig(_Strict):
     """The in-guest enhancement channel.
 
-    Enabled by default, with both registered capabilities granted, because the point of the
+    Enabled by default, with registered capabilities granted, because the point of the
     channel is to be usable. It still delivers nothing until a guest-side service answers
     the handshake: `vm_status` reports the two online states separately, and a call against
     a guest with no service fails as unavailable rather than falling back to keystrokes.
     """
 
     enabled: bool = True
-    protocol_version: str = "1.0"
+    protocol_version: str = "1.1"
     capabilities: list[str] = Field(
-        default_factory=lambda: ["guest.input_text", "guest.launch_app"],
+        default_factory=lambda: [
+            "guest.input_text",
+            "guest.launch_app",
+            "guest.filesystem",
+            "guest.powershell",
+            "guest.process",
+            "guest.registry",
+            "guest.app",
+            "guest.snapshot",
+            "guest.batch",
+            "guest.clipboard",
+        ],
         description="Registered capabilities to request; the guest must also offer them",
     )
     input_methods: list[str] = Field(
@@ -305,9 +316,13 @@ class GuestToolsConfig(_Strict):
     def _consistency(self) -> GuestToolsConfig:
         if self.enabled and not self.capabilities:
             raise ValueError("seeding guest_tools without a capability list is meaningless")
-        unknown = set(self.capabilities) - {"guest.input_text", "guest.launch_app"}
+        from .guest_tools.protocol import SUPPORTED_VERSIONS, Capability
+
+        unknown = set(self.capabilities) - set(Capability)
         if unknown:
             raise ValueError(f"unregistered guest capability: {sorted(unknown)}")
+        if self.protocol_version not in SUPPORTED_VERSIONS:
+            raise ValueError(f"unsupported guest protocol version: {self.protocol_version}")
         return self
 
 

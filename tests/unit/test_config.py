@@ -85,7 +85,18 @@ class TestLoading:
         assert profile.network.attaches_nic is True
         assert profile.qemu.allow_accelerator_fallback is False  # still refuses to degrade
         assert profile.guest_tools.enabled is True
-        assert profile.guest_tools.capabilities == ["guest.input_text", "guest.launch_app"]
+        assert set(profile.guest_tools.capabilities) == {
+            "guest.input_text",
+            "guest.launch_app",
+            "guest.filesystem",
+            "guest.powershell",
+            "guest.process",
+            "guest.registry",
+            "guest.app",
+            "guest.snapshot",
+            "guest.batch",
+            "guest.clipboard",
+        }
         assert profile.lifecycle.allow_agent_start is True
         assert profile.lifecycle.allow_agent_images is True
         assert profile.lifecycle.allow_agent_qemu_args is True

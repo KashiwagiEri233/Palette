@@ -172,20 +172,24 @@ def decode_json(data: bytes) -> dict[str, Any]:
     return result
 
 
-async def receive_frame(channel: Channel, *, timeout: float = FRAME_TIMEOUT) -> bytes:
+async def receive_frame(
+    channel: Channel, *, timeout: float = FRAME_TIMEOUT, max_bytes: int = MAX_FRAME_BYTES
+) -> bytes:
     # One deadline covers header and body, including a peer trickling partial bytes.
     async with asyncio.timeout(timeout):
         (size,) = _HEADER.unpack(await channel.readexactly(_HEADER.size))
-        if not 0 < size <= MAX_FRAME_BYTES:
+        if not 0 < size <= max_bytes:
             raise PaletteError(ErrorCode.INVALID_ARGUMENT, "invalid operator message length")
         return await channel.readexactly(size)
 
 
-async def send_frame(channel: Channel, payload: BaseModel) -> None:
+async def send_frame(
+    channel: Channel, payload: BaseModel, *, max_bytes: int = MAX_FRAME_BYTES
+) -> None:
     body = json.dumps(
-        payload.model_dump(mode="json"), allow_nan=False, separators=(",", ":")
+        payload.model_dump(mode="json"), allow_nan=False, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
-    if not 0 < len(body) <= MAX_FRAME_BYTES:
+    if not 0 < len(body) <= max_bytes:
         raise PaletteError(ErrorCode.INVALID_ARGUMENT, "operator message exceeds its size limit")
     async with asyncio.timeout(FRAME_TIMEOUT):
         await channel.write(_HEADER.pack(len(body)) + body)

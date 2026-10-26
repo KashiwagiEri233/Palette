@@ -24,6 +24,11 @@ Palette must expose the QGA and SPICE virtio channels in the VM's host Profile.
 The signed VirtIO serial driver lets the services connect through those channels.
 After boot/login, Palette checks responses rather than assuming installation.
 Clipboard/Unicode paste and QGA file transfer are available when services respond.
-Windows automatic resolution is not implemented by this media. No custom Palette
-Shell service, remote command runner, TPM changes or Windows setup bypasses are
-installed. WebDAV shares contain only folders explicitly exported by the host.
+The disc also compiles Palette.Agent.cs, Palette.Native.cs and Palette.Operations.cs
+with the Windows inbox .NET Framework compiler. PaletteGuestTools runs a transport-only
+SYSTEM service; file/system/App/UIA/clipboard operations run in the active console
+user's ordinary process. No automatic UAC elevation is performed for operations.
+Native Unicode input and coordinate/label batch tools use org.palette.tools.0.
+Run Install.cmd -Uninstall to remove only this Palette service and helper files.
+Windows automatic resolution, TPM changes and setup bypasses are not provided.
+WebDAV shares contain only folders explicitly exported by the host.

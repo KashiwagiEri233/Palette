@@ -2,7 +2,7 @@
 
 **English** | [简体中文](user-guide.zh-CN.md)
 
-**Palette** gives a visual agent an observable, operable, resettable QEMU virtual desktop. You call MCP tools; Palette drives an isolated guest VM and returns PNG screenshots alongside structured receipts. It never touches the host desktop and never exposes raw QMP, HMP, or a guest shell.
+**Palette** gives a visual agent an observable, operable, resettable QEMU virtual desktop. You call MCP tools; Palette drives a guest VM and returns PNG screenshots alongside structured receipts. It never touches the host desktop or exposes raw QMP/HMP. Optional Windows enhancement tools include a guest-only PowerShell under the logged-in user's rights; see [guest enhancements](guest-enhancements.md).
 
 ## 1. The Core Visual Loop
 

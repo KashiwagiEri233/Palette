@@ -39,6 +39,7 @@ from ..guest_tools.base import GuestToolOutcome
 from ..models import (
     Action,
     ActionSource,
+    ClickAction,
     EffectState,
     ErrorPayload,
     Frame,
@@ -140,6 +141,7 @@ class ActionController:
         self._frames = FrameRegistry()
         self._dedupe = RequestDeduplicator()
         self._generation = 0
+        self._guest_snapshots: dict[str, tuple[str, dict[str, int]]] = {}
         self._last_capture_at: float = 0.0
         self.mutation_guard: Callable[[], None] | None = None
         self._shutdown_task: asyncio.Task[ReleaseResult | None] | None = None
@@ -185,6 +187,7 @@ class ActionController:
     def invalidate(self, *, reason: str) -> None:
         """Fence in-flight captures and cancel old work before yielding to the event loop."""
         self._generation += 1
+        self._guest_snapshots.clear()
         self._frames.clear(reason=reason)
         error = PaletteError(ErrorCode.STALE_FRAME, reason, retryable=False)
         self.scheduler.cancel_all(error)
@@ -375,6 +378,7 @@ class ActionController:
         parameters: dict[str, Any],
         runner: Callable[[Callable[[], None]], Awaitable[GuestToolOutcome]],
         capture_after: bool = True,
+        failure_outcome: Callable[[PaletteError], GuestToolOutcome] | None = None,
     ) -> tuple[GuestToolResult, bytes | None]:
         """Run and retain guest receipts using the same queue and identity as visual input."""
         identity = self._identity()
@@ -382,13 +386,15 @@ class ActionController:
 
         def failure(error: PaletteError) -> tuple[GuestToolResult, None]:
             self._record_guest(label, None, error.code)
+            failed = failure_outcome(error) if failure_outcome is not None else None
             return GuestToolResult(
                 ok=False,
                 error=ErrorPayload(**error.as_payload()),
-                effect_state=progress.effect,
+                effect_state=failed.effect_state if failed is not None else progress.effect,
                 request_id=request_id,
                 action_seq=progress.sequence,
                 detail=error.message,
+                data=failed.data if failed is not None else {},
             ), None
 
         async def _job() -> tuple[GuestToolResult, bytes | None]:
@@ -464,6 +470,215 @@ class ActionController:
         if code is not None:
             payload["error_code"] = str(code)
         self._audit.record("guest.operation", **payload)
+
+    def remember_guest_snapshot(self, result: GuestToolResult) -> None:
+        """Bind guest labels to the actual QEMU image and its coordinate transform."""
+        snapshot_id = result.data.get("snapshot_id")
+        bounds = result.data.get("virtual_screen")
+        frame = result.frame
+        if not result.ok or frame is None or not isinstance(snapshot_id, str):
+            return
+        if not isinstance(bounds, dict):
+            result.data["labels_usable"] = False
+            return
+        valid = all(type(bounds.get(key)) is int for key in ("left", "top", "width", "height"))
+        if not valid:
+            result.data["labels_usable"] = False
+            return
+        if (bounds["width"], bounds["height"]) != (
+            frame.native_size.width,
+            frame.native_size.height,
+        ):
+            result.data["labels_usable"] = False
+            result.data["label_note"] = "Guest desktop bounds do not match this QEMU display head"
+            return
+        self._guest_snapshots[snapshot_id] = (frame.frame_id, dict(bounds))
+        while len(self._guest_snapshots) > 8:
+            self._guest_snapshots.pop(next(iter(self._guest_snapshots)))
+        result.data["labels_usable"] = True
+        result.data["frame_id"] = frame.frame_id
+        result.data["coordinate_space"] = (
+            "UIA bounds are native guest pixels; locs use returned image pixels"
+        )
+
+    async def run_guest_batch(
+        self,
+        *,
+        operation: str,
+        request_id: str,
+        frame_id: str,
+        parameters: dict[str, Any],
+        resolve: Callable[[str, list[int]], Awaitable[list[list[int]]]],
+        write_text: Callable[[str, Callable[[], None]], Awaitable[GuestToolOutcome]],
+        validate: Callable[[], None],
+        prepare: Callable[[], Awaitable[None]],
+    ) -> tuple[GuestToolResult, bytes | None]:
+        """One queued transaction, with QMP inputs retained in the shared input ledger."""
+        completed = 0
+        sent = False
+        in_flight = False
+        finished = False
+        editing = operation == "multi_edit"
+        entries = parameters.get("locs") or parameters.get("labels") or []
+
+        def failed(error: PaletteError) -> GuestToolOutcome:
+            effect = (
+                EffectState.SUBMITTED
+                if finished
+                else EffectState.UNKNOWN
+                if in_flight
+                else EffectState.PARTIAL
+                if sent
+                else EffectState.NOT_SENT
+            )
+            return GuestToolOutcome(
+                ok=False,
+                effect_state=effect,
+                error=error,
+                data={"completed": completed, "total": len(entries)},
+            )
+
+        async def runner(on_sending: Callable[[], None]) -> GuestToolOutcome:
+            nonlocal completed, sent, in_flight, finished
+            validate()
+            await prepare()
+            frame = self._frames.get(frame_id)
+            transform = self._validate_frame_for_action(frame)
+            labels: list[int] | None = None
+            snapshot_id = str(parameters.get("snapshot_id") or "")
+            bounds: dict[str, int] | None = None
+            if parameters.get("labels") is not None:
+                binding = self._guest_snapshots.get(snapshot_id)
+                if binding is None or binding[0] != frame_id:
+                    raise PaletteError(
+                        ErrorCode.STALE_FRAME, "labels require their original snapshot frame"
+                    )
+                bounds = binding[1]
+                labels = [entry[0] if editing else entry for entry in entries]
+                # Labels have exact native centers, even when the image was downscaled.
+                # Do not quantize them through the smaller screenshot pixel grid.
+                transform = CoordinateTransform.full(frame.native_size, frame.native_size)
+
+            def image_point(point: list[int]) -> tuple[int, int]:
+                if len(point) != 2 or any(type(value) is not int for value in point):
+                    raise PaletteError(
+                        ErrorCode.INVALID_COORDINATES, "invalid guest element coordinates"
+                    )
+                x, y = point
+                if bounds is not None:
+                    x, y = x - bounds["left"], y - bounds["top"]
+                    if (
+                        not 0 <= x < frame.native_size.width
+                        or not 0 <= y < frame.native_size.height
+                    ):
+                        raise PaletteError(
+                            ErrorCode.INVALID_COORDINATES, "element is outside the display"
+                        )
+                transform.validate(x, y)
+                return x, y
+
+            raw_points = (
+                await resolve(snapshot_id, labels)
+                if labels is not None
+                else [entry[:2] for entry in entries]
+            )
+            if len(raw_points) != len(entries):
+                raise PaletteError(
+                    ErrorCode.INVALID_ARGUMENT, "guest returned an incomplete label mapping"
+                )
+            points = [image_point(point) for point in raw_points]
+
+            def sending() -> None:
+                nonlocal sent, in_flight
+                sent = in_flight = True
+                on_sending()
+
+            async def send(events: list[dict[str, Any]], delay: int = 0) -> None:
+                nonlocal in_flight
+                validate()
+                self._check_mutation()
+                self._check_frame_authority(frame)
+                self._ledger.note_presses(events)
+                await self._send_events(
+                    events, timeout=self.profile.timeouts.qmp_command_seconds, on_sending=sending
+                )
+                self._ledger.note_releases(events)
+                in_flight = False
+                if delay:
+                    await asyncio.sleep(delay / 1000)
+
+            async def action(value: Action) -> None:
+                for events, delay in self._planner.batches(value, transform):
+                    await send(events, delay)
+
+            error: PaletteError | None = None
+            try:
+                async with asyncio.timeout(self.profile.guest_tools.request_timeout_seconds):
+                    if not editing and parameters.get("press_ctrl", True):
+                        await send([key_event("ctrl", True)])
+                    for index, point in enumerate(points):
+                        validate()
+                        await self._ensure_size_is_current()
+                        self._check_frame_authority(frame)
+                        if labels is not None:
+                            resolved = await resolve(snapshot_id, [labels[index]])
+                            if len(resolved) != 1 or image_point(resolved[0]) != point:
+                                raise PaletteError(
+                                    ErrorCode.STALE_FRAME,
+                                    "batch target moved; capture a new snapshot",
+                                )
+                        await action(ClickAction(type="click", x=point[0], y=point[1]))
+                        if editing:
+                            if parameters.get("clear", True):
+                                await action(KeyAction(type="key", keys=["CTRL", "A"]))
+                                await action(KeyAction(type="key", keys=["BACKSPACE"]))
+                            text = entries[index][-1]
+                            if text:
+                                result = await write_text(text, sending)
+                                in_flight = result.effect_state == EffectState.UNKNOWN
+                                if (
+                                    not result.ok
+                                    or result.effect_state is not EffectState.SUBMITTED
+                                ):
+                                    raise result.error or PaletteError(
+                                        ErrorCode.GUEST_TOOL_UNAVAILABLE, "guest text input failed"
+                                    )
+                        completed += 1
+                    if not editing and parameters.get("press_ctrl", True):
+                        await send([key_event("ctrl", False)])
+                    finished = True
+            except TimeoutError:
+                error = PaletteError(ErrorCode.TIMEOUT, "batch deadline exceeded", retryable=False)
+            except PaletteError as exc:
+                error = exc
+            finally:
+                await self._bounded_release()
+                if not self._ledger.is_clean:
+                    in_flight = True
+                    finished = False
+                    error = PaletteError(
+                        ErrorCode.ACTION_OUTCOME_UNKNOWN, "input release was not confirmed"
+                    )
+            if error is not None:
+                return failed(error)
+            if not finished:
+                return failed(
+                    PaletteError(
+                        ErrorCode.ACTION_OUTCOME_UNKNOWN, "input release was not confirmed"
+                    )
+                )
+            return GuestToolOutcome(
+                ok=True, method=operation, data={"completed": completed, "total": len(entries)}
+            )
+
+        return await self.run_guest_operation(
+            label="guest." + operation,
+            request_id=request_id,
+            frame_id=frame_id,
+            parameters=parameters,
+            runner=runner,
+            failure_outcome=failed,
+        )
 
     async def paste_guest_clipboard(self) -> None:
         """Send Ctrl+V within an already scheduled guest operation, using its ledger."""

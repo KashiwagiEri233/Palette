@@ -112,7 +112,7 @@ it('runs the real SDK through VM tools, persists history and reopens its tree', 
     expect(result.view.contextUsage).toMatchObject({ tokens: 2176, contextWindow: 128000 })
     expect(result.view.contextUsage!.percent).toBeCloseTo(1.7)
     const names = ((test.requests[0].tools ?? []) as { function: { name: string } }[]).map(tool => tool.function.name)
-    expect(names.sort()).toEqual(['act', 'clipboard_get', 'clipboard_set', 'display_resize', 'file_close', 'file_open', 'file_read', 'file_write', 'input_text', 'observe', 'release_inputs', 'status', 'sync_time', 'wait'])
+    expect(names.sort()).toEqual(['act', 'app', 'clipboard_get', 'clipboard_set', 'display_resize', 'file_close', 'file_open', 'file_read', 'file_write', 'filesystem', 'input_text', 'multi_edit', 'multi_select', 'observe', 'powershell', 'process', 'registry', 'release_inputs', 'snapshot', 'status', 'sync_time', 'wait'])
     expect(JSON.stringify(result)).not.toContain('test-secret')
     const directory = join(test.service.directory, 'sessions', test.id)
     const files = (await readdir(directory)).filter(file => file.endsWith('.jsonl'))
@@ -377,6 +377,91 @@ it('stops the SDK after an unknown enhancement result without issuing the next w
     const result = await settled(test.service, test.id)
     expect(result.view.run?.state).toBe('cancelled')
     expect(test.client.calls.filter(method => method === 'guest_enhancement')).toHaveLength(1)
+    expect(test.client.calls.at(-1)).toBe('driver_release')
+  } finally { await test.close() }
+}, 20000)
+
+it('runs Windows management and batch tools through the bound guest claim with frame identity outside parameters', async () => {
+  const test = await environment()
+  const identity = { instance_id: 'instance', boot_epoch: 1 }
+  const steps = [
+    { name: 'filesystem', parameters: { mode: 'write', path: 'C:\\Users\\Guest\\中文.txt', content: '第一行\n第二行 😀', append: true, encoding: 'utf-8' } },
+    { name: 'filesystem', parameters: { mode: 'search', path: 'C:\\Users\\Guest', recursive: true, pattern: '*.txt', offset: 20, limit: 10 } },
+    { name: 'powershell', parameters: { command: 'Get-Location', cwd: 'C:\\Users\\Guest', timeout_seconds: 45 } },
+    { name: 'process', parameters: { mode: 'list', name: 'notepad', sort_by: 'memory', limit: 10 } },
+    { name: 'process', parameters: { mode: 'kill', pid: 321, force: false } },
+    { name: 'registry', parameters: { mode: 'set', path: 'HKCU:\\Software\\Palette', name: 'Names', value: ['中文', 'Guest'], type: 'MultiString' } },
+    { name: 'registry', parameters: { mode: 'set', path: 'HKCU:\\Software\\Palette', name: 'Bytes', value: [0, 128, 255], type: 'Binary' } },
+    { name: 'app', parameters: { mode: 'launch_executable', executable: 'C:\\Windows\\System32\\notepad.exe', args: ['C:\\Users\\Guest\\中文.txt'], cwd: 'C:\\Users\\Guest' } },
+    { name: 'app', parameters: { mode: 'resize', window_id: 'window-1', window_loc: [-10, 20], window_size: [800, 600] } },
+    { name: 'snapshot', parameters: { max_elements: 250 } },
+    { name: 'multi_select', parameters: { snapshot_id: 'snapshot-1', labels: [1, 2], press_ctrl: true }, frame_id: 'frame' },
+    { name: 'multi_select', parameters: { locs: [[10, 20], [30, 40]], press_ctrl: false }, frame_id: 'frame-2' },
+    { name: 'multi_edit', parameters: { snapshot_id: 'snapshot-2', labels: [[3, '字段 😀']], clear: true }, frame_id: 'frame-3' },
+    { name: 'multi_edit', parameters: { locs: [[100, 200, '中文\n多行']], clear: false }, frame_id: 'frame-4' }
+  ]
+  try {
+    const settings = await test.service.settings()
+    expect(settings.guestProgramming).toMatchObject({ availability: 'per_vm' })
+    expect(settings.guestProgramming.reason).toContain('虚拟机状态')
+    test.script(steps.map(step => ({ name: step.name, arguments: { ...identity, ...step.parameters, ...(step.frame_id ? { frame_id: step.frame_id } : {}) } })))
+    await test.service.start('vm', test.id, 'Windows enhancement task', randomUUID())
+    const result = await settled(test.service, test.id)
+    expect(result.view.run?.state).toBe('completed')
+    const requests = test.client.requests.filter(request => request.method === 'guest_enhancement')
+    expect(requests).toHaveLength(steps.length)
+    for (const [index, request] of requests.entries()) {
+      const step = steps[index]
+      expect(request.claim).toBe('a'.repeat(48))
+      expect(request.parameters).toEqual({ ...identity, operation: step.name, parameters: step.parameters, request_id: expect.stringMatching(/^[a-f0-9]{32}$/), ...(step.frame_id ? { frame_id: step.frame_id } : {}) })
+      expect(request.parameters.parameters).not.toHaveProperty('frame_id')
+    }
+    expect(new Set(requests.map(request => request.parameters.request_id)).size).toBe(steps.length)
+    const messages = test.requests[0].messages as { role: string; content: unknown }[]
+    const instructions = JSON.stringify(messages.filter(message => message.role === 'system'))
+    expect(instructions).toContain('You have no host filesystem or shell tools')
+    expect(instructions).toContain('Windows enhancement tools')
+    expect(instructions).not.toContain('Guest shell and edit tools are unavailable')
+    expect(test.client.calls.at(-1)).toBe('driver_release')
+  } finally { await test.close() }
+}, 30000)
+
+it('rejects invalid Windows tool arguments in the real SDK before sending any guest operation', async () => {
+  const test = await environment()
+  const identity = { instance_id: 'instance', boot_epoch: 1 }
+  try {
+    test.script([
+      { name: 'powershell', arguments: { ...identity, command: 'Get-Process', timeout_seconds: 61 } },
+      { name: 'multi_select', arguments: { ...identity, locs: [[10, 20]] } },
+      { name: 'multi_edit', arguments: { ...identity, frame_id: 'frame', locs: [[10, 'missing-y']] } },
+      { name: 'registry', arguments: { ...identity, mode: 'set', path: 'HKCU:\\Software\\Palette', name: 'Invalid', value: { command: 'not registry data' } } },
+      { name: 'app', arguments: { ...identity, mode: 'resize', window_id: 'window-1', window_size: [0, 600] } },
+      { name: 'snapshot', arguments: { ...identity, max_elements: 2001 } }
+    ])
+    await test.service.start('vm', test.id, 'invalid enhancement arguments', randomUUID())
+    const result = await settled(test.service, test.id)
+    expect(result.view.run?.state).toBe('completed')
+    expect(test.client.calls).not.toContain('guest_enhancement')
+    expect(result.view.run?.stepCount).toBe(0)
+    expect(test.client.calls.at(-1)).toBe('driver_release')
+  } finally { await test.close() }
+}, 20000)
+
+it('stops after an unknown Windows batch without sending the next guest command', async () => {
+  const test = await environment()
+  const identity = { instance_id: 'instance', boot_epoch: 1 }
+  try {
+    test.client.unknownEnhancement = true
+    test.script([
+      { name: 'multi_edit', arguments: { ...identity, frame_id: 'frame', locs: [[10, 20, '提交']] } },
+      { name: 'powershell', arguments: { ...identity, command: 'Write-Output next' } }
+    ])
+    await test.service.start('vm', test.id, 'Windows batch task', randomUUID())
+    const result = await settled(test.service, test.id)
+    expect(result.view.run?.state).toBe('cancelled')
+    const requests = test.client.requests.filter(request => request.method === 'guest_enhancement')
+    expect(requests).toHaveLength(1)
+    expect(requests[0].parameters).toMatchObject({ operation: 'multi_edit', frame_id: 'frame' })
     expect(test.client.calls.at(-1)).toBe('driver_release')
   } finally { await test.close() }
 }, 20000)

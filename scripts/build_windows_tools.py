@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import time
 import urllib.request
@@ -14,6 +15,7 @@ import pycdlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "guest" / "windows"
+HELPER_FILES = ("Build-Agent.ps1", "Palette.Agent.cs", "Palette.Native.cs", "Palette.Operations.cs")
 ISO_NAME = "palette-tools-windows-x86_64.iso"
 
 
@@ -70,7 +72,14 @@ def build_iso(cache: Path, output: Path, *, offline: bool = False) -> Path:
     )
     files = [
         (SOURCE / name, name)
-        for name in ("Install.cmd", "Install.ps1", "autorun.inf", "README.txt", "payloads.json")
+        for name in (
+            "Install.cmd",
+            "Install.ps1",
+            "autorun.inf",
+            "README.txt",
+            "payloads.json",
+            *HELPER_FILES,
+        )
     ]
     files += [
         (fetch_payload(cache, item, offline=offline), item["name"])
@@ -81,17 +90,42 @@ def build_iso(cache: Path, output: Path, *, offline: bool = False) -> Path:
     partial = output / (ISO_NAME + ".partial")
     iso = pycdlib.PyCdlib()
     iso.new(interchange_level=3, joliet=3, vol_ident="PALETTE_TOOLS")
+    helper_manifest = json.dumps(
+        {
+            "protocol_version": "1.1",
+            "files": [
+                {
+                    "name": name,
+                    "size_bytes": (SOURCE / name).stat().st_size,
+                    "sha256": hashlib.sha256((SOURCE / name).read_bytes()).hexdigest(),
+                }
+                for name in HELPER_FILES
+            ],
+        },
+        indent=2,
+    ).encode("utf-8")
+    helper_stream = io.BytesIO(helper_manifest)
     try:
         for index, (file, name) in enumerate(files):
             # Joliet preserves the user-visible file names used by the guest installer.
             iso.add_file(str(file), iso_path=f"/FILE{index:03d}.DAT;1", joliet_path="/" + name)
+        iso.add_fp(
+            helper_stream,
+            len(helper_manifest),
+            iso_path="/HELPER.JSON;1",
+            joliet_path="/helper-files.json",
+        )
         iso.write(str(partial))
     finally:
         iso.close()
+        helper_stream.close()
     # Read back every embedded payload, including scripts, before publishing the ISO.
     verify = pycdlib.PyCdlib()
     verify.open(str(partial))
     try:
+        with verify.open_file_from_iso(joliet_path="/helper-files.json") as embedded:
+            if embedded.read() != helper_manifest:
+                raise ValueError("ISO helper manifest verification failed")
         for original, name in files:
             with (
                 verify.open_file_from_iso(joliet_path="/" + name) as embedded,

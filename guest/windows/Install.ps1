@@ -1,4 +1,5 @@
 # Runs inside the Windows guest only. No host execution or Windows setup bypasses.
+param([switch]$Uninstall)
 $ErrorActionPreference = 'Stop'
 try {
     $architecture = $env:PROCESSOR_ARCHITECTURE
@@ -9,6 +10,7 @@ try {
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"'
+        if ($Uninstall) { $arguments += ' -Uninstall' }
         $elevated = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -Verb RunAs -Wait -PassThru
         exit $elevated.ExitCode
     }
@@ -16,6 +18,28 @@ try {
     New-Item -ItemType Directory -Force -Path $logs | Out-Null
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     Start-Transcript -Path (Join-Path $logs ($stamp + '-install.log')) | Out-Null
+    $agentDirectory = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Palette\GuestTools'
+    $agentService = Get-Service -Name 'PaletteGuestTools' -ErrorAction SilentlyContinue
+    if ($Uninstall) {
+        if ($agentService) {
+            Stop-Service -Name 'PaletteGuestTools' -Force -ErrorAction Stop
+            & sc.exe delete PaletteGuestTools | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw 'Could not remove PaletteGuestTools service.' }
+        }
+        # The target is a fixed dedicated folder, never supplied by an RPC or file path argument.
+        if (Test-Path -LiteralPath $agentDirectory) { Remove-Item -LiteralPath $agentDirectory -Recurse -Force }
+        Write-Host 'Palette session helper removed. VirtIO, QGA, SPICE and WebDAV remain installed.'
+        Stop-Transcript | Out-Null
+        exit 0
+    }
+    $helperManifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'helper-files.json') -Raw | ConvertFrom-Json
+    foreach ($item in $helperManifest.files) {
+        if ([IO.Path]::GetFileName($item.name) -ne $item.name) { throw 'Invalid helper source name.' }
+        $source = Join-Path $PSScriptRoot $item.name
+        if ((Get-Item -LiteralPath $source).Length -ne $item.size_bytes -or (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -ne $item.sha256) {
+            throw ('Palette helper source checksum failed: ' + $item.name)
+        }
+    }
     $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'payloads.json') -Raw | ConvertFrom-Json
     foreach ($payload in $manifest.payloads) {
         $file = Join-Path $PSScriptRoot $payload.name
@@ -39,9 +63,31 @@ try {
             try { Start-Service -Name $name -ErrorAction Stop } catch { Write-Warning ('Service not ready yet: ' + $name + '. Restart Windows and check the service.') }
         }
     }
+    Write-Host 'Installing Palette Windows user-session tools...'
+    if ($agentService) {
+        Stop-Service -Name 'PaletteGuestTools' -Force -ErrorAction Stop
+        (Get-Service -Name 'PaletteGuestTools').WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+    }
+    New-Item -ItemType Directory -Force -Path $agentDirectory | Out-Null
+    # Program Files inherits administrator/SYSTEM write access and ordinary-user read/execute.
+    foreach ($name in @('Build-Agent.ps1', 'Palette.Agent.cs', 'Palette.Native.cs', 'Palette.Operations.cs')) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $agentDirectory $name) -Force
+    }
+    $agentExecutable = Join-Path $agentDirectory 'Palette.GuestTools.exe'
+    & (Join-Path $agentDirectory 'Build-Agent.ps1') -OutputPath $agentExecutable
+    if ($agentService) {
+        & sc.exe config PaletteGuestTools binPath= ('"' + $agentExecutable + '"') start= auto obj= LocalSystem | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw 'Could not update PaletteGuestTools service.' }
+    } else {
+        New-Service -Name 'PaletteGuestTools' -BinaryPathName ('"' + $agentExecutable + '"') -DisplayName 'Palette Windows Guest Tools' -StartupType Automatic | Out-Null
+    }
+    & sc.exe failure PaletteGuestTools reset= 86400 actions= restart/3000/restart/10000/restart/30000 | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'Could not configure guest helper recovery.' }
+    Start-Service -Name 'PaletteGuestTools' -ErrorAction Stop
     Write-Host ('Installation completed. Logs: ' + $logs)
     Write-Host 'Restart Windows before using guest tools. Palette detects live service capabilities after boot and login.'
-    Write-Host 'Clipboard and QGA file transfer use their existing channels. Windows automatic resolution is not provided by this disc.'
+    Write-Host 'Palette detects file/system/App/UIA tools after a normal user logs in. The transport service never executes these operations as SYSTEM.'
+    Write-Host 'QGA binary transfers retain their existing channel. Windows automatic resolution is not provided by this disc.'
     Stop-Transcript | Out-Null
     exit 0
 } catch {

@@ -45,6 +45,13 @@ _CAPABILITY_LABELS: dict[str, str] = {
     "host.qemu_args": "caller-supplied QEMU arguments",
     "guest.input_text": "vm_guest_input_text",
     "guest.launch_app": "vm_guest_launch_app",
+    "guest.filesystem": "vm_guest_filesystem",
+    "guest.powershell": "vm_guest_powershell",
+    "guest.process": "vm_guest_process",
+    "guest.registry": "vm_guest_registry",
+    "guest.app": "vm_guest_app",
+    "guest.snapshot": "vm_guest_snapshot",
+    "guest.batch": "vm_guest_multi_select / vm_guest_multi_edit",
     "guest.clipboard": "vm_guest_clipboard_get / vm_guest_clipboard_set",
     "guest.file": "vm_guest_file_open / read / write / close",
     "guest.resize": "vm_guest_resize",
@@ -253,7 +260,11 @@ class Policy:
             if flag:
                 available.append(operation)
         if self.profile.guest_tools.enabled:
-            available.extend(sorted(self.profile.guest_tools.capabilities))
+            available.extend(
+                capability
+                for capability in sorted(self.profile.guest_tools.capabilities)
+                if capability != "guest.clipboard" or self.profile.guest_desktop.clipboard
+            )
         for capability, enabled in (
             ("guest.input_text", self.profile.guest_desktop.clipboard),
             ("guest.clipboard", self.profile.guest_desktop.clipboard),

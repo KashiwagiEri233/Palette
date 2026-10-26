@@ -5,9 +5,9 @@
 This directory defines the protocol specification for the guest-side daemon backing Palette's **Retained Guest Enhancement Channel**.
 
 * **Host-Side Status (Implemented & Tested)**: Length-prefixed framing (`src/palette/guest_tools/protocol.py`), version and capability intersection negotiation, policy enforcement, `GuestToolBridge` (`src/palette/guest_tools/bridge.py`), and an in-process fault-injecting transport (`MemoryGuestToolTransport`) are fully implemented and covered by automated tests.
-* **Guest-Side Status (Specification Only; No Binary Bundled)**: Until a guest image runs a daemon implementing this contract over `virtio-serial`, `VirtioSerialGuestToolTransport` reports the channel as offline, `vm_status` reports transport and service readiness as separate facts, and calls to `vm_guest_input_text` or `vm_guest_launch_app` fail cleanly with `GUEST_TOOL_UNAVAILABLE` — **never silently downgrading to simulated keystrokes**.
+* **Windows guest implementation**: `guest/windows/Palette.*.cs` implements a SYSTEM transport broker and an ordinary-user worker. The tools disc compiles it offline with the inbox .NET Framework compiler and installs the broker service. The real `VirtioSerialGuestToolTransport` uses Palette's per-instance private socket/named pipe. Missing services remain unavailable and never silently downgrade Unicode to keystrokes.
 
-Keeping the host bridge and contract complete today means that enabling native Unicode/CJK text injection or allowlisted app launching later requires only dropping in a guest daemon and wiring the `virtio-serial` transport, without changing Palette's policy, scheduling, or audit architecture.
+See the [enhancement guide](../../docs/guest-enhancements.md) for installation, tool arguments, permissions, limits and the remaining real-VM acceptance requirements.
 
 ## 1. Transport Specification
 
@@ -20,15 +20,15 @@ Keeping the host bridge and contract complete today means that enabling native U
 Upon connection or after a guest `RESET` event, the host and guest service perform an explicit handshake:
 
 1. **Host Sends `hello`**:
-   Includes `protocol_version` (`"1.0"`), `vm_id`, `instance_id`, `boot_epoch`, a unique `connect_id`, and the `capabilities` and `input_methods` permitted by the active profile.
+   Bootstrap envelope `v="1.0"`, `kind="hello"`, `id=connect_id`; payload contains `versions=["1.1","1.0"]`, `vm_id`, `instance_id`, `boot_epoch`, unique `connect_id` and `desired_capabilities`. Later requests use the negotiated version.
 2. **Guest Service Replies with `hello_ack`**:
-   Reports the selected `protocol_version`, the `capabilities` and `input_methods` the guest service actually implements, its registered `allowed_apps`, the attached session type (`"interactive"`), and whether the interactive desktop is ready (`desktop_ready: true/false`).
+   Reports selected `version`, implemented `capabilities`/`input_methods`, registered `apps`, `session="interactive"` and `interactive_desktop`. The Windows worker requires 1.1; the host retains 1.0 support for older implementations and restricts those connections to legacy operations.
 
 > **Intersection Rule**: Both sides enforce the strict **intersection** of what the profile permits and what the guest service actually provides. A service must never advertise a capability or input method it cannot honor.
 
 ## 3. Supported Operations
 
-The guest service exposes strictly two bounded operations — **it is neither a general guest shell nor a host-clipboard broker**:
+Operations have explicit registered capability categories. The Windows worker provides native text, filesystem, PowerShell, process, registry, App, UIA snapshot, label resolution and guest-only clipboard. Requests contain `capability`, typed `params`, `session`, `boot_epoch`, connection `generation`, `connect_id` and `timeout_ms`; responses contain `ok/effect_state/method/detail/data`. New categories require both a host registry entry and a Profile grant. The following two interfaces retain their existing contracts:
 
 | Capability | MCP Tool | Request Payload | Rules & Constraints |
 | --- | --- | --- | --- |
@@ -40,11 +40,13 @@ The guest service exposes strictly two bounded operations — **it is neither a 
 1. **Run Inside the Interactive User Session**: Bind to the active graphical desktop session (`target_session = "interactive"`). Spawning a process in a detached background session does not count as launching a desktop app.
 2. **Never Elevate Privileges**: Run as the standard desktop user — no automatic `sudo`, no UAC elevation prompts, and no inherited host secrets.
 3. **Report `effect_state` Honestly**: Return `effect_state` (`not_sent`, `submitted`, `partial`, or `unknown`), the actual `method` used, and a `launch_id` for app launches. A running process does not prove a window appeared on screen — agents still verify visually via post-action screenshots.
-4. **Treat the Channel as Untrusted Input**: Validate every incoming JSON payload, enforce `max_text_chars` (4096 by default), and expose zero file-system, shell, or arbitrary process-control endpoints.
+4. **Treat the Channel as Untrusted Input**: Validate every JSON payload and limit output; native text obeys `max_text_chars` (4096 by default). File/system/App endpoints execute only in the guest and remain individually capability-gated. The SYSTEM broker forwards messages and never executes them.
+
+The host sends `kind="cancel"` with the original request ID and connection identity on timeout or cancellation. The broker stops the worker and any command job; it never replays an operation. A fresh worker re-handshakes before the next request. Host scheduling and deduplication preserve partial/unknown outcomes, while batch mouse/keyboard events stay in the host QMP input ledger. Label resolution itself sends no input.
 
 ## 5. Testing a Guest Service Implementation
 
-After wiring `VirtioSerialGuestToolTransport` to your guest daemon, run the contract and integration suites:
+Run the contract, compiled Windows worker and integration suites:
 
 ```bash
 # In-process protocol, handshake intersection, timeout, and out-of-order reply tests

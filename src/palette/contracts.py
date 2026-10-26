@@ -87,6 +87,7 @@ class AgentService(Protocol):
         request_id: str,
         operation: str,
         parameters: dict[str, Any],
+        frame_id: str | None = None,
     ) -> tuple[GuestToolResult, bytes | None]: ...
 
     async def start(

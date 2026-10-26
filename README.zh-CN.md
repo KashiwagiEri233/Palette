@@ -14,9 +14,11 @@ Agent 通过标准 Model Context Protocol（MCP）接收桌面截图并发送有
 * **Palette Desktop 桌面工作台**：基于 Electron、React 19、TypeScript、Tailwind CSS v4 与 noVNC 构建。支持从 `qcow2`/`raw` 基础镜像或安装 ISO 创建持久虚拟机，提供完整的离线硬件配置面板（1–64 核 vCPU、256–1,048,576 MiB 内存、最高 4096 GiB 写层安全扩容、启动顺序、显卡与默认分辨率、网络模式与本机端口转发、Intel HDA 音频输出），以及一键**恢复初始状态**。
 * **共享后台与多端协同**：通过单一 `RuntimeOwner`（`palette daemon` 或托管 `palette serve`）统一管理虚拟机状态。Palette Desktop、运维 CLI 与多个 MCP 客户端（`palette serve --connect-only`）可安全共用同一个后台进程。
 * **人机独占控制权交接**：采用单写入者输入控制器。运维人员可在桌面端控制台点击“接管”（带 3 秒心跳租约，支持 `Ctrl+Alt+G`、失焦或断线自动释放键鼠）或执行 `palette vm take-control`，立即递增 `controller_epoch` 并作废 Agent 手中的旧 frame；人工操控期间 Agent 仍可调用 `vm_observe` 观察画面，但写入请求会被安全拦截。
-* **只读画面网关与严密宿主边界**：从不向 Agent 暴露原始 QMP、HMP 或通用客户机 Shell。QMP 始终运行在受监管子进程的私有管道上（绝不监听 TCP）；桌面端实时画面通过仅监听本机的 WebSocket RFB 网关传输，采用一次性票据并在协议层过滤写入消息。所有受管可写层、临时帧与日志经 `PathGuard` 严格收敛在 `.runtime/` 目录内。
+* **只读画面网关与严密宿主边界**：从不向 Agent 暴露原始 QMP、HMP 或宿主 Shell。可选 Windows PowerShell 仅在客户机内以登录用户权限执行。QMP 始终运行在受监管子进程的私有管道上（绝不监听 TCP）；桌面端实时画面通过仅监听本机的 WebSocket RFB 网关传输，采用一次性票据并在协议层过滤写入消息。所有受管可写层、临时帧与日志经 `PathGuard` 严格收敛在 `.runtime/` 目录内。
 * **可选 Agent 增强能力**：Agent 通过标准 QEMU/SPICE 与 QGA 服务直接输入中文、读写客户机剪贴板并传输二进制文件，无需人工点击，参阅[增强工具指南](docs/guest-enhancements.zh-CN.md)。独立的自定义服务继续支持原生文本与应用接口：在保持视觉基线独立可用的前提下，提供受同一套策略、调度与审计约束的 `Guest Tool Bridge`（`vm_guest_input_text` 原生 Unicode/中文文本输入、`vm_guest_launch_app` 受控白名单应用启动）。客户机未运行增强服务时如实返回 `GUEST_TOOL_UNAVAILABLE`，绝不静默降级为模拟按键。
 * **跨平台硬件加速与显式 TCG**：原生支持 Windows（`WHPX`）、macOS Apple Silicon / Intel（`HVF`）与 Linux x86_64 / aarch64（`KVM`），并提供显式软件模拟配置（`tcg-x86_64`、`tcg-aarch64`，例如在 Apple Silicon 上免 Rosetta 运行 x86_64 客户机）。缺少硬件加速时直接诊断报错，绝不静默回退到 TCG。
+
+Windows 增强层还向外部 MCP 与内置 Agent 提供文件管理、客户机 PowerShell、进程/注册表、App/窗口管理、UIA 快照和坐标/控件编号批量操作，安装与运行时能力检查见[增强工具指南](docs/guest-enhancements.zh-CN.md)。
 
 ## 系统架构
 

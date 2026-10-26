@@ -6,7 +6,7 @@ This directory contains the technical and operational documentation for Palette,
 
 Two core invariants run through every page:
 
-1. **Strict Agent Boundary**: Agents receive screenshots and submit bounded actions; they never touch raw QMP, HMP, the host desktop, or a general guest shell.
+1. **Strict Agent Boundary**: Agents never touch raw QMP, HMP, the host desktop or a host shell. Optional Windows enhancement commands execute in the guest under its logged-in user's rights.
 2. **Self-Sufficient Visual Baseline**: The visual loop works end-to-end using standard framebuffer captures and standard HID keyboard/pointer events alone, without requiring any in-guest agent.
 
 ## Documentation Map

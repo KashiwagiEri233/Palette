@@ -2,7 +2,38 @@
 
 **English** | [简体中文](guest-enhancements.zh-CN.md)
 
-Palette reuses QEMU Guest Agent, SPICE vdagent and spice-webdavd. The desktop remains usable without these guest services: missing responses mean **currently unavailable**, not proof that software is uninstalled. Availability is checked repeatedly, including after guest reboot. Unicode clipboard input uses the standard QEMU/SPICE channel and file transfers use QGA. Native text APIs and app launching still require the separate `org.palette.tools.0` custom protocol.
+Palette reuses QEMU Guest Agent, SPICE vdagent and spice-webdavd, and provides a Windows user-session helper. The desktop remains usable without these guest services: missing responses mean **currently unavailable**, not proof that software is uninstalled. Availability is checked repeatedly, including after guest reboot. QGA retains binary transfer/time/shutdown; Windows file management, PowerShell, process/registry tools, App and UIA use the private `org.palette.tools.0` channel.
+
+## Windows file, system and application tools
+
+Rebuild and mount the Windows tools disc, then run `Install.cmd` **inside the guest** as described below. The installer compiles the bundled C# sources with Windows' inbox .NET Framework compiler; no Python runtime or guest network is required. Restart the VM to attach the new VirtIO port, and log in normally. `vm_status.enhancements.windows` reports the handshake, interactive-desktop state and granted capabilities.
+
+The `PaletteGuestTools` SYSTEM service only transports messages across the administrator-only VirtIO port. A separate process executes operations with the active console user's ordinary token, through a local pipe restricted to that user and SYSTEM and checked against the worker PID. Operations never auto-elevate. Locked desktops reject UI, App, text and clipboard actions; file/system access remains subject to the logged-in user's rights. To remove only this helper, run `Install.cmd -Uninstall` in the guest; upstream drivers and services remain installed.
+
+| Built-in Agent | External MCP | Behavior |
+| --- | --- | --- |
+| `filesystem` | `vm_guest_filesystem` | `read/write/copy/move/delete/list/search/info`; text read/write, append, directory metadata and bounded results |
+| `powershell` | `vm_guest_powershell` | Guest PowerShell source, optional `cwd`, bounded stdout/stderr, exit code and timeout/truncation flags |
+| `process` | `vm_guest_process` | List/filter/sort processes; close or force-terminate by PID or unambiguous name |
+| `registry` | `vm_guest_registry` | `get/set/delete/list`; String, ExpandString, Binary, DWord, QWord and MultiString values |
+| `app` | `vm_guest_app` | Localized Start Menu launch, executable with separated `args`/`cwd`, switch focus, move/resize windows |
+| `snapshot` | `vm_guest_snapshot` | Bounded Windows UIA controls, stable window IDs, numbered labels, snapshot ID and a QEMU screenshot |
+| `multi_select` | `vm_guest_multi_select` | Up to 64 clicks, optionally holding Ctrl |
+| `multi_edit` | `vm_guest_multi_edit` | Up to 64 Unicode field fills; `clear=true` selects all and deletes first |
+
+`filesystem` relative paths resolve from the guest user's Desktop. Text writes and total batch text are limited to 48 KiB UTF-8; per-field native text also obeys `guest_tools.max_text_chars` (4096 by default). `read` uses one-based line `offset`; list/search use one-based result `offset`, with explicit truncation. Use the existing QGA chunk tools for binary transfer. Copy/move reject overlapping paths, require `overwrite=true` for an existing file, and reject existing-directory replacement. Recursive mutations do not follow reparse points. Deleting a nonempty directory requires `recursive=true`.
+
+PowerShell requests accept 1–60 seconds, default 20; the effective timeout reserves reply/cleanup time inside the profile's guest-request and action deadlines and is returned as `effective_timeout_seconds`. Each stdout/stderr stream is capped at 16384 characters; output is drained after truncation. Timeout/cancellation stops the worker's command job and descendants. A timeout does not undo completed effects. App launch uses separated arguments, never concatenates them into a shell command, and does not prove that a window has appeared. Ambiguous application/window names fail; use an executable or snapshot `window_id`.
+
+Batch `locs` use pixels in the returned screenshot, matching `vm_act`. Label batches instead require `snapshot_id` and the **same snapshot's `frame_id`**, with `labels=[id,...]` or `labels=[[id,text],...]`. Labels are revalidated before each click and expire on guest changes, worker reconnect or after 30 seconds. UIA native bounds are mapped to the QEMU display; mismatched multi-display bounds report `labels_usable=false` instead of guessing. `snapshot` defaults to 500 controls (maximum 2000), reports truncation and does not implement a separate browser DOM/Firefox IA2 mode.
+
+Every new call uses the existing authenticated Agent IPC, profile grants, instance/boot identity, driver claim, single-writer scheduler and request deduplication. Batches stop on failure, return `completed/total`, release held keys and capture a result image. They provide no rollback; `partial/unknown` must not be replayed automatically. Clipboard get/set retain their existing tool names and 48 KiB text limit, prefer the ready Windows helper, and otherwise use the configured SPICE channel before any request has been sent. Neither route accesses the host clipboard.
+
+Ordinary profiles enable the new capabilities by default after a successful handshake. Explicit capability lists and `strict-example` remain restrictive; `guest_desktop.clipboard` independently controls clipboard access. The older `vm_guest_launch_app(app_id, options)` keeps its application whitelist contract. The new `vm_guest_app` uses the separate `guest.app` grant.
+
+Automated tests compile and run the Windows worker's framed diagnostic path for Unicode files, PowerShell output/deadline limits and disposable HKCU values. Service installation, VirtIO access, logon/logoff, real window focus, UIA input and human takeover still require real Windows VM acceptance; simulated tests and host diagnostic tests do not establish that acceptance.
+
+For QWord registry values above JavaScript's exact integer range, use a decimal string; reads return such values as decimal strings too. Agent response metadata is bounded to 1 MiB, with images on their separate bounded binary frame; ordinary operator messages retain their 256 KiB limit.
 
 ## Install inside a Debian / XFCE guest
 

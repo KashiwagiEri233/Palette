@@ -78,6 +78,11 @@ Things that will save you time:
   guest path, r or w mode, then base64 chunks up to 49152 bytes and always close the
   returned transfer_id. w overwrites the guest file. A file is limited to 16 MiB by
   default. Each chunk needs a new request_id; reuse that ID only to retrieve its receipt.
+* On Windows, vm_guest_filesystem/powershell/process/registry/app provide guest-only
+  file, system and window operations under the logged-in user's ordinary rights.
+  vm_guest_snapshot returns UIA labels with a screenshot. Label batches require its
+  snapshot_id and the same frame_id; coordinate batches use image pixels. Batches stop
+  on failure and report completed/total, with no rollback or automatic replay.
 * If guest tools are unavailable, keep using the visual baseline. Never silently replace
   Unicode or binary data with keyboard events. Clipboard input targets the focused app;
   terminals may require setting the clipboard then an explicit Ctrl+Shift+V action.
@@ -122,8 +127,13 @@ def build_server(service: AgentService) -> MCPServer:
     profiles = service.config.profiles.values()
     if any(profile.guest_tools.enabled or profile.guest_desktop.clipboard for profile in profiles):
         register_guest_tools(server, service)
+    if any(profile.guest_tools.enabled for profile in service.config.profiles.values()):
+        from .windows_tools import register_windows_tools
+
+        register_windows_tools(server, service)
     if any(
         profile.guest_agent.enabled
+        or profile.guest_tools.enabled
         or profile.guest_desktop.clipboard
         or profile.guest_desktop.resize
         for profile in service.config.profiles.values()

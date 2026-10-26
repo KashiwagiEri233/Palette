@@ -56,7 +56,7 @@ export interface AgentSettings {
   credentialPersistent: boolean
   providers: AgentProviderView[]
   models: AgentModel[]
-  guestProgramming: { available: false; reason: string }
+  guestProgramming: { availability: 'per_vm'; reason: string }
 }
 export interface AgentMessageView {
   id: string

@@ -46,3 +46,17 @@ it.each(['identity', 'length', 'disconnect'])('rejects %s failures without repla
   try { await expect(test.client.request('act', 'vm')).rejects.toThrow(); expect(calls).toBe(1) }
   finally { await test.close() }
 })
+
+it('accepts a bounded UIA response larger than the operator message limit', async () => {
+  const name = '中'.repeat(250)
+  const test = await fixture((socket, request) => {
+    const elements = Array.from({ length: 500 }, (_, label) => ({ label, name }))
+    socket.end(Buffer.concat([frame({ version: 1, request_id: request.request_id, generation: request.generation, ok: true, result: { data: { elements } }, image_bytes: 0 }), Buffer.alloc(4)]))
+  })
+  try {
+    const result = await test.client.request('guest_enhancement', 'vm')
+    const data = result.result.data as { elements: { label: number; name: string }[] }
+    expect(data.elements).toHaveLength(500)
+    expect(data.elements[499].name).toBe(name)
+  } finally { await test.close() }
+})

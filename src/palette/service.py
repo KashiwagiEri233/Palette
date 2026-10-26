@@ -189,8 +189,23 @@ class PaletteService:
 
         guest_status = await guest.capabilities() if guest is not None else None
         enhancements = enhancement_status(instance)
+        enhancements["windows"] = {
+            "enabled": instance.profile.guest_tools.enabled,
+            "online": bool(guest_status and guest_status.usable),
+            "interactive_desktop_ready": guest_status.interactive_desktop_ready
+            if guest_status
+            else False,
+            "capabilities": list(guest_status.capabilities) if guest_status else [],
+            "detail": guest_status.detail if guest_status else "Windows guest worker unavailable",
+        }
         standard_clipboard = instance.profile.guest_desktop.clipboard
-        clipboard_ready = enhancements["desktop"]["clipboard"]
+        clipboard_ready = enhancements["desktop"]["clipboard"] or bool(
+            standard_clipboard
+            and guest_status
+            and guest_status.supports("guest.clipboard")
+            and guest_status.interactive_desktop_ready is True
+        )
+        enhancements["desktop"]["clipboard"] = clipboard_ready
         status = VmStatus(
             **execution_info(instance.profile),
             vm_id=vm_id,
@@ -242,7 +257,7 @@ class PaletteService:
                     ),
                     allowed_apps=list(guest_status.apps),
                     detail=(
-                        "Standard QEMU clipboard available"
+                        "Guest clipboard available"
                         if clipboard_ready
                         else "Standard QEMU clipboard unavailable; basic visual input remains available"
                     )
@@ -541,6 +556,7 @@ class PaletteService:
         request_id: str,
         operation: str,
         parameters: dict[str, Any],
+        frame_id: str | None = None,
     ) -> tuple[GuestToolResult, bytes | None]:
         """Agent authority never routes through an operator lease or host dialog."""
         from .agent_enhancements import execute, validate_parameters
@@ -551,20 +567,106 @@ class PaletteService:
         self.require_instance_id(instance, instance_id)
         self._require_boot_epoch(instance, boot_epoch)
         request = validate_parameters(operation, parameters)
+        controller = self.controller_for(instance)
+
+        if operation in {"multi_select", "multi_edit"}:
+            from .windows_enhancements import BatchParameters
+
+            if not isinstance(request, BatchParameters):  # pragma: no cover - closed registry
+                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "invalid batch parameters")
+            if frame_id is None:
+                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "batch operations require frame_id")
+            instance.policy.require_capability("guest.batch")
+            backend = instance.guest_tools
+            if operation == "multi_edit":
+                instance.policy.require_capability("guest.input_text")
+                for item in request.locs or request.labels or []:
+                    if len(item[-1]) > instance.profile.guest_tools.max_text_chars:
+                        raise PaletteError(
+                            ErrorCode.INVALID_ARGUMENT, "field text exceeds profile limit"
+                        )
+
+            def validate() -> None:
+                self.control.require_agent(vm_id)
+                self._require_boot_epoch(instance, boot_epoch)
+
+            async def prepare() -> None:
+                nonlocal backend
+                backend = instance.guest_tools
+                if backend is None:
+                    raise PaletteError(
+                        ErrorCode.GUEST_TOOL_UNAVAILABLE, "Windows guest worker unavailable"
+                    )
+                caps = await backend.capabilities()
+                if not caps.supports("guest.batch") or not caps.interactive_desktop_ready:
+                    raise PaletteError(
+                        ErrorCode.GUEST_TOOL_UNAVAILABLE, "Windows interactive worker unavailable"
+                    )
+                if operation == "multi_edit" and not caps.supports_method("native_text"):
+                    raise PaletteError(
+                        ErrorCode.INPUT_TARGET_UNSUPPORTED, "native text input is required"
+                    )
+
+            async def resolve(snapshot_id: str, labels: list[int]) -> list[list[int]]:
+                validate()
+                if backend is None:  # pragma: no cover - prepare establishes this
+                    raise PaletteError(
+                        ErrorCode.GUEST_TOOL_UNAVAILABLE, "Windows guest worker unavailable"
+                    )
+                result = await backend.execute_operation(
+                    operation="resolve_elements",
+                    parameters={"snapshot_id": snapshot_id, "labels": labels},
+                )
+                if not result.ok:
+                    raise result.error or PaletteError(
+                        ErrorCode.STALE_FRAME, "guest elements are no longer available"
+                    )
+                points = result.data.get("points")
+                if not isinstance(points, list) or any(
+                    not isinstance(point, list) for point in points
+                ):
+                    raise PaletteError(
+                        ErrorCode.INVALID_COORDINATES, "guest returned invalid element coordinates"
+                    )
+                return points
+
+            async def write_text(text: str, on_sending: Callable[[], None]) -> GuestToolOutcome:
+                validate()
+                if backend is None:  # pragma: no cover - prepare establishes this
+                    raise PaletteError(
+                        ErrorCode.GUEST_TOOL_UNAVAILABLE, "Windows guest worker unavailable"
+                    )
+                return await backend.input_text(
+                    text=text, method="native_text", on_sending=on_sending
+                )
+
+            return await controller.run_guest_batch(
+                operation=operation,
+                request_id=request_id,
+                frame_id=frame_id,
+                parameters=request.model_dump(exclude_none=True),
+                resolve=resolve,
+                write_text=write_text,
+                validate=validate,
+                prepare=prepare,
+            )
 
         async def run(on_sending: Callable[[], None]) -> GuestToolOutcome:
             self.control.require_agent(vm_id)
             self._require_boot_epoch(instance, boot_epoch)
             return await execute(instance, operation, request, on_sending)
 
-        return await self.controller_for(instance).run_guest_operation(
+        result, image = await controller.run_guest_operation(
             label="guest." + operation,
             request_id=request_id,
-            frame_id=None,
+            frame_id=frame_id,
             parameters=parameters,
             runner=run,
-            capture_after=operation == "display.resize",
+            capture_after=operation in {"display.resize", "app", "snapshot"},
         )
+        if operation == "snapshot":
+            controller.remember_guest_snapshot(result)
+        return result, image
 
     # -- lifecycle --------------------------------------------------------------------
     async def start(

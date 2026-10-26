@@ -12,6 +12,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .enhancements import enhancement_status
 from .errors import ErrorCode, PaletteError
 from .guest_tools.base import GuestToolOutcome
+from .models import EffectState
+from .windows_enhancements import (
+    WINDOWS_MODELS,
+    PowerShellParameters,
+    WindowsParameters,
+    validate_windows,
+)
 
 if TYPE_CHECKING:
     from .vm.manager import VmInstance
@@ -41,7 +48,9 @@ FIELDS: dict[str, set[str]] = {
 }
 
 
-def validate_parameters(operation: str, values: dict[str, Any]) -> Parameters:
+def validate_parameters(operation: str, values: dict[str, Any]) -> Parameters | WindowsParameters:
+    if operation in WINDOWS_MODELS:
+        return validate_windows(operation, values)
     if operation not in FIELDS or set(values) - FIELDS[operation]:
         raise PaletteError(ErrorCode.INVALID_ARGUMENT, "unsupported guest operation or parameters")
     try:
@@ -79,15 +88,67 @@ def validate_parameters(operation: str, values: dict[str, Any]) -> Parameters:
 async def execute(
     instance: VmInstance,
     operation: str,
-    request: Parameters,
+    request: Parameters | WindowsParameters,
     on_sending: Callable[[], None],
 ) -> GuestToolOutcome:
+    if isinstance(request, WindowsParameters):
+        instance.policy.require_capability("guest." + operation)
+        backend = instance.guest_tools
+        if backend is None:
+            raise PaletteError(ErrorCode.GUEST_TOOL_UNAVAILABLE, "Windows guest worker is offline")
+        parameters = request.model_dump(exclude_none=True)
+        if isinstance(request, PowerShellParameters):
+            budget = min(
+                instance.profile.guest_tools.request_timeout_seconds - 2,
+                instance.profile.resources.max_action_seconds - 3,
+            )
+            if budget < 1:
+                raise PaletteError(
+                    ErrorCode.INVALID_ARGUMENT, "profile deadline is too short for PowerShell"
+                )
+            parameters["timeout_seconds"] = min(request.timeout_seconds, budget)
+        return await backend.execute_operation(
+            operation=operation,
+            parameters=parameters,
+            on_sending=on_sending,
+        )
     status = enhancement_status(instance)
     desktop = instance.guest_desktop
     data: dict[str, Any]
     if operation.startswith("clipboard.") or operation == "display.resize":
         feature = "resize" if operation == "display.resize" else "clipboard"
         instance.policy.require_capability(f"guest.{feature}")
+        if feature == "clipboard" and instance.guest_tools is not None:
+            caps = await instance.guest_tools.capabilities()
+            if caps.supports("guest.clipboard"):
+                if (
+                    len(request.text.encode("utf-8"))
+                    > instance.profile.guest_desktop.max_clipboard_bytes
+                ):
+                    raise PaletteError(
+                        ErrorCode.INVALID_ARGUMENT, "clipboard text exceeds profile limit"
+                    )
+                result = await instance.guest_tools.execute_operation(
+                    operation=operation,
+                    parameters={"text": request.text} if operation == "clipboard.set" else {},
+                    on_sending=on_sending,
+                )
+                if result.ok and operation == "clipboard.get":
+                    text = result.data.get("text")
+                    if (
+                        not isinstance(text, str)
+                        or len(text.encode("utf-8"))
+                        > instance.profile.guest_desktop.max_clipboard_bytes
+                    ):
+                        return GuestToolOutcome(
+                            ok=False,
+                            effect_state=EffectState.NOT_SENT,
+                            error=PaletteError(
+                                ErrorCode.INVALID_ARGUMENT,
+                                "guest clipboard result exceeds profile limit",
+                            ),
+                        )
+                return result
         if not status["desktop"][feature] or desktop is None:
             raise PaletteError(
                 ErrorCode.GUEST_TOOL_UNAVAILABLE,

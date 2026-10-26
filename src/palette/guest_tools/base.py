@@ -1,11 +1,4 @@
-"""Guest tool backends: the contract, the disabled default, and the mock.
-
-The interface is deliberately narrow — capability discovery, text input, app launching —
-because those are the only two capabilities the plan registers. There is no "run this in
-the guest" method and no free-form RPC passthrough: a new capability must be added to the
-registry, the schema and the policy before it can be called, which is what keeps this
-channel from quietly becoming a guest shell.
-"""
+"""Guest tool backends with explicit capability-gated operation categories."""
 
 from __future__ import annotations
 
@@ -15,6 +8,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from ..errors import ErrorCode, PaletteError
 from ..models import EffectState
+from .protocol import LEGACY_CAPABILITIES, OPERATION_CAPABILITIES, PROTOCOL_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +79,13 @@ class GuestToolBackend(Protocol):
         options: dict[str, object],
         on_sending: Callable[[], None] | None = None,
     ) -> GuestToolOutcome: ...
+    async def execute_operation(
+        self,
+        operation: str,
+        parameters: dict[str, Any],
+        *,
+        on_sending: Callable[[], None] | None = None,
+    ) -> GuestToolOutcome: ...
     async def close(self) -> None: ...
 
 
@@ -131,6 +132,18 @@ class DisabledGuestToolBackend:
     async def close(self) -> None:
         return None
 
+    async def execute_operation(
+        self,
+        operation: str,
+        parameters: dict[str, Any],
+        *,
+        on_sending: Callable[[], None] | None = None,
+    ) -> GuestToolOutcome:
+        raise PaletteError(
+            ErrorCode.GUEST_TOOL_UNAVAILABLE,
+            "guest enhancement tools are not enabled for this profile",
+        )
+
 
 @dataclass
 class MockGuestToolBackend:
@@ -144,12 +157,13 @@ class MockGuestToolBackend:
     capabilities_available: bool = True
     service_online: bool = True
     transport_online: bool = True
-    protocol_version: str | None = "1.0"
+    protocol_version: str | None = PROTOCOL_VERSION
     input_methods: tuple[str, ...] = ("native_text",)
     apps: dict[str, dict[str, object]] = field(default_factory=lambda: {"text-editor": {}})
     interactive_desktop_ready: bool | None = True
     fail_with: PaletteError | None = None
     calls: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+    operation_data: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     async def capabilities(self) -> GuestCapabilities:
         return GuestCapabilities(
@@ -159,7 +173,9 @@ class MockGuestToolBackend:
             interactive_desktop_ready=self.interactive_desktop_ready,
             protocol_version=self.protocol_version,
             connection_generation=1,
-            capabilities=("guest.input_text", "guest.launch_app"),
+            capabilities=tuple(sorted(LEGACY_CAPABILITIES | set(OPERATION_CAPABILITIES.values())))
+            if self.capabilities_available
+            else (),
             input_methods=self.input_methods,
             apps=tuple(sorted(self.apps)),
         )
@@ -229,6 +245,30 @@ class MockGuestToolBackend:
             launch_id=f"launch_{app_id}",
             detail="launch accepted; a running process does not prove a window is focused",
         )
+
+    async def execute_operation(
+        self,
+        operation: str,
+        parameters: dict[str, Any],
+        *,
+        on_sending: Callable[[], None] | None = None,
+    ) -> GuestToolOutcome:
+        capability = OPERATION_CAPABILITIES.get(operation)
+        if capability is None:
+            raise PaletteError(ErrorCode.UNSUPPORTED_CAPABILITY, "unregistered guest operation")
+        caps = await self.capabilities()
+        if not caps.usable:
+            raise PaletteError(
+                ErrorCode.GUEST_TOOL_UNAVAILABLE, "the guest tool service is offline"
+            )
+        if caps.protocol_version != PROTOCOL_VERSION or not caps.supports(capability):
+            raise PaletteError(ErrorCode.UNSUPPORTED_CAPABILITY, "guest operation is unavailable")
+        if self.fail_with is not None:
+            raise self.fail_with
+        if on_sending is not None:
+            on_sending()
+        self.calls.append((operation, dict(parameters)))
+        return GuestToolOutcome(ok=True, data=dict(self.operation_data.get(operation, {})))
 
     async def close(self) -> None:
         return None

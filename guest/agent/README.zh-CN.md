@@ -5,9 +5,9 @@
 本目录定义 Palette **保留的客户机增强通道（Guest Enhancement Channel）** 在客户机内部一侧的服务协议规范。
 
 * **宿主机侧状态（已完整实现）**：长度分帧协议（`src/palette/guest_tools/protocol.py`）、版本与能力交集协商、权限策略检查、`GuestToolBridge`（`src/palette/guest_tools/bridge.py`）以及进程内乱序/断连模拟传输层（`MemoryGuestToolTransport`）均已实现并通过测试覆盖。
-* **客户机侧状态（契约定义，默认未内置守护进程）**：在客户机内部实际部署并运行实现本契约的服务之前，宿主机侧的 `VirtioSerialGuestToolTransport` 会诚实报告通道未连接，`vm_status` 会将传输与服务就绪状态分开报告，任何针对 `vm_guest_input_text` 或 `vm_guest_launch_app` 的调用都会以 `GUEST_TOOL_UNAVAILABLE` 明确失败，**绝不静默退化为模拟键盘按键**。
+* **Windows 客户机实现**：`guest/windows/Palette.*.cs` 实现 SYSTEM 传输代理和普通用户工作进程；工具盘使用 Windows 自带 .NET Framework 编译器离线编译并安装代理服务。真实 `VirtioSerialGuestToolTransport` 使用每个实例独立的私有 socket/命名管道。服务缺失时明确报告不可用，绝不把 Unicode 静默退化为按键。
 
-这一架构设计确保：未来在客户机镜像中启用原生 Unicode/中文文本输入与白名单应用启动时，只需编写一个遵循本协议的轻量级客户机守护进程并接入 `virtio-serial` 端口，无需改动宿主机侧的权限、调度或审计架构。
+安装、工具参数、权限、限制与仍需真实虚拟机执行的验收，见[增强工具指南](../../docs/guest-enhancements.zh-CN.md)。
 
 ## 1. 传输层规范（Transport）
 
@@ -20,15 +20,15 @@
 连接建立或客户机发生 `RESET` 后，宿主机与客户机服务必须完成一次显式握手：
 
 1. **宿主机发送 `hello`**：
-   包含宿主机支持的协议版本（`protocol_version`，当前为 `"1.0"`）、`vm_id`、`instance_id`、`boot_epoch`、唯一连接标识 `connect_id`，以及当前 Profile 允许启用的能力列表（`capabilities`）与输入方法（`input_methods`）。
+   引导信封为 `v="1.0"`、`kind="hello"`、`id=connect_id`；载荷包含 `versions=["1.1","1.0"]`、`vm_id`、`instance_id`、`boot_epoch`、唯一 `connect_id` 和 `desired_capabilities`，后续请求使用协商版本。
 2. **客户机服务回复 `hello_ack`**：
-   包含协商选定的协议版本、客户机服务**实际支持**的能力列表（`capabilities`）、实际支持的输入方法（`input_methods`）、已登记可启动的应用 ID 列表（`allowed_apps`）、当前绑定的会话类型（如 `"interactive"`），以及交互式桌面是否已就绪（`desktop_ready: true/false`）。
+   包含选定的 `version`、实际实现的 `capabilities`/`input_methods`、已登记的 `apps`、`session="interactive"` 与 `interactive_desktop`。Windows 助手要求 1.1；宿主保留对旧服务 1.0 的支持，此类连接仅开放原有操作。
 
 > **交集原则**：宿主机 Bridge 最终仅启用“Profile 授权集”与“客户机 `hello_ack` 声明集”的**严格交集**。客户机服务绝不能声称自己无法兑现的能力。
 
 ## 3. 受控操作契约（Operations）
 
-客户机服务仅允许实现以下两项受控操作，**严禁暴露通用 Shell、任意命令执行、任意文件读写或进程管理接口**：
+操作采用显式注册的能力分类。Windows 助手提供原生文字、文件管理、PowerShell、进程、注册表、App、UIA 快照、编号解析及客户机剪贴板。请求包含 `capability`、强类型 `params`、`session`、`boot_epoch`、连接 `generation`、`connect_id`、`timeout_ms`；响应包含 `ok/effect_state/method/detail/data`。新增分类必须同时注册并由 Profile 授权。以下两个接口保留原有契约：
 
 | 能力名称 | MCP 工具对应 | 请求载荷字段 | 执行规则与边界约束 |
 | --- | --- | --- | --- |
@@ -40,11 +40,13 @@
 1. **必须在交互式图形用户会话中运行**：在 Linux/X11 或 Windows 桌面中，服务必须绑定到当前可见的普通用户交互式图形会话（`target_session = "interactive"`）。在后台脱离图形环境的会话中拉起进程不算“打开了桌面应用”。
 2. **绝不提权运行**：以客户机普通桌面用户身份运行，绝不自动调用 `sudo`、绝不触发 UAC 提权弹窗、绝不持有任何宿主机凭据。
 3. **如实报告效果状态（`effect_state`）**：响应必须明确返回 `effect_state`（`not_sent`、`submitted`、`partial`、`unknown`）、实际执行的 `method` 以及应用启动的 `launch_id`。请注意：进程成功创建仅代表 `submitted`，不代表应用窗口已经渲染在屏幕上——Agent 仍需通过动作后截图确认视觉结果。
-4. **双向零信任校验**：客户机服务同样应将来自通道的每条 JSON 消息视为不可信输入，严格校验字段类型、文本长度上限（`max_text_chars`，默认 4096）与选项键名。
+4. **双向零信任校验**：校验每条 JSON 和结果上限，原生文字受 `max_text_chars` 限制，默认 4096。文件/系统/App 操作仅在客户机执行并独立授权，SYSTEM 代理只转发消息，不执行这些操作。
+
+超时或取消时，宿主发送 `kind="cancel"`、原请求 ID 和连接身份。代理停止工作进程及命令作业，不重放操作；下次请求先对新进程重新握手。宿主调度与去重保留部分/未知结果，批量键鼠事件仍记入 QMP 输入账本，编号解析本身不发送输入。
 
 ## 5. 如何验证自定义客户机服务实现
 
-当你实现了客户机端服务并补齐宿主机 `VirtioSerialGuestToolTransport` 的管道连接后，可运行以下测试套件验证协议兼容性：
+运行协议、真实编译 Windows 工作进程及服务集成测试：
 
 ```bash
 # 运行进程内协议、握手交集、超时与乱序回复契约测试

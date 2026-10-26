@@ -2,7 +2,38 @@
 
 **简体中文** | [English](guest-enhancements.md)
 
-Palette 复用 QEMU Guest Agent、SPICE vdagent 和 spice-webdavd。没有安装或没有运行这些客户机服务时，基础画面、键盘和鼠标仍可使用。没有响应表示“当前不可用”，不能直接认定未安装。后台会持续检测，在服务恢复和客户机重启后重新识别能力。中文输入与剪贴板使用标准 QEMU/SPICE 通道，文件传输使用 QGA；`native_text` 与应用启动仍依赖独立的 `org.palette.tools.0` 自定义协议。
+Palette 复用 QEMU Guest Agent、SPICE vdagent 和 spice-webdavd，并提供 Windows 用户会话助手。没有安装或没有运行这些客户机服务时，基础画面、键盘和鼠标仍可使用。没有响应表示“当前不可用”，不能直接认定未安装。后台会持续检测，在服务恢复和客户机重启后重新识别能力。QGA 继续负责二进制传输、时间同步和关机；Windows 文件管理、PowerShell、进程/注册表、App 与 UIA 使用私有 `org.palette.tools.0` 通道。
+
+## Windows 文件、系统与应用工具
+
+按下文重建并装载 Windows 工具盘，**在客户机内**运行 `Install.cmd`。安装程序使用 Windows 自带的 .NET Framework 编译器编译随盘 C# 源码，无需 Python 或客户机网络。重启虚拟机以连接新增 VirtIO 端口，然后正常登录。`vm_status.enhancements.windows` 报告握手、交互桌面状态和实际授权能力。
+
+`PaletteGuestTools` SYSTEM 服务只转发受限 VirtIO 端口上的消息。独立进程通过只允许当前用户和 SYSTEM、并校验工作进程 PID 的本地管道，以活动控制台用户的普通令牌执行操作，不自动提权。锁屏时拒绝界面、App、文字与剪贴板操作；文件和系统操作仍受登录用户权限约束。仅卸载此助手可在客户机运行 `Install.cmd -Uninstall`，上游驱动及服务保留。
+
+| 内置 Agent | 外部 MCP | 功能 |
+| --- | --- | --- |
+| `filesystem` | `vm_guest_filesystem` | `read/write/copy/move/delete/list/search/info`；文本读写、追加、目录元数据和有界结果 |
+| `powershell` | `vm_guest_powershell` | 客户机 PowerShell 源码、可选 `cwd`、有界标准输出/错误、退出码及超时/截断标记 |
+| `process` | `vm_guest_process` | 列出、过滤和排序进程；按 PID 或无歧义名称关闭、强制终止 |
+| `registry` | `vm_guest_registry` | `get/set/delete/list`；String、ExpandString、Binary、DWord、QWord、MultiString 类型 |
+| `app` | `vm_guest_app` | 本地化开始菜单名称启动、独立 `args`/`cwd` 的可执行文件启动、切换焦点、移动/缩放窗口 |
+| `snapshot` | `vm_guest_snapshot` | 有界 Windows UIA 控件、稳定窗口 ID、控件编号、快照 ID 和 QEMU 截图 |
+| `multi_select` | `vm_guest_multi_select` | 最多 64 次点击，可保持 Ctrl 多选 |
+| `multi_edit` | `vm_guest_multi_edit` | 最多 64 项 Unicode 字段填写；`clear=true` 先全选并删除 |
+
+`filesystem` 相对路径从客户机当前用户桌面解析。文本写入及批量文字合计最多 48 KiB UTF-8；每个字段还受 `guest_tools.max_text_chars` 限制，默认 4096 字符。`read` 的 `offset` 是从 1 开始的行号，目录/搜索则是从 1 开始的结果位置，截断会明确报告。二进制传输继续使用已有 QGA 分块工具。复制/移动拒绝路径重叠，覆盖已有文件需显式 `overwrite=true`，不支持替换已有目录；递归修改不跟随重解析点。删除非空目录需 `recursive=true`。
+
+PowerShell 请求接受 1–60 秒，默认 20 秒；实际时限会在 Profile 的增强请求和动作期限内预留回执/清理时间，并通过 `effective_timeout_seconds` 返回。标准输出和错误各最多 16384 字符，截断后继续排空输出。超时或取消会停止命令作业及其子进程，不撤销已发生的效果。App 启动分离参数，不拼接 Shell 命令，也不把进程启动视为窗口已出现。名称有歧义时失败，请使用可执行路径或快照的 `window_id`。
+
+批量 `locs` 使用返回截图的像素坐标，与 `vm_act` 一致。控件编号方式必须同时提供 `snapshot_id` 和**同一快照的 `frame_id`**，使用 `labels=[编号,...]` 或 `labels=[[编号,文字],...]`。每次点击前重新验证控件；客户机变化、助手重连或超过 30 秒后编号失效。UIA 原生边界会映射到 QEMU 画面，多显示器边界不匹配时报告 `labels_usable=false`，不猜测坐标。`snapshot` 默认最多 500 个控件、上限 2000，并报告截断；本次没有独立浏览器 DOM/Firefox IA2 模式。
+
+所有新增调用沿用认证 Agent IPC、Profile 授权、实例/启动代次、运行声明、单写入者调度及请求去重。批量失败立即停止，返回 `completed/total`、释放按键并截取结果画面，不提供回滚；不能自动重放 `partial/unknown`。剪贴板 get/set 保持原工具名和 48 KiB 文本限制，优先使用已就绪 Windows 助手；仅在尚未发送请求时使用配置好的 SPICE 通道。两条路径都不访问宿主剪贴板。
+
+普通 Profile 在握手成功后默认开放新增能力；显式能力列表和 `strict-example` 继续保持限制，剪贴板还独立受 `guest_desktop.clipboard` 控制。旧 `vm_guest_launch_app(app_id, options)` 保留应用白名单契约，新 `vm_guest_app` 使用独立的 `guest.app` 授权。
+
+自动化测试会编译并运行 Windows 助手的分帧诊断入口，验证 Unicode 文件、PowerShell 输出/时限及临时 HKCU 值。服务安装、VirtIO 访问、登录/注销、真实窗口焦点、UIA 输入和人工接管仍须真实 Windows 虚拟机验收；模拟测试和宿主诊断测试不能替代这些验收。
+
+QWord 注册表值超过 JavaScript 精确整数范围时，请使用十进制字符串；读取也会以十进制字符串返回此类值。Agent 响应元数据上限为 1 MiB，图片使用独立的有界二进制帧；普通操作者消息继续保持 256 KiB 上限。
 
 ## 在 Debian / XFCE 客户机内安装
 

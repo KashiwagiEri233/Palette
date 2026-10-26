@@ -565,7 +565,11 @@ class VmManager:
                 timeout_seconds=profile.guest_agent.request_timeout_seconds,
                 max_file_bytes=profile.guest_agent.max_file_bytes,
             )
-            # Windows pipe chardev initialization waits for this connection before QMP.
+        # Windows initializes pipe chardevs before QMP; connect the private helper pipe
+        # immediately, while its optional guest-service handshake runs asynchronously.
+        instance.guest_tools = DisabledGuestToolBackend()
+        self._refresh_guest_tools(instance)
+        if plan.guest_agent_endpoint is not None or plan.guest_tools_endpoint is not None:
             instance.tasks.append(asyncio.create_task(self._watch_enhancements(instance)))
         transport = ProcessQmpTransport(process, name=f"qmp-{paths.vm_id}")
         instance.transport = transport
@@ -606,10 +610,14 @@ class VmManager:
                 instance.console_password,
                 max_clipboard_bytes=profile.guest_desktop.max_clipboard_bytes,
             )
-        if instance.qemu_guest_agent is None and (
-            instance.guest_desktop is not None
-            or instance.guest_shares is not None
-            or instance.guest_session is not None
+        if (
+            instance.qemu_guest_agent is None
+            and plan.guest_tools_endpoint is None
+            and (
+                instance.guest_desktop is not None
+                or instance.guest_shares is not None
+                or instance.guest_session is not None
+            )
         ):
             instance.tasks.append(asyncio.create_task(self._watch_enhancements(instance)))
 
@@ -625,11 +633,6 @@ class VmManager:
         )
         instance.controller = controller
         await controller.start()
-
-        # 6. guest enhancement channel only for a hybrid profile, and never required by
-        #    the visual baseline.
-        instance.guest_tools = DisabledGuestToolBackend()
-        self._refresh_guest_tools(instance)
 
         instance.tasks.append(
             asyncio.create_task(self._watch_process(instance), name=f"watch-{paths.vm_id}")
@@ -654,11 +657,21 @@ class VmManager:
         config = instance.profile.guest_tools
         if not config.enabled:
             return DisabledGuestToolBackend()
+        if not instance.profile.guest_desktop.clipboard:
+            config = config.model_copy(
+                update={
+                    "capabilities": [
+                        name for name in config.capabilities if name != "guest.clipboard"
+                    ]
+                }
+            )
         factory = self._guest_tool_transport_factory
         if factory is None:
             from ..guest_tools.bridge import VirtioSerialGuestToolTransport
 
-            transport: GuestToolTransport = VirtioSerialGuestToolTransport()
+            transport: GuestToolTransport = VirtioSerialGuestToolTransport(
+                endpoint=instance.plan.guest_tools_endpoint if instance.plan is not None else None
+            )
         elif callable(factory):
             transport = factory(instance)
         else:  # pragma: no cover - defensive
@@ -685,6 +698,18 @@ class VmManager:
 
     async def _watch_enhancements(self, instance: VmInstance) -> None:
         while instance.process is not None and instance.process.returncode is None:
+            guest_status = (
+                await instance.guest_tools.capabilities() if instance.guest_tools else None
+            )
+            if (
+                instance.profile.guest_tools.enabled
+                and not instance.stop_requested
+                and (instance.guest_refresh is None or instance.guest_refresh.done())
+                and instance.guest_tools is not None
+                and guest_status is not None
+                and (not guest_status.usable or guest_status.interactive_desktop_ready is False)
+            ):
+                self._refresh_guest_tools(instance)
             if instance.qemu_guest_agent is not None:
                 await instance.qemu_guest_agent.refresh_info()
             if instance.qmp is not None and instance.view.qmp_ready:
@@ -703,6 +728,7 @@ class VmManager:
             await asyncio.sleep(3)
 
     def _refresh_guest_tools(self, instance: VmInstance) -> None:
+        instance.tasks[:] = [task for task in instance.tasks if not task.done()]
         previous = instance.guest_tools
         instance.guest_tools = DisabledGuestToolBackend()
         if instance.guest_refresh is not None:
@@ -719,9 +745,15 @@ class VmManager:
     ) -> None:
         backend: GuestToolBackend | None = None
         try:
-            if previous is not None:
-                await previous.close()
-            backend = await self._build_guest_tools(instance)
+            if isinstance(previous, BridgeGuestToolBackend) and previous.boot_epoch == boot_epoch:
+                # Keep the QEMU chardev open across guest logon/service startup. A fresh
+                # hello fences all replies from the prior connection without replaying work.
+                backend = previous
+                await backend.connect()
+            else:
+                if previous is not None:
+                    await previous.close()
+                backend = await self._build_guest_tools(instance)
             if (
                 self.find(instance.view.vm_id) is instance
                 and not instance.stop_requested

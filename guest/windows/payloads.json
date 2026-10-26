@@ -1,5 +1,5 @@
 {
-  "version": "1-virtio-0.1.285",
+  "version": "2-palette-1.1-virtio-0.1.285",
   "payloads": [
     {
       "name": "virtio-win-guest-tools-0.1.285.exe",

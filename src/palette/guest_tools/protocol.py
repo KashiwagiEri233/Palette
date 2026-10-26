@@ -1,9 +1,8 @@
 """The guest enhancement protocol: versioning, framing and message schema.
 
-This is a *different* protocol from QMP, on a different channel, with its own framing. It
-is defined now, with a disabled backend and a mock, because the plan keeps the guest-side
-path as a first-class extension point: when Unicode text or app launching becomes a hard
-requirement, the contract already exists and does not have to be invented under pressure.
+This protocol uses its own channel and framing, separate from QMP. The Windows session
+worker implements it over VirtIO serial; disabled and mock backends keep unavailable
+guests and contract tests on the same interface.
 
 Design commitments taken from the plan:
 
@@ -33,11 +32,11 @@ from ..errors import ErrorCode, PaletteError
 from ..models import EffectState
 
 #: The version this build speaks.
-PROTOCOL_VERSION = "1.0"
+PROTOCOL_VERSION = "1.1"
 
 #: Versions this build can still talk to. Kept separate from PROTOCOL_VERSION so that a
 #: future bump can remain backwards compatible on purpose rather than by accident.
-SUPPORTED_VERSIONS: tuple[str, ...] = ("1.0",)
+SUPPORTED_VERSIONS: tuple[str, ...] = ("1.1", "1.0")
 
 #: 4-byte big-endian length prefix, then UTF-8 JSON.
 _HEADER = struct.Struct(">I")
@@ -54,6 +53,30 @@ class Capability(StrEnum):
 
     INPUT_TEXT = "guest.input_text"
     LAUNCH_APP = "guest.launch_app"
+    FILESYSTEM = "guest.filesystem"
+    POWERSHELL = "guest.powershell"
+    PROCESS = "guest.process"
+    REGISTRY = "guest.registry"
+    APP = "guest.app"
+    SNAPSHOT = "guest.snapshot"
+    BATCH = "guest.batch"
+    CLIPBOARD = "guest.clipboard"
+
+
+# Closed internal dispatch table: adding a category requires a registered capability.
+OPERATION_CAPABILITIES: dict[str, str] = {
+    "filesystem": Capability.FILESYSTEM,
+    "powershell": Capability.POWERSHELL,
+    "process": Capability.PROCESS,
+    "registry": Capability.REGISTRY,
+    "app": Capability.APP,
+    "snapshot": Capability.SNAPSHOT,
+    "resolve_elements": Capability.BATCH,
+    "clipboard.get": Capability.CLIPBOARD,
+    "clipboard.set": Capability.CLIPBOARD,
+}
+
+LEGACY_CAPABILITIES = frozenset({Capability.INPUT_TEXT, Capability.LAUNCH_APP})
 
 
 class InputMethod(StrEnum):
@@ -74,6 +97,7 @@ class MessageKind(StrEnum):
     REQUEST = "request"
     RESPONSE = "response"
     ERROR = "error"
+    CANCEL = "cancel"
 
 
 class Envelope(BaseModel):
