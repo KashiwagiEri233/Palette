@@ -1,5 +1,21 @@
 Palette Windows Guest Tools / Windows x64
 
+During Windows installation (Windows Setup / WinPE):
+Keep the Windows installation ISO mounted and mount this tools disc as well.
+At the disk selection page, choose Load driver / Browse, then select:
+  drivers\viostor\w11\amd64   VirtIO Block disk
+  drivers\vioscsi\w11\amd64   VirtIO SCSI disk
+For Windows 10 use w10. For Server 2016/2019/2022/2025 use
+2k16/2k19/2k22/2k25 respectively. SATA/IDE disks use Windows inbox drivers.
+Load the driver matching the configured disk controller; keep incompatible
+drivers hidden. INF, SYS, CAT and companion files retain their upstream bytes.
+For network setup, browse to drivers\NetKVM\<OS>\amd64\netkvm.inf.
+If no driver button is offered during OOBE, press Shift+F10 and run (replace E:):
+  pnputil /add-driver E:\drivers\NetKVM\w11\amd64\netkvm.inf /install
+vioserial drivers for the guest-service channel are also under drivers.
+The original VirtIO license is in drivers\virtio-win_license.txt.
+Install.cmd is for the installed Windows desktop, not Windows Setup / WinPE.
+
 Inside the Windows guest, open this optical disc and run Install.cmd.
 Accept Windows administrator approval. Restart Windows after installation.
 The installer does not restart the guest automatically. Re-run to retry failed

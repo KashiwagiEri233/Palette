@@ -61,13 +61,34 @@ After running `uv sync --locked` on the host, build the offline installation dis
 uv run python scripts/build_windows_tools.py
 ```
 
-The builder downloads the pinned official [VirtIO all-in-one installer](https://github.com/virtio-win/virtio-win-guest-tools-installer) 0.1.285 and SPICE WebDAV 2.4, verifies sizes and SHA-256 hashes from `guest/windows/payloads.json`, and produces `images/guest-tools/palette-tools-windows-x86_64.iso` and its matching `.json` manifest. The disc includes scripts, VirtIO drivers, QGA, SPICE Agent and WebDAV; installation needs no guest network. Downloads are cached in `.runtime/guest-tools-cache/`; `--offline` rebuilds from verified cached files. Updates require changing pinned URLs, sizes and hashes and repeating acceptance. Generated media and caches stay out of Git.
+The builder downloads the pinned official [VirtIO all-in-one installer and driver ISO](https://github.com/virtio-win/virtio-win-pkg-scripts#downloads) 0.1.285, plus SPICE WebDAV 2.4, verifies sizes and SHA-256 hashes from `guest/windows/payloads.json`, and produces `images/guest-tools/palette-tools-windows-x86_64.iso` and its matching `.json` manifest. The first build also downloads the approximately 753 MiB upstream driver ISO. Only selected x64 driver directories are included in the tools disc, preserving the original INF, SYS, CAT, companion files and upstream license; every embedded file is read back before publication. The disc also includes post-install scripts, QGA, SPICE Agent and WebDAV; guests need no network. Downloads are cached in `.runtime/guest-tools-cache/`; `--offline` rebuilds from verified cached files. Updates require changing pinned URLs, sizes and hashes and repeating acceptance. Generated media and caches stay out of Git.
 
 For a separate configuration root, use `--output <config-root>/images/guest-tools`, or copy both the ISO and JSON there. Menus never download files or execute installers on the host. Missing or corrupt media reports an error.
 
 Select the Windows VM and choose **Application menu → Virtual machine → Install guest tools and drivers** (`应用菜单 → 虚拟机 → 安装增强工具与驱动`) in the title bar, or the VM's **More** menu. Running VMs dynamically gain a dedicated USB optical drive on first use; subsequent mounts reuse it, and mounting the same media again does not open the tray. Stopped VMs save the selection for their next start. This read-only CD-ROM uses Windows 10/11's built-in USB storage driver and preserves all existing drives, installation ISOs and boot order. **Eject guest tools disc** removes only its media, leaves the live drive available for reuse, and never forces locked media or uninstalls software.
 
-Inside Windows, open the disc, run **Install.cmd**, approve administrator elevation and restart after installation. The script verifies embedded files and runs upstream installers in sequence. Logs stay in `%ProgramData%\Palette\GuestTools\Logs`. Failures stop and report logs, retaining installed components for repair. Re-run to retry a failed installation, or repair/uninstall components using Windows Apps. The script never reboots automatically or changes driver-signing policy, TPM or Windows setup checks.
+### Load drivers during Windows installation
+
+Keep the Windows installation ISO mounted and mount the tools disc through the menu above. At the **Where do you want to install Windows?** page, choose **Load driver → Browse**, then select the directory matching the VM's disk controller:
+
+| Device | Windows 11 x64 driver directory |
+| --- | --- |
+| VirtIO Block disk (`virtio-blk`) | `drivers\viostor\w11\amd64` |
+| VirtIO SCSI disk | `drivers\vioscsi\w11\amd64` |
+| VirtIO network adapter | `drivers\NetKVM\w11\amd64` |
+| VirtIO serial port (guest-service channel) | `drivers\vioserial\w11\amd64` |
+
+For Windows 10 replace `w11` with `w10`; for Server 2016/2019/2022/2025 use `2k16/2k19/2k22/2k25` respectively. Select the matching OS's `amd64` directory and keep **Hide drivers that aren't compatible with this computer's hardware** enabled. Refresh the disk list after loading the matching controller driver. SATA/IDE disks use Windows inbox drivers and do not need a VirtIO storage driver.
+
+If Windows initial setup (OOBE) needs a network driver, use its driver-loading option to select the `NetKVM` directory. If that option is unavailable, press **Shift+F10** and run the command below. Replace `E:` with the tools disc's actual drive letter and select the appropriate OS directory:
+
+```bat
+pnputil /add-driver E:\drivers\NetKVM\w11\amd64\netkvm.inf /install
+```
+
+### Install enhancement services after Windows setup
+
+After reaching the Windows desktop, open the tools disc, run **Install.cmd**, approve administrator elevation and restart after installation. This script is not for Windows Setup / WinPE: when WinPE is detected it explains how to load drivers from `drivers` and exits. The script verifies embedded files and runs upstream installers in sequence. Logs stay in `%ProgramData%\Palette\GuestTools\Logs`. Failures stop and report logs, retaining installed components for repair. Re-run to retry a failed installation, or repair/uninstall components using Windows Apps. The script never reboots automatically or changes driver-signing policy, TPM or Windows setup checks.
 
 The disc supports **x64** Windows 10/11 and Server 2016 or newer. ARM64 and Linux presets cannot mount this package; custom configurations require the operator to confirm Windows x64. Clipboard, Unicode paste, QGA file operations and WebDAV still require enabled host Profile channels; mounting does not change channel policy. Windows automatic resolution remains unavailable: the Linux X11 session helper does not apply. Mounting does not establish installation, and installation does not establish live services. Agents continue to use runtime handshakes and capabilities with baseline fallback.
 

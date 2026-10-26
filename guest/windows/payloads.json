@@ -1,5 +1,11 @@
 {
-  "version": "2-palette-1.1-virtio-0.1.285",
+  "version": "3-palette-1.1-setup-virtio-0.1.285",
+  "setup_drivers": {
+    "name": "virtio-win-0.1.285.iso",
+    "url": "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.285-1/virtio-win.iso",
+    "sha256": "e14cf2b94492c3e925f0070ba7fdfedeb2048c91eea9c5a5afb30232a3976331",
+    "size_bytes": 789645312
+  },
   "payloads": [
     {
       "name": "virtio-win-guest-tools-0.1.285.exe",

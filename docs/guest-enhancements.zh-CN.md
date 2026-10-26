@@ -61,13 +61,34 @@ sudo sh guest/linux/install.sh --uninstall
 uv run python scripts/build_windows_tools.py
 ```
 
-构建器下载固定版本的官方 [VirtIO 一体化安装包](https://github.com/virtio-win/virtio-win-guest-tools-installer) 0.1.285 和 SPICE WebDAV 2.4，按 `guest/windows/payloads.json` 的大小及 SHA-256 校验，生成 `images/guest-tools/palette-tools-windows-x86_64.iso` 和同名 `.json` 清单。ISO 内含脚本、VirtIO 驱动、QGA、SPICE Agent 和 WebDAV 服务，安装时无需客户机联网。缓存位于 `.runtime/guest-tools-cache/`，`--offline` 可从已校验缓存重建。更新版本需同时更新固定地址、大小和摘要并重新验收。镜像与缓存不提交到 Git。
+构建器下载固定版本的官方 [VirtIO 一体化安装包和驱动 ISO](https://github.com/virtio-win/virtio-win-pkg-scripts#downloads) 0.1.285，以及 SPICE WebDAV 2.4，按 `guest/windows/payloads.json` 的大小及 SHA-256 校验，生成 `images/guest-tools/palette-tools-windows-x86_64.iso` 和同名 `.json` 清单。首次构建还需下载约 753 MiB 的上游驱动 ISO；工具盘仅收录选定的 x64 驱动目录，保留 INF、SYS、CAT、配套文件和上游许可证的原始内容，逐文件回读验证后发布。ISO 同时包含安装后使用的脚本、QGA、SPICE Agent 和 WebDAV 服务，客户机无需联网。缓存位于 `.runtime/guest-tools-cache/`，`--offline` 可从已校验缓存重建。更新版本需同时更新固定地址、大小和摘要并重新验收。镜像与缓存不提交到 Git。
 
 独立配置目录使用 `--output <配置目录>/images/guest-tools`，或将 ISO 和 JSON 清单一起复制到该目录。菜单不自动下载文件或执行宿主安装程序；文件缺失或损坏会报错。
 
 选中 Windows 虚拟机，打开顶栏**应用菜单 → 虚拟机 → 安装增强工具与驱动**，或该虚拟机的**更多 → 安装增强工具与驱动**。运行中首次使用时动态新增独立 USB 光驱，后续装载复用它，重复装载同一工具盘不打开托盘。关机状态保存设置并在下次启动时装载。只读 CD-ROM 可由 Windows 10/11 内置 USB 存储驱动读取，保留已有驱动器、安装 ISO 和启动顺序。相同菜单可**弹出增强工具光盘**，只弹出该工具盘介质，运行中的光驱保留供再次使用，不强制弹出被占用介质，也不卸载客户机软件。
 
-在 Windows 客户机打开光驱运行 **Install.cmd**，确认管理员权限，完成后自行重启。脚本验证内置文件并顺序运行上游安装程序，日志保存在 `%ProgramData%\Palette\GuestTools\Logs`。失败停止并提示日志，已安装组件保留供修复；可重跑以重试失败的安装，或通过 Windows 应用列表修复、卸载各组件。不自动重启，不修改驱动签名策略、TPM 或系统安装检查。
+### 安装 Windows 时加载驱动
+
+保留 Windows 安装 ISO，并通过上述菜单同时装载工具盘。在“你想将 Windows 安装在哪里？”页面点击**加载驱动程序 → 浏览**，按虚拟机的磁盘控制器选择工具盘中的目录：
+
+| 设备 | Windows 11 x64 驱动目录 |
+| --- | --- |
+| VirtIO Block 磁盘（`virtio-blk`） | `drivers\viostor\w11\amd64` |
+| VirtIO SCSI 磁盘 | `drivers\vioscsi\w11\amd64` |
+| VirtIO 网卡 | `drivers\NetKVM\w11\amd64` |
+| VirtIO 串口（增强服务通道） | `drivers\vioserial\w11\amd64` |
+
+Windows 10 将 `w11` 换成 `w10`；Server 2016/2019/2022/2025 分别使用 `2k16/2k19/2k22/2k25`。选择对应系统的 `amd64` 目录，保留“隐藏与此计算机硬件不兼容的驱动程序”选项。加载匹配磁盘控制器的驱动后刷新磁盘列表；SATA/IDE 磁盘使用 Windows 内置驱动，无需加载 VirtIO 存储驱动。
+
+Windows 初始设置（OOBE）缺少网络时，可使用界面的驱动加载入口选择 `NetKVM` 目录。没有入口时按 **Shift+F10**，执行下列命令；`E:` 替换为实际工具盘盘符，系统目录也按版本替换：
+
+```bat
+pnputil /add-driver E:\drivers\NetKVM\w11\amd64\netkvm.inf /install
+```
+
+### 安装完成后安装增强服务
+
+进入 Windows 桌面后打开工具盘运行 **Install.cmd**，确认管理员权限，完成后自行重启。该脚本不用于 Windows Setup / WinPE，检测到 WinPE 时会提示从 `drivers` 加载驱动并退出。脚本验证内置文件并顺序运行上游安装程序，日志保存在 `%ProgramData%\Palette\GuestTools\Logs`。失败停止并提示日志，已安装组件保留供修复；可重跑以重试失败的安装，或通过 Windows 应用列表修复、卸载各组件。不自动重启，不修改驱动签名策略、TPM 或系统安装检查。
 
 当前支持 Windows 10/11、Server 2016 及更新的 **x64** 系统。ARM64 和 Linux 预设不装载此包；自定义配置需自行确认客户机为 Windows x64。剪贴板、Unicode 粘贴、QGA 文件操作和 WebDAV 仍需宿主 Profile 启用对应通道；装载不会改变通道策略。Windows 自动分辨率尚未提供，Linux X11 会话助手不适用于 Windows。装载不代表安装成功，安装成功不代表服务在线，Agent 继续按运行时握手和实际能力判断、降级。
 

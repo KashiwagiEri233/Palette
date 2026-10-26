@@ -1,4 +1,4 @@
-"""Build the offline Windows tools ISO from pinned, verified upstream installers."""
+"""Build Windows tools and Setup-loadable drivers from pinned upstream packages."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import io
 import json
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -17,6 +18,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "guest" / "windows"
 HELPER_FILES = ("Build-Agent.ps1", "Palette.Agent.cs", "Palette.Native.cs", "Palette.Operations.cs")
 ISO_NAME = "palette-tools-windows-x86_64.iso"
+SETUP_DRIVER_NAMES = {
+    "viostor": "viostor",
+    "vioscsi": "vioscsi",
+    "NetKVM": "netkvm",
+    "vioserial": "vioser",
+}
+SETUP_DRIVER_OSES = ("w10", "w11", "2k16", "2k19", "2k22", "2k25")
 
 
 class Payload(TypedDict):
@@ -29,6 +37,7 @@ class Payload(TypedDict):
 class PayloadDocument(TypedDict):
     version: str
     payloads: list[Payload]
+    setup_drivers: Payload
 
 
 def checked_payload(path: Path, item: Payload) -> bool:
@@ -55,7 +64,7 @@ def fetch_payload(cache: Path, item: Payload, *, offline: bool) -> Path:
             total = 0
             while chunk := response.read(64 * 1024):
                 total += len(chunk)
-                if total > item["size_bytes"] or time.monotonic() - started > 300:
+                if total > item["size_bytes"] or time.monotonic() - started > 1800:
                     raise ValueError("payload download exceeded its size or time limit")
                 output.write(chunk)
         if not checked_payload(partial, item):
@@ -64,6 +73,47 @@ def fetch_payload(cache: Path, item: Payload, *, offline: bool) -> Path:
     finally:
         partial.unlink(missing_ok=True)
     return path
+
+
+def extract_setup_drivers(source: Path, destination: Path) -> list[tuple[Path, str]]:
+    """Keep upstream x64 packages intact, including INF catalogues and companion files."""
+    files: list[tuple[Path, str]] = []
+    upstream = pycdlib.PyCdlib()
+    upstream.open(str(source))
+    try:
+        if not upstream.has_rock_ridge():
+            raise ValueError("VirtIO driver ISO must preserve upstream Rock Ridge names")
+        for driver, basename in SETUP_DRIVER_NAMES.items():
+            for operating_system in SETUP_DRIVER_OSES:
+                folder = f"/{driver}/{operating_system}/amd64"
+                entries: list[tuple[str, list[str], list[str]]] = list(
+                    upstream.walk(rr_path=folder)
+                )
+                names = next((names for path, _, names in entries if path == folder), [])
+                if not all(f"{basename}.{ext}" in names for ext in ("inf", "sys", "cat")):
+                    raise ValueError(f"Incomplete Windows Setup driver package: {folder}")
+                for directory, _, names in entries:
+                    for name in names:
+                        relative = Path(directory.lstrip("/")) / name
+                        if any(
+                            part in {".", ".."} or "\\" in part or ":" in part
+                            for part in relative.parts
+                        ):
+                            raise ValueError("Invalid path in upstream driver package")
+                        target = destination / "drivers" / relative
+                        if not target.resolve().is_relative_to((destination / "drivers").resolve()):
+                            raise ValueError(
+                                "Upstream driver path escapes the extraction directory"
+                            )
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        upstream.get_file_from_iso(str(target), rr_path=directory + "/" + name)
+                        files.append((target, "drivers/" + relative.as_posix()))
+        license_file = destination / "drivers" / "virtio-win_license.txt"
+        upstream.get_file_from_iso(str(license_file), rr_path="/virtio-win_license.txt")
+        files.append((license_file, "drivers/virtio-win_license.txt"))
+    finally:
+        upstream.close()
+    return files
 
 
 def build_iso(cache: Path, output: Path, *, offline: bool = False) -> Path:
@@ -85,6 +135,13 @@ def build_iso(cache: Path, output: Path, *, offline: bool = False) -> Path:
         (fetch_payload(cache, item, offline=offline), item["name"])
         for item in payload_document["payloads"]
     ]
+    driver_source = fetch_payload(cache, payload_document["setup_drivers"], offline=offline)
+    with tempfile.TemporaryDirectory(prefix=".setup-drivers-", dir=cache.resolve()) as work:
+        files += extract_setup_drivers(driver_source, Path(work))
+        return write_iso(files, output, payload_document["version"])
+
+
+def write_iso(files: list[tuple[Path, str]], output: Path, version: str) -> Path:
     output.mkdir(parents=True, exist_ok=True)
     path = output / ISO_NAME
     partial = output / (ISO_NAME + ".partial")
@@ -106,9 +163,23 @@ def build_iso(cache: Path, output: Path, *, offline: bool = False) -> Path:
     ).encode("utf-8")
     helper_stream = io.BytesIO(helper_manifest)
     try:
+        directories: set[str] = set()
         for index, (file, name) in enumerate(files):
+            parent = Path(name).parent
+            for directory in reversed((parent, *parent.parents)):
+                directory_name = directory.as_posix()
+                if directory_name != "." and directory_name not in directories:
+                    iso.add_directory(
+                        iso_path="/" + directory_name.upper(), joliet_path="/" + directory_name
+                    )
+                    directories.add(directory_name)
             # Joliet preserves the user-visible file names used by the guest installer.
-            iso.add_file(str(file), iso_path=f"/FILE{index:03d}.DAT;1", joliet_path="/" + name)
+            iso_path = (
+                "/" + name.upper().replace("-", "_") + ";1"
+                if parent != Path(".")
+                else f"/FILE{index:03d}.DAT;1"
+            )
+            iso.add_file(str(file), iso_path=iso_path, joliet_path="/" + name)
         iso.add_fp(
             helper_stream,
             len(helper_manifest),
@@ -144,7 +215,7 @@ def build_iso(cache: Path, output: Path, *, offline: bool = False) -> Path:
         "schema_version": 1,
         "guest_os": "windows",
         "arch": "x86_64",
-        "version": payload_document["version"],
+        "version": version,
         "sha256": digest,
         "size_bytes": partial.stat().st_size,
     }
