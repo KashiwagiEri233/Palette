@@ -62,18 +62,24 @@ class InputLedger:
                     self.press_button(button)
 
     def note_releases(self, events: list[dict[str, Any]]) -> None:
-        """Record a release only once the send came back successfully."""
+        """Apply acknowledged transitions in order, releasing only after success.
+
+        A real-time batch can contain up/down or down/up/down for the same input.
+        Reapply presses as well so an earlier release cannot erase a later hold.
+        """
         for event in events:
             data = event.get("data") or {}
             if event["type"] == "key":
                 qcode = (data.get("key") or {}).get("data")
-                if isinstance(qcode, str) and not data.get("down"):
-                    self.release_key(qcode)
+                if isinstance(qcode, str):
+                    if data.get("down"):
+                        self.press_key(qcode)
+                    else:
+                        self.release_key(qcode)
             elif event["type"] == "btn":
                 button = data.get("button")
-                if (
-                    isinstance(button, str)
-                    and not button.startswith("wheel")
-                    and not data.get("down")
-                ):
-                    self.release_button(button)
+                if isinstance(button, str) and not button.startswith("wheel"):
+                    if data.get("down"):
+                        self.press_button(button)
+                    else:
+                        self.release_button(button)

@@ -86,9 +86,11 @@ class RuntimeOwner:
                     "disk-resize",
                     "runtime-stop",
                     "vm-stop-identity",
+                    "vm-reboot-v1",
                     "vm-shutdown-v2",
                     "driver-claim-v1",
                     "guest-enhancements-v1",
+                    "operator-input-stream-v1",
                 ],
                 "owner_kind": self.kind,
                 "pid": os.getpid(),
@@ -175,6 +177,11 @@ class RuntimeOwner:
             )
         if method == "vms.restart":
             return await self.desktop.restart(vm_id)
+        if method == "vms.reboot":
+            expected = payload.get("expected_instance_id")
+            if not isinstance(expected, str) or not expected:
+                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "expected_instance_id is required")
+            return await self.desktop.reboot(vm_id, expected_instance_id=expected)
         if method == "vms.reset":
             result = await self.service.reset(vm_id)
             return (
@@ -191,10 +198,23 @@ class RuntimeOwner:
         if method == "display.ticket":
             return self.display.ticket(vm_id, str(payload["instance_id"]))
         if method == "display.sync":
-            await self.service.observe(vm_id, actor="operator")
+            try:
+                await self.service.observe(vm_id, actor="operator")
+            except PaletteError as error:
+                if error.code != ErrorCode.VM_NOT_RUNNING:
+                    raise
             return (await self.service.status(vm_id, actor="operator")).model_dump(mode="json")
         if method == "control.acquire":
             return await self.service.control.acquire(vm_id, str(payload["instance_id"]))
+        if method == "control.metrics":
+            instance = self.service.manager.get(vm_id)
+            controller = instance.controller
+            return {
+                "instance_id": instance.view.instance_id,
+                "input": controller.operator_timings.snapshot() if controller else {},
+                "runtime": self.service.control.timings.snapshot(),
+                "display": self.display.timings.snapshot(),
+            }
         if method == "control.heartbeat":
             return self.service.control.heartbeat(vm_id, str(payload["lease_id"]))
         if method == "control.release":

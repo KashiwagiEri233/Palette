@@ -101,6 +101,20 @@ test('manages multiple custom providers, imports models and only offers configur
     await page.getByRole('button', { name: '获取模型', exact: true }).click()
     await expect(page.getByRole('alert')).toContainText('认证失败')
     await expect(page.getByRole('alert')).not.toContainText('first-key')
+    const copyDebug = page.getByRole('alert').getByRole('button', { name: '复制调试信息', exact: true })
+    await application.evaluate(({ clipboard }) => {
+      const original = clipboard.writeText
+      clipboard.writeText = () => { clipboard.writeText = original; throw new Error('Test clipboard unavailable') }
+    })
+    await copyDebug.click()
+    await expect(copyDebug).toContainText('复制失败，重试')
+    await copyDebug.click()
+    await expect(copyDebug).toContainText('已复制')
+    const debugText = await application.evaluate(({ clipboard }) => clipboard.readText())
+    expect(JSON.parse(debugText)).toMatchObject({ source: 'provider', format: 'palette-debug-v1', recentFailure: { operation: 'agent.models.discover' } })
+    expect(debugText).not.toContain('first-key')
+    expect(debugText).not.toContain('多提供商草稿')
+    await page.screenshot({ path: 'test-results/provider-error-debug-info.png', animations: 'disabled' })
     await expect(page.locator('.agent-model-editor')).toHaveCount(2)
     await page.getByRole('button', { name: '保存提供商', exact: true }).click()
     await expect(page.locator('.agent-provider-editor')).toHaveCount(0)

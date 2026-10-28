@@ -4,6 +4,8 @@
 
 Palette 复用 QEMU Guest Agent、SPICE vdagent 和 spice-webdavd，并提供 Windows 用户会话助手。没有安装或没有运行这些客户机服务时，基础画面、键盘和鼠标仍可使用。没有响应表示“当前不可用”，不能直接认定未安装。后台会持续检测，在服务恢复和客户机重启后重新识别能力。QGA 继续负责二进制传输、时间同步和关机；Windows 文件管理、PowerShell、进程/注册表、App 与 UIA 使用私有 `org.palette.tools.0` 通道。
 
+在 Windows 宿主上，四条可选通道使用 AF_UNIX 套接字，每个实例在 `%TEMP%\Palette\ipc` 下使用独立、仅当前用户可访问的目录。Windows 的 QMP 使用同一实例目录下另一条私有 AF_UNIX 套接字，POSIX 的 QMP 保留子进程标准输入输出。QMP 协商与恢复运行完成后才连接客户机服务，因此缺少助手或 HELLO 响应缓慢不会阻止虚拟机启动；助手重连也不重启 QMP。消费者停止且 QEMU 退出后，后台删除该实例的套接字节点和目录。使用临时目录可避开部分 Windows 宿主上 LocalAppData 下套接字能绑定却无法连接或删除的问题。客户机 VirtIO 端口名和已安装服务均不变。
+
 ## Windows 文件、系统与应用工具
 
 按下文重建并装载 Windows 工具盘，**在客户机内**运行 `Install.cmd`。安装程序使用 Windows 自带的 .NET Framework 编译器编译随盘 C# 源码，无需 Python 或客户机网络。重启虚拟机以连接新增 VirtIO 端口，然后正常登录。`vm_status.enhancements.windows` 报告握手、交互桌面状态和实际授权能力。
@@ -31,7 +33,7 @@ PowerShell 请求接受 1–60 秒，默认 20 秒；实际时限会在 Profile 
 
 普通 Profile 在握手成功后默认开放新增能力；显式能力列表和 `strict-example` 继续保持限制，剪贴板还独立受 `guest_desktop.clipboard` 控制。旧 `vm_guest_launch_app(app_id, options)` 保留应用白名单契约，新 `vm_guest_app` 使用独立的 `guest.app` 授权。
 
-自动化测试会编译并运行 Windows 助手的分帧诊断入口，验证 Unicode 文件、PowerShell 输出/时限及临时 HKCU 值。服务安装、VirtIO 访问、登录/注销、真实窗口焦点、UIA 输入和人工接管仍须真实 Windows 虚拟机验收；模拟测试和宿主诊断测试不能替代这些验收。
+自动化测试会编译并运行 Windows 助手的分帧诊断入口，验证 Unicode 文件、PowerShell 输出/时限及临时 HKCU 值。服务安装、VirtIO 访问、登录/注销、真实窗口焦点、UIA 输入和人工接管须按具体目标进行真实 Windows 虚拟机验收；模拟测试和宿主诊断测试不能替代这些验收。
 
 QWord 注册表值超过 JavaScript 精确整数范围时，请使用十进制字符串；读取也会以十进制字符串返回此类值。Agent 响应元数据上限为 1 MiB，图片使用独立的有界二进制帧；普通操作者消息继续保持 256 KiB 上限。
 
@@ -88,7 +90,9 @@ pnputil /add-driver E:\drivers\NetKVM\w11\amd64\netkvm.inf /install
 
 ### 安装完成后安装增强服务
 
-进入 Windows 桌面后打开工具盘运行 **Install.cmd**，确认管理员权限，完成后自行重启。该脚本不用于 Windows Setup / WinPE，检测到 WinPE 时会提示从 `drivers` 加载驱动并退出。脚本验证内置文件并顺序运行上游安装程序，日志保存在 `%ProgramData%\Palette\GuestTools\Logs`。失败停止并提示日志，已安装组件保留供修复；可重跑以重试失败的安装，或通过 Windows 应用列表修复、卸载各组件。不自动重启，不修改驱动签名策略、TPM 或系统安装检查。
+进入 Windows 桌面后打开工具盘运行 **Install.cmd**，确认管理员权限，完成后自行重启。该脚本不用于 Windows Setup / WinPE，检测到 WinPE 时会提示从 `drivers` 加载驱动并退出。脚本验证内置文件后，先将匹配的 VirtIO 串口驱动加入驱动库并安装 Palette 助手，再运行上游安装程序。如果 Windows 报告没有更新任何串口设备，安装程序会提示驱动可能已是最新版本或设备不存在。日志保存在 `%ProgramData%\Palette\GuestTools\Logs`。后续上游安装失败时仍会报告安装失败，但已安装的助手保留；QGA、SPICE 和 WebDAV 可能仍不可用。可重跑以重试失败的安装，或通过 Windows 应用列表修复、卸载各组件。不自动重启，不修改驱动签名策略、TPM 或系统安装检查。
+
+安装程序会配置 WebDAV 服务在发生服务故障后重启。若 QGA 安装在 VSS 注册时失败，请检查 MSI 和 Windows COM+ 事件日志。一次精简版 Windows 11 客户机验收中，COM+ 事件 4691 显示 MS-DTC 服务被禁用；管理员将其设置为手动并启动后，重新安装成功。安装程序不会更改 MS-DTC 配置。
 
 当前支持 Windows 10/11、Server 2016 及更新的 **x64** 系统。ARM64 和 Linux 预设不装载此包；自定义配置需自行确认客户机为 Windows x64。剪贴板、Unicode 粘贴、QGA 文件操作和 WebDAV 仍需宿主 Profile 启用对应通道；装载不会改变通道策略。Windows 自动分辨率尚未提供，Linux X11 会话助手不适用于 Windows。装载不代表安装成功，安装成功不代表服务在线，Agent 继续按运行时握手和实际能力判断、降级。
 
@@ -117,7 +121,7 @@ path = "exchange"
 read_only = true
 ```
 
-共享目录的相对路径按配置根目录解析。只暴露明确配置或选择的目录。QGA 与 WebDAV 使用每个实例独立的私有通道：POSIX 为 Unix socket，Windows 为命名管道，不在宿主开放管理或文件共享 TCP 端口。升级后需重启共享后台，通道配置变化后需重启虚拟机。Windows 会在 QMP 握手之前连接命名管道，避免 QEMU 管道初始化等待客户端而阻塞。
+共享目录的相对路径按配置根目录解析。只暴露明确配置或选择的目录。QGA 与 WebDAV 在所有支持的宿主上均使用每个实例独立的私有 Unix socket，不在宿主开放管理或文件共享 TCP 端口。升级后需重启共享后台，通道配置变化后需重启虚拟机。客户机服务连接在 QMP 协商与恢复运行后开始。
 
 ## Agent 直接操作与自动降级
 
@@ -164,10 +168,13 @@ dav://127.0.0.1:9843/
 | Windows Electron 控制台 | 原有控制台流程、移除人工增强入口后的基础控制流程已通过测试；内置 pi SDK 模型工具调用另有契约测试 |
 | Linux/macOS 宿主 | 已实现 POSIX 通道；当前 Windows 开发环境未完成这些宿主的实机验收 |
 | 已安装工具的 Debian/XFCE 客户机 | 已提供安装脚本和会话助手；剪贴板、实时分辨率、QGA 操作与 WebDAV 挂载仍需真实桌面镜像验收 |
-| Windows x64 工具盘 | 固定上游包及 ISO 内容已校验；真实 QEMU 11.1 验证独立工具光驱、只读冷/热装载和弹出，原系统光盘保留；Windows 内安装与服务功能尚需验收 |
+| Windows x64 工具盘 | 固定上游包及 ISO 内容已校验；真实 QEMU 11.1 验证独立工具光驱、只读冷/热装载和弹出，原系统光盘保留 |
+| Windows 宿主/WHPX 上的 Windows 11 x64 客户机 | 真实 MCP 已验证 Palette 助手的 PowerShell、Unicode 文件和剪贴板往返、注册表、进程列表、应用启动、窗口控制及 UIA 文字输入，QGA 二进制传输和时间同步，以及只读 WebDAV 访问。正常关机并冷启动后服务恢复；主动终止 WebDAV 服务进程后也验证了自动重启。此前客户机重启后画面未恢复，冷启动后恢复桌面。冷启动后客户机时间再次慢了八小时，需重新执行 QGA 同步。 |
 | Windows/Wayland 客户机 | 不提供本项目的自动分辨率助手；客户机内 QGA/SPICE/WebDAV 能力需要单独验收 |
 
 `palette doctor` 将宿主 virtio-serial、qemu-vdagent 依赖作为非阻断检查。运行时 `vm_status.enhancements` 与操作者 `guest.status` 提供实际可用状态；QGA 在线不代表交互桌面已就绪。
+
+关机后，尚未结束的桌面能力轮询返回增强功能不可用，画面同步返回虚拟机已关机状态。修改客户机的操作仍要求虚拟机正在运行，并持有有效控制权限。
 
 单元和集成测试覆盖服务晚启动、消息分片、超时后的 QGA 重新同步、命令禁用、控制权隔离、关机结果未知、传输大小和资源清理、中文剪贴板与解压限制，以及 WebDAV 只读、中文路径与目录越界。Agent 测试覆盖无人工租约的中文输入、剪贴板与二进制传输、认证 IPC、去重和人工接管；内置 pi SDK 测试驱动模型直接调用工具。Electron 测试检查基础控制。
 

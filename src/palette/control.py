@@ -18,6 +18,7 @@ from .cleanup import close_all, join_cleanup
 from .errors import ErrorCode, PaletteError
 from .input.keyboard import QCODES
 from .operations import VmOperations
+from .timing import TimingWindow
 
 if TYPE_CHECKING:
     from .service import PaletteService
@@ -76,6 +77,7 @@ class ControlManager:
         self._operations = VmOperations()
         self._watcher: asyncio.Task[None] | None = None
         self._revocations: dict[str, asyncio.Task[None]] = {}
+        self.timings = TimingWindow()
 
     def start(self) -> None:
         if self._watcher is None or self._watcher.done():
@@ -213,7 +215,11 @@ class ControlManager:
             confirmed = result.release_confirmed
         if instance.qemu_guest_agent is not None:
             await instance.qemu_guest_agent.close_files()
-        if confirmed or instance.process is None or instance.process.returncode is not None:
+        # Once the process has exited, it cannot retain held guest inputs even if
+        # its already-closed controller could not acknowledge emergency_release.
+        if instance.process is None or instance.process.returncode is not None:
+            confirmed = True
+        if confirmed:
             self.leases.pop(vm_id, None)
         else:
             lease.state = "faulted"
@@ -321,7 +327,9 @@ class ControlManager:
 
     async def _watch(self) -> None:
         while True:
+            due = time.perf_counter() + 0.25
             await asyncio.sleep(0.25)
+            self.timings.record(loop_lag_ms=(time.perf_counter() - due) * 1000)
             for vm_id, lease in list(self.leases.items()):
                 instance = self.service.manager.find(vm_id)
                 if (

@@ -42,6 +42,7 @@ ALLOWED_COMMANDS = frozenset(
         "set_password",
         "query-cpus-fast",
         "query-block",
+        "query-chardev",
         "blockdev-change-medium",
         "blockdev-add",
         "blockdev-del",
@@ -120,11 +121,21 @@ class QmpClient:
         self._greeting: dict[str, Any] | None = None
         self._version: dict[str, Any] | None = None
         self._commands: frozenset[str] | None = None
+        self._phase = "not-started"
+        self._first_frame_at: float | None = None
+        self._started_at: float | None = None
+        self._eof = False
+        self._last_frame_at: float | None = None
+        self._protocol_errors: deque[dict[str, str]] = deque(maxlen=8)
         self.history: deque[tuple[float, str, dict[str, Any]]] = deque(maxlen=event_history)
 
     # -- lifecycle -------------------------------------------------------------------
     async def start(self) -> dict[str, Any]:
         """Read the greeting and negotiate capabilities."""
+        if self._closing:
+            raise QmpDisconnectedError("QMP client is closed")
+        self._started_at = time.monotonic()
+        self._phase = "greeting"
         waiter = self._greeting_future
         if waiter is None:
             waiter = asyncio.get_running_loop().create_future()
@@ -139,14 +150,25 @@ class QmpClient:
             raise PaletteError(
                 ErrorCode.QMP_UNAVAILABLE, "QEMU did not send a QMP greeting in time"
             ) from exc
+        except asyncio.CancelledError:
+            await self.close()
+            raise
         self._greeting = greeting
-        await self.execute("qmp_capabilities", timeout=self._handshake_timeout)
+        self._phase = "capabilities"
+        try:
+            await self.execute("qmp_capabilities", timeout=self._handshake_timeout)
+        except asyncio.CancelledError:
+            await self.close()
+            raise
         self._connected = True
+        self._phase = "ready"
         logger.debug("QMP capabilities negotiated: %s", sorted(greeting.get("QMP", {})))
         return greeting
 
     async def close(self) -> None:
         self._closing = True
+        self._connected = False
+        self._fail_pending(QmpDisconnectedError("QMP client closed"))
         if self._reader_task is not None:
             self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -159,6 +181,27 @@ class QmpClient:
         """Drain the final events before classifying a process exit."""
         if self._reader_task is not None:
             await asyncio.shield(self._reader_task)
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "transport": self._transport.kind,
+            "phase": self._phase,
+            "greeting_received": self._greeting is not None,
+            "first_frame_seconds": (
+                self._first_frame_at - self._started_at
+                if self._first_frame_at is not None and self._started_at is not None
+                else None
+            ),
+            "elapsed_seconds": (
+                time.monotonic() - self._started_at if self._started_at is not None else None
+            ),
+            "eof": self._eof,
+            "seconds_since_last_frame": (
+                time.monotonic() - self._last_frame_at if self._last_frame_at is not None else None
+            ),
+            "pending_commands": len(self._pending),
+            "protocol_errors": list(self._protocol_errors),
+        }
 
     @property
     def connected(self) -> bool:
@@ -203,7 +246,12 @@ class QmpClient:
                 f"command {command!r} is not on the reviewed QMP allow-list",
                 details={"command": command},
             )
-        if not self.connected and command != "qmp_capabilities":
+        if (
+            self._closing
+            or self._transport.reader.at_eof()
+            or (self._reader_task is not None and self._reader_task.done())
+            or (not self.connected and command != "qmp_capabilities")
+        ):
             raise QmpDisconnectedError()
 
         message_id = self._next_id()
@@ -223,7 +271,12 @@ class QmpClient:
             raise PaletteError(
                 ErrorCode.TIMEOUT,
                 f"QMP command {command!r} timed out; its effect is unknown",
-                details={"command": command, "timeout_seconds": effective},
+                details={
+                    "command": command,
+                    "timeout_seconds": effective,
+                    "request_id": message_id,
+                    "qmp": self.diagnostics(),
+                },
             ) from None
         finally:
             self._pending.pop(message_id, None)
@@ -300,7 +353,11 @@ class QmpClient:
                 except asyncio.CancelledError:
                     raise
                 if not line:
+                    self._eof = True
                     break
+                if self._first_frame_at is None:
+                    self._first_frame_at = time.monotonic()
+                self._last_frame_at = time.monotonic()
                 self._dispatch_line(line)
         except asyncio.CancelledError:
             raise
@@ -353,7 +410,16 @@ class QmpClient:
 
         message_id = message.get("id")
         if message_id is None:
-            logger.warning("QMP response without an id was discarded")
+            error = message.get("error")
+            if isinstance(error, dict):
+                diagnostic = {
+                    "class": str(error.get("class", "unknown"))[:80],
+                    "description": str(error.get("desc", ""))[:240],
+                }
+                self._protocol_errors.append(diagnostic)
+                logger.warning("QMP error without an id: %s", diagnostic)
+            else:
+                logger.warning("QMP response without an id was discarded")
             return
         future = self._pending.pop(str(message_id), None)
         if future is None:
@@ -363,6 +429,9 @@ class QmpClient:
             future.set_result(message)
 
     def _fail_pending(self, error: BaseException) -> None:
+        if self._greeting_future is not None and not self._greeting_future.done():
+            self._greeting_future.set_exception(error)
+            self._greeting_future.exception()
         for message_id, future in list(self._pending.items()):
             self._pending.pop(message_id, None)
             if not future.done():

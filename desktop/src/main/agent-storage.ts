@@ -68,4 +68,18 @@ export class AgentCredentials implements CredentialStore {
     }
     return text
   }
+  async redactJson(value: unknown): Promise<unknown> {
+    const keys: string[] = []
+    for (const info of await this.list()) {
+      const credential = await this.read(info.providerId)
+      if (credential?.type === 'api_key' && credential.key) keys.push(credential.key)
+    }
+    const redact = (item: unknown): unknown => {
+      if (typeof item === 'string') return keys.reduce((text, key) => text.split(key).join('[redacted]'), item)
+      if (Array.isArray(item)) return item.map(redact)
+      if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item).map(([key, entry]) => [key, redact(entry)]))
+      return item
+    }
+    return redact(value)
+  }
 }

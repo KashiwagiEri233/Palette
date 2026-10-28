@@ -22,6 +22,7 @@ import { useAgent, useAgentSettings } from '../lib/use-agent'
 import { MessageMarkdown } from './MessageMarkdown'
 import { ContextUsage } from './ContextUsage'
 import { ModelSelector } from './ModelSelector'
+import { CopyDebugInfoButton } from './CopyDebugInfoButton'
 
 interface Props {
   conversation: Conversation
@@ -114,7 +115,7 @@ export function ConversationPage(props: Props) {
       {!!view?.messages.length ? <div className="agent-timeline" aria-live="polite" aria-relevant="additions text">
         {view.messages.map(message => <article key={message.id} className={`agent-message agent-message-${message.role}`} data-message-role={message.role}><span className="agent-message-label">{message.role === 'user' ? '你' : message.role === 'assistant' ? 'Palette' : message.toolName ?? '系统'}</span>{message.text && ['user', 'assistant'].includes(message.role) ? <MessageMarkdown text={message.text} onError={props.reportError} /> : <div className="agent-message-text">{message.text || (message.status === 'streaming' ? '正在回复…' : message.status === 'error' ? '回复已中断' : '')}</div>}{message.status === 'error' && <span className="field-hint">回复未完成</span>}</article>)}
       </div> : <EmptyState variant="plain" heading="h1" className="conversation-empty" icon={<Sparkles size={22} />} title={props.conversation.archived ? '对话已归档' : '开始一项新任务'} description={props.conversation.archived ? '可以从搜索中找到此对话。' : '描述任务，或在右侧接管虚拟机。'} />}
-      <div className="agent-run-status" role="status">{view?.compacting ? '正在压缩上下文…' : view?.run ? `${({ starting: '正在启动', running: '正在执行', stopping: '正在停止', completed: '已完成', cancelled: '已停止', failed: '执行失败', interrupted: '任务已中断' })[view.run.state]} · ${view.run.stepCount} 次工具调用` : ''}{view?.run?.error && <p>{view.run.error}</p>}</div>
+      <div className="agent-run-status" role="status">{view?.compacting ? '正在压缩上下文…' : view?.run ? `${({ starting: '正在启动', running: '正在执行', stopping: '正在停止', completed: '已完成', cancelled: '已停止', failed: '执行失败', interrupted: '任务已中断' })[view.run.state]} · ${view.run.stepCount} 次工具调用` : ''}{view?.run?.error && <div className="agent-run-error"><p>{view.run.error}</p><CopyDebugInfoButton source="agent" error={view.run.error} vmId={props.conversation.vm_id} conversationId={props.conversation.id} /></div>}</div>
     </ScrollArea>
   </AgentChat>
 

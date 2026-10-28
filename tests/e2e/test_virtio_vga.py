@@ -29,7 +29,8 @@ pytestmark = [
 ]
 
 
-async def test_real_virtio_vga_framebuffer_keyboard_and_vnc(tmp_path):
+@pytest.mark.parametrize("enhancements", [False, True])
+async def test_real_virtio_vga_framebuffer_keyboard_and_vnc(tmp_path, enhancements, monkeypatch):
     qemu = Path(os.environ["PALETTE_VIRTIO_VGA_QEMU"]).resolve()
     image = tmp_path / "keyboard.raw"
     # Real-mode BIOS guest: set mode 13h, fill blue, wait for a key, then change color.
@@ -55,7 +56,17 @@ async def test_real_virtio_vga_framebuffer_keyboard_and_vnc(tmp_path):
             "images": {"base": str(image), "format": "raw", "size_gib": 1},
             "devices": {"display_model": "virtio-vga", "default_resolution": True},
             "resources": {"vcpus": 1, "memory_mib": 256, "process_memory_limit_mib": None},
-            "timeouts": {"settle_after_input_ms": 200},
+            "timeouts": {
+                "settle_after_input_ms": 200,
+                "qmp_handshake_seconds": 2.0 if enhancements else 10.0,
+            },
+            "guest_agent": {"enabled": enhancements},
+            "guest_tools": {"enabled": enhancements},
+            "guest_desktop": {
+                "clipboard": enhancements,
+                "resize": enhancements,
+                "shared_folders": enhancements,
+            },
             # BIOS USB polling is much slower than a desktop guest's HID driver.
             "text": {"char_interval_ms": 200},
             "network": {"mode": "offline"},
@@ -68,6 +79,17 @@ async def test_real_virtio_vga_framebuffer_keyboard_and_vnc(tmp_path):
     )
     service = PaletteService(config, audit=NullAuditLog())
     service.manager.console_enabled = True
+    if enhancements and os.name == "nt":
+        from palette import windows_unix
+
+        original_connect = windows_unix.open_connection
+
+        async def connect_after_creation(endpoint, **kwargs):
+            if Path(endpoint).stem == "tools":
+                await asyncio.sleep(0.25)
+            return await original_connect(endpoint, **kwargs)
+
+        monkeypatch.setattr(windows_unix, "open_connection", connect_after_creation)
     await service.startup()
     try:
         instance = await service.manager.start("vga-test")

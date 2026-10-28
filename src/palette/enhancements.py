@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .config import SharedFolderConfig
 from .errors import ErrorCode, PaletteError
+from .vm.manager import VmState
 
 if TYPE_CHECKING:
     from .service import PaletteService
@@ -30,6 +31,21 @@ class EnhancementRequest(BaseModel):
 
 
 def enhancement_status(instance: VmInstance) -> dict[str, Any]:
+    if instance.state is not VmState.RUNNING:
+        return {
+            "qga": {
+                "enabled": instance.profile.guest_agent.enabled,
+                "online": False,
+                "commands": [],
+                "detail": "虚拟机未运行, 客户机增强功能不可用",
+            },
+            "desktop": {
+                "clipboard": False,
+                "resize": False,
+                "reason": "虚拟机未运行, 客户机增强功能不可用",
+            },
+            "shares": {"available": False, "folders": [], "url": "dav://127.0.0.1:9843/"},
+        }
     agent = instance.qemu_guest_agent
     desktop = instance.guest_desktop
     ports = instance.enhancement_ports
@@ -80,10 +96,14 @@ class EnhancementRoutes:
         request = EnhancementRequest.model_validate(payload)
         manager = self.service.manager
         async with manager.operations.hold(vm_id):
+            # A read-only poll can arrive after shutdown but before the UI refreshes.
+            # Keep identity checks while reporting unavailable capabilities normally.
+            if method == "guest.status":
+                instance = manager.get(vm_id)
+                self.service.require_instance_id(instance, request.instance_id)
+                return enhancement_status(instance)
             instance = await manager.require_running(vm_id)
             self.service.require_instance_id(instance, request.instance_id)
-            if method == "guest.status":
-                return enhancement_status(instance)
             if request.lease_id is None:
                 raise PaletteError(ErrorCode.CONTROL_NOT_OWNED, "请先接管虚拟机")
             lease = self.service.control.validate(vm_id, request.lease_id)

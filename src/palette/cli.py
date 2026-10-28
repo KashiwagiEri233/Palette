@@ -465,6 +465,15 @@ def build_doctor_report(
         check("target_compatibility", True, execution_info(profile))
     except PaletteError as exc:
         check("target_compatibility", False, exc.message)
+    if IS_WINDOWS:
+        from .windows_unix import endpoint_directory, require_support
+
+        try:
+            require_support()
+            endpoint_directory()
+            check("qmp_socket_host", True, "private Windows AF_UNIX sockets available")
+        except PaletteError as exc:
+            check("qmp_socket_host", False, exc.message)
     try:
         binary = locate_binary(profile, config.host)
     except PaletteError as exc:

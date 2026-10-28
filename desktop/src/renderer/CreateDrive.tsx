@@ -1,3 +1,4 @@
+import { ErrorWithDebugInfo } from './components/CopyDebugInfoButton'
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog'
@@ -33,6 +34,6 @@ export function CreateDrive({ caps, onAdd, onClose }: { caps: HardwareCapabiliti
     <p className="field-hint">{removable ? '创建光驱，介质文件保留在原位置；可选择 ISO 或保持空载。' : '磁盘文件保存在虚拟机目录内；导入会复制并转换镜像，保留源文件。'}</p>
     <div><Label htmlFor="new-drive-interface">接口</Label><FormSelect id="new-drive-interface" disabled={!interfaces.length} value={current ?? ''} onValueChange={value => setSelected(value as DriveInterface)} options={interfaces.map(value => ({ value, label: interfaceNames[value] }))} /></div>
     {!removable && <><div><Label htmlFor="new-drive-size">容量 / GiB</Label><Input id="new-drive-size" type="number" min={1} max={4096} value={capacity} onChange={event => setCapacity(Number(event.target.value))} /><p className="field-hint">创建空白磁盘时使用此容量；导入时使用源镜像容量。</p></div><div><Label htmlFor="new-drive-format">镜像格式</Label><FormSelect id="new-drive-format" value={format} onValueChange={value => setFormat(value as typeof format)} options={[{ value: 'qcow2', label: 'QCOW2' }, { value: 'raw', label: 'RAW' }]} /></div></>}
-    {(!interfaces.length || error) && <p role="alert" className="text-destructive">{error || (!caps.drive_interfaces ? '后台未提供驱动器能力信息，请重启后台并重新连接。' : !caps.available ? caps.reason : '当前 QEMU 没有可用的接口。')}</p>}
+    {(!interfaces.length || error) && <ErrorWithDebugInfo className="text-destructive" error={error || (!caps.drive_interfaces ? '后台未提供驱动器能力信息，请重启后台并重新连接。' : !caps.available ? caps.reason : '当前 QEMU 没有可用的接口。')} />}
   </fieldset><DialogFooter><Button variant="secondary" disabled={busy} onClick={onClose}>取消</Button><Button variant="outline" disabled={busy || !current} onClick={() => void add(true)}>{removable ? '浏览…' : '导入…'}</Button><Button disabled={busy || !current} onClick={() => void add(false)}>创建</Button></DialogFooter></DialogContent></Dialog>
 }

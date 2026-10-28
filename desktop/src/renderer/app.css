@@ -175,6 +175,8 @@ body:has(.console-panel:fullscreen) .window-drag-region { display: none; }
 body:has(.console-panel:fullscreen) .workspace-topbar { -webkit-app-region: no-drag; }
 .console-panel:fullscreen { -webkit-app-region: no-drag; }
 .rfb-mount { width: 100%; height: 100%; }
+.console-surface:not(.captured) .rfb-mount,
+.console-surface:not(.captured) .rfb-mount * { cursor: default !important; }
 .console-placeholder { position: absolute; inset: 0; display: grid; place-items: center; padding: 32px; color: #aaa; text-align: center; pointer-events: none; }
 .sidebar-collapsed { --sidebar-width: 0px; }
 .sidebar-collapsed .app-shell .app-sidebar { display: none; }

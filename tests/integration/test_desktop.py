@@ -295,6 +295,70 @@ async def test_display_ticket_is_single_use_and_disconnect_releases(
         await owner.close()
 
 
+@pytest.mark.parametrize("held_at_disconnect", [True, False])
+async def test_late_display_cleanup_does_not_revoke_new_takeover(
+    service: PaletteService, monkeypatch: pytest.MonkeyPatch, held_at_disconnect: bool
+) -> None:
+    owner = RuntimeOwner(service)
+    closing = asyncio.Event()
+    resume = asyncio.Event()
+    finished = asyncio.Event()
+    original_handle = owner.display._handle
+
+    async def handle(ws):
+        try:
+            await original_handle(ws)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(owner.display, "_handle", handle)
+    await owner.start()
+    try:
+        await service.start("desktop")
+        instance = service.manager.get("desktop")
+        original_connect = asyncio.open_connection
+
+        async def delayed_connect(*args, **kwargs):
+            reader, writer = await original_connect(*args, **kwargs)
+            if args == instance.console_address:
+                original_closed = writer.wait_closed
+
+                async def wait_closed():
+                    closing.set()
+                    await resume.wait()
+                    await original_closed()
+
+                monkeypatch.setattr(writer, "wait_closed", wait_closed)
+            return reader, writer
+
+        monkeypatch.setattr(asyncio, "open_connection", delayed_connect)
+        url = owner.display.ticket("desktop", instance.view.instance_id)["url"]
+        async with connect(url, origin="app://palette", proxy=None) as ws:
+            assert await ws.recv() == VERSION
+            await ws.send(VERSION)
+            assert await ws.recv() == b"\x01\x01"
+            await ws.send(b"\x01")
+            assert await ws.recv() == b"\0" * 4
+            await ws.send(b"\x01")
+            assert len(await ws.recv()) >= 24
+            old = (
+                await service.control.acquire("desktop", instance.view.instance_id)
+                if held_at_disconnect
+                else None
+            )
+            await ws.close()
+            await asyncio.wait_for(closing.wait(), 3)
+            if old is not None:
+                await service.control.release("desktop", old["lease_id"])
+            new = await service.control.acquire("desktop", instance.view.instance_id)
+            resume.set()
+            await asyncio.wait_for(finished.wait(), 3)
+            assert service.control.validate("desktop", new["lease_id"])
+    finally:
+        resume.set()
+        await owner.close()
+
+
 async def test_gui_graceful_stop_never_kills_on_failure(service: PaletteService) -> None:
     desktop = DesktopManager(service)
     definition = await desktop.create(draft(service))

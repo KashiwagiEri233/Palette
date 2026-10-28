@@ -20,10 +20,11 @@ import locale
 import logging
 import os
 import re
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
-import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -434,6 +435,8 @@ class LaunchPlan:
     guest_tools_endpoint: str | None = None
     webdav_endpoint: str | None = None
     session_endpoint: str | None = None
+    guest_ipc_directory: Path | None = None
+    qmp_endpoint: str | None = None
     clipboard_enabled: bool = False
 
     def as_dict(self) -> dict[str, object]:
@@ -452,6 +455,38 @@ class LaunchPlan:
 #: caller-supplied arguments are scanned, so Palette's own `-chardev stdio,id=qmp` is not a
 #: false positive here.
 _EXTRA_CHANNEL_TOKENS = ("-mon", "-monitor", "monitor=", "-chardev", "vnc", "spice", "telnet")
+
+
+def _available_console_port() -> int:
+    """Ask the OS for a usable loopback port instead of assuming 5900 is bindable.
+
+    QEMU interprets its VNC number as a display offset from 5900. The probe is closed
+    before launch; QEMU's ``to`` range handles ordinary competing binds in that window.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = int(probe.getsockname()[1])
+    except OSError as exc:
+        raise PaletteError(
+            ErrorCode.STARTUP_FAILED,
+            "could not allocate a local display port; check loopback socket permissions",
+            details={"errno": exc.errno},
+        ) from exc
+    if port >= 5900:
+        return port
+
+    # Unusual custom ephemeral ranges can return ports QEMU cannot express as a
+    # non-negative display number. Probe the standard high range in that case.
+    for _ in range(32):
+        port = 49152 + secrets.randbelow(16384)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            continue
+    raise PaletteError(ErrorCode.STARTUP_FAILED, "could not find a free local display port")
 
 
 def _flag_extra_channels(args: Sequence[str], notes: list[str]) -> None:
@@ -628,9 +663,18 @@ def build_launch_plan(
         argv += ["-cpu", qemu.cpu]
     argv += ["-nodefaults", "-display", "none"]
     if managed_console:
-        argv += ["-vnc", "127.0.0.1:0,to=99,password=on,share=force-shared"]
+        vnc_port = _available_console_port()
+        if not 5900 <= vnc_port <= 65535:
+            raise PaletteError(ErrorCode.STARTUP_FAILED, "invalid local display port")
+        vnc_display = vnc_port - 5900
+        last_display = min(vnc_port + 99, 65535) - 5900
+        argv += [
+            "-vnc",
+            f"127.0.0.1:{vnc_display},to={last_display},password=on,share=force-shared",
+        ]
     clipboard_enabled = managed_console and profile.guest_desktop.clipboard and clipboard_available
     endpoints: dict[str, str] = {}
+    ipc_directory: Path | None = None
     if (
         profile.guest_agent.enabled
         or profile.guest_tools.enabled
@@ -648,9 +692,15 @@ def build_launch_plan(
         if not enabled:
             continue
         if IS_WINDOWS:
-            name = f"palette-{key}-{uuid.uuid4().hex}"
-            endpoints[key] = rf"\\.\pipe\{name}"
-            backend = f"pipe,id=palette-{key},path={name}"
+            from ..windows_unix import endpoint_directory, validate_endpoint
+
+            if ipc_directory is None:
+                ipc_directory = endpoint_directory()
+            endpoint = ipc_directory / f"{key}.sock"
+            validate_endpoint(str(endpoint))
+            endpoints[key] = str(endpoint)
+            path = str(endpoint).replace("\\", "/").replace(",", ",,")
+            backend = f"socket,id=palette-{key},path={path},server=on,wait=off"
         else:
             endpoints[key] = str(workdir / f"{key}.sock")
             backend = f"socket,id=palette-{key},path={key}.sock,server=on,wait=off"
@@ -776,9 +826,22 @@ def build_launch_plan(
         argv += ["-readconfig", "qemu-host-paths.conf"]
         notes.append("Windows host paths loaded through a native-codepage drive config")
 
-    # QMP over the child's own stdin/stdout, never a socket. ``signal=off`` keeps QEMU
-    # from installing host signal handlers around our channel.
-    argv += ["-chardev", "stdio,id=qmp,signal=off", "-mon", "chardev=qmp,mode=control"]
+    # Windows stdio drops bytes when the monitor applies backpressure. A private
+    # socket preserves framing under concurrent input, capture and status commands.
+    qmp_endpoint = None
+    if IS_WINDOWS:
+        from ..windows_unix import endpoint_directory, validate_endpoint
+
+        if ipc_directory is None:
+            ipc_directory = endpoint_directory()
+        endpoint = ipc_directory / "qmp.sock"
+        validate_endpoint(str(endpoint))
+        qmp_endpoint = str(endpoint)
+        path = str(endpoint).replace("\\", "/").replace(",", ",,")
+        qmp_backend = f"socket,id=qmp,path={path},server=on,wait=off"
+    else:
+        qmp_backend = "stdio,id=qmp,signal=off"
+    argv += ["-chardev", qmp_backend, "-mon", "chardev=qmp,mode=control"]
     argv += list(qemu.extra_args)
     argv += list(caller_args)
     if caller_args:
@@ -808,6 +871,8 @@ def build_launch_plan(
         guest_tools_endpoint=endpoints.get("tools"),
         webdav_endpoint=endpoints.get("webdav"),
         session_endpoint=endpoints.get("session"),
+        guest_ipc_directory=ipc_directory,
+        qmp_endpoint=qmp_endpoint,
         clipboard_enabled=clipboard_enabled,
     )
 
@@ -867,9 +932,9 @@ async def spawn_qemu(
 ) -> ManagedProcess:
     """Start QEMU detached from Palette's own standard streams.
 
-    ``stdin``/``stdout`` are the QMP pipe; MCP's stdout must stay clean, so QEMU's
-    diagnostics go to a separate ``stderr`` pipe that the manager consumes continuously
-    (an unread stderr pipe would eventually block the guest).
+    POSIX uses child stdin/stdout for QMP; Windows uses a private AF_UNIX monitor
+    with stdin disconnected and stdout drained separately. Diagnostics stay on
+    stderr, which the manager also consumes continuously.
     """
     task = asyncio.create_task(_spawn_qemu(plan, on_spawn=on_spawn))
     try:
@@ -903,6 +968,10 @@ async def _dispose_spawned(process: ManagedProcess) -> None:
 async def _spawn_qemu(
     plan: LaunchPlan, *, on_spawn: Callable[[ManagedProcess], None] | None = None
 ) -> ManagedProcess:
+    if plan.guest_ipc_directory is not None:
+        from ..windows_unix import prepare_directory
+
+        prepare_directory(plan.guest_ipc_directory)
     if plan.host_path_config is not None:
         try:
             (plan.cwd / "qemu-host-paths.conf").write_bytes(plan.host_path_config)
@@ -915,7 +984,7 @@ async def _spawn_qemu(
             return await _spawn_supervisor(plan, on_spawn=on_spawn)
         process = await asyncio.create_subprocess_exec(
             *plan.argv,
-            stdin=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL if plan.qmp_endpoint else asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(plan.cwd),

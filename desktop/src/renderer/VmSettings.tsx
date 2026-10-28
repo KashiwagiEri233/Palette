@@ -1,3 +1,4 @@
+import { ErrorWithDebugInfo } from './components/CopyDebugInfoButton'
 import { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -138,7 +139,7 @@ export function VmSettings({ vm, owner, onClose, onSaved }: { vm: VmRecord; owne
           </fieldset>
           {section === 'network' && (result.preserved_network.hostfwd.length > 0 || result.preserved_network.extra_options) && <div className="settings-preserved"><Label>沿用的 profile 网络参数</Label><p className="path-value">{[result.preserved_network.extra_options, ...result.preserved_network.hostfwd].filter(Boolean).join('\n')}</p></div>}
           {deletedIds.length > 0 && <p role="status" className="field-hint">保存时将删除 {deletedIds.length} 个受管磁盘文件。取消设置可放弃删除。</p>}
-          {error && <p role="alert" className="text-destructive settings-error">{error}</p>}
+          {error && <ErrorWithDebugInfo className="text-destructive settings-error" error={error} vmId={vm.vm_id} />}
         </div>
       </div>}
       <DialogFooter><Button variant="secondary" disabled={saving} onClick={close}>{editable ? '取消' : '关闭'}</Button>{supported && result && <Button disabled={!editable || !dirty || saving} onClick={() => void save(true)}>{saving ? '保存中…' : '保存'}</Button>}</DialogFooter>

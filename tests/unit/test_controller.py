@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import threading
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ from PIL import Image
 
 from palette.audit import NullAuditLog
 from palette.config import CaptureConfig, Profile, ResourcesConfig
-from palette.errors import ErrorCode, PaletteError
+from palette.errors import ErrorCode, PaletteError, QmpCommandError
 from palette.input.controller import ActionController, FrameRegistry, InstanceView
 from palette.models import Frame, Size
 from support.doubles import StubCaptureBackend, StubQmp
@@ -130,6 +131,36 @@ def harness_factory(profile: Profile, tmp_path: Path, base_image: Path):
 
 
 class TestObservation:
+    async def test_thumbnail_worker_cannot_publish_a_frame_after_boot_changes(
+        self, harness_factory, monkeypatch
+    ) -> None:
+        from palette.input import controller as controller_module
+
+        entered = asyncio.Event()
+        gate = threading.Event()
+        loop = asyncio.get_running_loop()
+        original = controller_module.image_thumbnail
+
+        def blocked(png: bytes) -> bytes:
+            loop.call_soon_threadsafe(entered.set)
+            gate.wait(5)
+            return original(png)
+
+        monkeypatch.setattr(controller_module, "image_thumbnail", blocked)
+        async with harness_factory() as h:
+            observation = asyncio.create_task(h.controller.observe())
+            try:
+                await asyncio.wait_for(entered.wait(), 3)
+                h.view.boot_epoch += 1
+                gate.set()
+                with pytest.raises(PaletteError) as error:
+                    await observation
+                assert error.value.code == ErrorCode.STALE_FRAME
+                assert h.controller.latest_frame is None
+            finally:
+                gate.set()
+                await asyncio.gather(observation, return_exceptions=True)
+
     async def test_observe_returns_a_frame_describing_the_delivered_image(
         self, harness_factory
     ) -> None:
@@ -1216,6 +1247,45 @@ class TestRegistryUnit:
         with pytest.raises(PaletteError) as info:
             registry.get("frame_0")
         assert info.value.code is ErrorCode.FRAME_NOT_FOUND  # evicted, not retired
+
+
+_KEY_STROKE = [{"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}}]
+
+
+class TestGuestNotRunning:
+    """A paused or shutting-down guest takes no input, and must say exactly that.
+
+    QEMU answers ``input-send-event`` with a generic "VM not running" error whenever the
+    guest is not running or suspended. Reporting that as a failed QMP command makes a
+    normal pause look like a broken channel, and on the desktop it used to cost the
+    operator the control lease for a keystroke that was never delivered.
+    """
+
+    async def test_operator_input_is_refused_before_a_paused_guest_is_touched(
+        self, harness_factory
+    ) -> None:
+        async with harness_factory() as h:
+            h.view.state = "PAUSED"
+            with pytest.raises(PaletteError) as error:
+                await h.controller.operator_input(_KEY_STROKE, lambda: None)
+            assert error.value.code is ErrorCode.VM_NOT_RUNNING
+            assert error.value.details["state"] == "PAUSED"
+            assert h.qmp.calls == []
+
+    async def test_qemu_refusing_a_non_running_guest_is_not_a_broken_command(
+        self, harness_factory
+    ) -> None:
+        qmp = StubQmp()
+        qmp.failures["input-send-event"] = QmpCommandError(
+            "GenericError", "VM not running", "input-send-event"
+        )
+        qmp.fail_after["input-send-event"] = 0
+        async with harness_factory(qmp=qmp) as h:
+            h.view.state = "RUNNING"
+            with pytest.raises(PaletteError) as error:
+                await h.controller.operator_input(_KEY_STROKE, lambda: None)
+            assert error.value.code is ErrorCode.VM_NOT_RUNNING
+            assert error.value.details["qmp_class"] == "GenericError"
 
 
 def _frame(frame_id: str) -> Frame:

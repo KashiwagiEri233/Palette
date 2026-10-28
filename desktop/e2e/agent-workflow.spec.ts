@@ -13,11 +13,25 @@ test('built-in pi configures a model, operates the VM, stops and restores histor
   const uv = process.env.PALETTE_UV ?? 'uv'
   execFileSync(uv, ['run', '--offline', 'python', resolve('scripts/setup_fixture.py'), root], { cwd: repository })
   let slow = false
+  let rejectSchema = false
   const requestedTools = new Set<string>()
   const server = createServer(async (request, response) => {
     let body = ''
     for await (const data of request) body += data
-    const payload = JSON.parse(body) as { messages: { role: string; content: unknown }[] }
+    const payload = JSON.parse(body) as { messages: { role: string; content: unknown }[]; tools?: { function?: { name: string; parameters: unknown } }[] }
+    const invalidItems = (value: unknown): boolean => {
+      if (Array.isArray(value)) return value.some(invalidItems)
+      if (!value || typeof value !== 'object') return false
+      const node = value as Record<string, unknown>
+      if ('items' in node && typeof node.items !== 'boolean' && (!node.items || typeof node.items !== 'object' || Array.isArray(node.items))) return true
+      return Object.values(node).some(invalidItems)
+    }
+    const invalid = payload.tools?.find(tool => invalidItems(tool.function?.parameters))
+    if (invalid || rejectSchema) {
+      response.writeHead(400, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ error: { message: `Invalid schema for function '${invalid?.function?.name ?? 'app'}': items must be boolean or object e2e-secret` } }))
+      return
+    }
     response.writeHead(200, { 'content-type': 'text/event-stream' })
     const chunk = (delta: unknown, reason: string | null = null) => response.write(`data: ${JSON.stringify({ id: 'palette-test', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta, finish_reason: reason }], ...(reason === 'stop' ? { usage: { prompt_tokens: 2048, completion_tokens: 128, total_tokens: 2176 } } : {}) })}\n\n`)
     chunk({ role: 'assistant' })
@@ -201,6 +215,19 @@ test('built-in pi configures a model, operates the VM, stops and restores histor
     await page.evaluate(() => document.documentElement.classList.add('dark'))
     await page.screenshot({ path: 'test-results/pi-agent-markdown-dark.png', animations: 'disabled' })
     await page.evaluate(() => document.documentElement.classList.remove('dark'))
+    rejectSchema = true
+    await page.getByRole('textbox', { name: '任务内容' }).fill('debug-private-task')
+    await page.getByRole('button', { name: '发送', exact: true }).click()
+    const runError = page.locator('.agent-run-error')
+    await expect(runError).toContainText('工具参数格式不兼容', { timeout: 20000 })
+    await runError.getByRole('button', { name: '复制调试信息', exact: true }).click()
+    await expect(runError).toContainText('已复制')
+    const debugText = await application.evaluate(({ clipboard }) => clipboard.readText())
+    expect(JSON.parse(debugText)).toMatchObject({ source: 'agent', vmId, model: { modelId: 'fixture', api: 'openai-completions' }, run: { state: 'failed' }, modelError: expect.stringContaining('Invalid schema') })
+    expect(debugText).not.toContain('e2e-secret')
+    expect(debugText).not.toContain('debug-private-task')
+    await page.screenshot({ path: 'test-results/agent-error-debug-info.png', animations: 'disabled' })
+    rejectSchema = false
     slow = true
     await page.getByRole('textbox', { name: '任务内容' }).fill('等待任务')
     await page.getByRole('button', { name: '发送', exact: true }).click()

@@ -97,6 +97,9 @@ class DisabledGuestToolBackend:
     agent would then believe its Unicode text arrived verbatim when it did not.
     """
 
+    def _unavailable(self, message: str, *, details: dict[str, Any] | None = None) -> PaletteError:
+        return PaletteError(ErrorCode.GUEST_TOOL_UNAVAILABLE, message, details=details)
+
     async def capabilities(self) -> GuestCapabilities:
         return GuestCapabilities(
             enabled=False,
@@ -111,8 +114,7 @@ class DisabledGuestToolBackend:
         target: str = "focused",
         on_sending: Callable[[], None] | None = None,
     ) -> GuestToolOutcome:
-        raise PaletteError(
-            ErrorCode.GUEST_TOOL_UNAVAILABLE,
+        raise self._unavailable(
             "guest text input is not enabled for this profile",
             details={"hint": "use vm_act with type_text for US-ASCII keyboard input"},
         )
@@ -124,8 +126,7 @@ class DisabledGuestToolBackend:
         options: dict[str, object],
         on_sending: Callable[[], None] | None = None,
     ) -> GuestToolOutcome:
-        raise PaletteError(
-            ErrorCode.GUEST_TOOL_UNAVAILABLE,
+        raise self._unavailable(
             "guest application launching is not enabled for this profile",
         )
 
@@ -139,9 +140,24 @@ class DisabledGuestToolBackend:
         *,
         on_sending: Callable[[], None] | None = None,
     ) -> GuestToolOutcome:
-        raise PaletteError(
-            ErrorCode.GUEST_TOOL_UNAVAILABLE,
+        raise self._unavailable(
             "guest enhancement tools are not enabled for this profile",
+        )
+
+
+class ConnectingGuestToolBackend(DisabledGuestToolBackend):
+    """Configured enhancements with no usable connection yet; operations stay fenced."""
+
+    def _unavailable(self, message: str, *, details: dict[str, Any] | None = None) -> PaletteError:
+        return PaletteError(
+            ErrorCode.GUEST_TOOL_UNAVAILABLE,
+            "guest enhancement tools are connecting",
+        )
+
+    async def capabilities(self) -> GuestCapabilities:
+        return GuestCapabilities(
+            enabled=True,
+            detail="guest enhancement tools are connecting",
         )
 
 

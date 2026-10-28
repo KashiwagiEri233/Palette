@@ -38,7 +38,7 @@ When `allow_agent_qemu_args = false`, Palette enforces the following controls:
 | Risk | Enforced Mitigation |
 | --- | --- |
 | **Agent reaching the host via management APIs** | No `qmp_execute`, no HMP, and no generic monitor passthrough. The QMP client enforces a static allowlist of reviewed commands; unknown commands are rejected locally before touching the pipe |
-| **Management channel exposed on the network** | QMP runs strictly over private anonymous pipes to the child process spawned by Palette — never over TCP, VNC, or SPICE sockets |
+| **Management channel exposed on the network** | QMP uses private child stdio on POSIX and instance-private AF_UNIX sockets with current-user-only directory ACLs on Windows; it never uses TCP, VNC or SPICE |
 | **Live display stream abused to inject input** | Palette Desktop's `DisplayGateway` binds strictly to localhost, requires a one-time display ticket, and drops all client write messages at the RFB protocol layer |
 | **Path traversal or accidental host file deletion** | Managed paths (`overlay.qcow2`, transient frames, logs, audit trail, persistent definitions) are constructed from trusted config and generated IDs, then verified by `PathGuard` (both lexical confinement and symlink/junction/reparse-point checks) to stay inside `runtime_root` |
 | **Data exfiltration via shared host channels** | Palette never configures `9p`, `virtiofs`, SMB shares, bidirectional host clipboards, host USB/PCI passthrough, or microphone capture, and scrubs the QEMU child process environment via an allowlist |

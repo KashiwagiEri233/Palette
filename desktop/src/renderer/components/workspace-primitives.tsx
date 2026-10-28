@@ -25,7 +25,7 @@ export function VmActions({ vm, busy, onAction, compact = false, inline = false 
     { action: 'start', label: '启动', Icon: Play, disabled: active },
     { action: 'power', label: '关机', Icon: Power, disabled: !active, title: '强制停止虚拟机，需确认' },
     { action: 'stop', label: '请求正常关机', Icon: Power, disabled: !['RUNNING', 'PAUSED'].includes(state) },
-    { action: 'restart', label: '重启', Icon: RotateCw, disabled: state !== 'RUNNING' || !vm.persistent },
+    { action: 'restart', label: '重启', Icon: RotateCw, title: '强制重启虚拟机', disabled: state !== 'RUNNING' || !vm.persistent },
     { action: 'pause', label: '暂停', Icon: Pause, disabled: true, title: '当前版本暂不支持暂停' },
     { action: 'settings', label: '虚拟机设置', Icon: Settings2, disabled: !vm.persistent },
     { action: 'tools.mount', label: '安装增强工具与驱动', Icon: Disc, disabled: !vm.persistent || vm.definition?.draft.os_preset === 'linux' || vm.status.guest_arch !== 'x86_64' || !['RUNNING', 'STOPPED', 'FAILED'].includes(state) },

@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { call } from './ipc'
+import { call, InputStream } from './ipc'
 import { RuntimeShutdown, VmShutdownTimeout } from './shutdown'
 import type { DesktopMethod, OwnerInfo, VmRecord } from '../shared/types'
 import { workspaceMethods } from '../shared/workspace'
@@ -13,6 +13,8 @@ import { PiAgentService } from './pi-agent'
 import { externalLink } from '../shared/external-link'
 import { checkedClipboard, checkedGuestPath, withGuestLease, uploadGuestFile, downloadGuestFile } from './guest-enhancements'
 import type { GuestAction } from '../shared/guest'
+import type { CopyDebugInfoRequest } from '../shared/diagnostics'
+import { DebugInfoStore, scrubDebugInfo } from './diagnostics'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const backendRoot = resolve(here, '../../..')
@@ -24,9 +26,21 @@ let handlingClose = false
 let connectionsInFlight = 0
 const shutdown = new RuntimeShutdown()
 const leases = new Map<string, string>()
+const inputStreams = new Map<string, InputStream>()
+let inputStreamGeneration: string | undefined
+
+function closeInputStream(vmId: string, leaseId?: string): void {
+  if (leaseId !== undefined && inputStreams.get(vmId)?.leaseId !== leaseId) return
+  inputStreams.get(vmId)?.close()
+  inputStreams.delete(vmId)
+}
 const guestActions = new Map<string, AbortController>()
 const repositories = new Map<string, ConversationRepository>()
 const agentServices = new Map<string, PiAgentService>()
+const debugInfo = new DebugInfoStore()
+function captureDebugFailure(root: string, operation: string, error: unknown, vmId?: string, secret?: unknown): void {
+  try { debugInfo.capture(root, operation, error, vmId, secret) } catch { /* Diagnostics must preserve the original failure. */ }
+}
 function agent(): PiAgentService {
   const root = resolve(configRoot)
   let service = agentServices.get(root)
@@ -50,9 +64,10 @@ function conversations(): ConversationRepository {
   if (!repository) { repository = new ConversationRepository(app.getPath('userData'), root); repositories.set(root, repository) }
   return repository
 }
-const methods = new Set<DesktopMethod>(['profiles', 'doctor', 'vms.list', 'vms.create', 'vms.tools.mount', 'vms.tools.eject', 'vms.update', 'vms.start', 'vms.stop', 'vms.restart', 'vms.reset', 'vms.delete', 'display.ticket', 'display.sync', 'control.acquire', 'control.input', 'control.heartbeat', 'control.release'])
+const methods = new Set<DesktopMethod>(['profiles', 'doctor', 'vms.list', 'vms.create', 'vms.tools.mount', 'vms.tools.eject', 'vms.update', 'vms.start', 'vms.stop', 'vms.restart', 'vms.reboot', 'vms.reset', 'vms.delete', 'display.ticket', 'display.sync', 'control.acquire', 'control.input', 'control.heartbeat', 'control.release'])
 methods.add('guest.status')
 methods.add('control.display.resize')
+methods.add('control.metrics')
 methods.add('image.info')
 methods.add('os_presets.list')
 methods.add('hardware.capabilities')
@@ -86,6 +101,7 @@ async function connectOwner(): Promise<OwnerInfo> {
     }
     const result = await call(runtimeRoot, 'hello')
     if (result.desktop_protocol !== 1) throw new Error('后台协议版本不兼容')
+    inputStreamGeneration = Array.isArray(result.features) && result.features.includes('operator-input-stream-v1') ? String(result.generation) : undefined
     // Agent credentials never cross the preload boundary.
     return { owner_kind: result.owner_kind, config_root: result.config_root, runtime_root: result.runtime_root, version: result.version, features: Array.isArray(result.features) ? result.features : [] } as OwnerInfo
   } finally { connectionsInFlight-- }
@@ -93,7 +109,8 @@ async function connectOwner(): Promise<OwnerInfo> {
 
 async function releaseAll(): Promise<void> {
   await Promise.all([...leases].map(async ([vmId, leaseId]) => {
-    try { const result = await call(runtimeRoot, 'control.release', vmId, { lease_id: leaseId }); if (result.release_confirmed === true) leases.delete(vmId) } catch { /* The backend lease still expires independently. */ }
+    closeInputStream(vmId, leaseId)
+    try { const result = await call(runtimeRoot, 'control.release', vmId, { lease_id: leaseId }); if (result.release_confirmed === true && leases.get(vmId) === leaseId) leases.delete(vmId) } catch { /* The backend lease still expires independently. */ }
   }))
 }
 
@@ -142,7 +159,12 @@ app.whenReady().then(async () => {
     window.webContents.send('close-request')
     void releaseAll()
   })
-  ipcMain.handle('connect', event => { trusted(event); if (handlingClose) throw new Error('正在退出，请稍候'); return connectOwner() })
+  ipcMain.handle('connect', async event => {
+    trusted(event)
+    const root = resolve(configRoot)
+    try { return await connectOwner() }
+    catch (error) { captureDebugFailure(root, 'connect', error); throw error }
+  })
   ipcMain.handle('window-backdrop', (event, opacity: unknown, background: unknown = '#f7f6f5') => {
     trusted(event)
     if (typeof opacity !== 'number' || !Number.isFinite(opacity) || opacity < 0 || opacity > 1) throw new Error('窗口遮罩参数无效')
@@ -152,7 +174,7 @@ app.whenReady().then(async () => {
     const color = `#${channels.map(channel => channel.toString(16).padStart(2, '0')).join('')}`
     window.setTitleBarOverlay({ color, symbolColor: channels.reduce((a, b) => a + b, 0) < 384 ? '#e5e5e5' : '#252525' })
   })
-  ipcMain.handle('request', async (event, method: DesktopMethod, vmId?: string, payload: Record<string, unknown> = {}) => {
+  const handleRequest = async (event: Electron.IpcMainInvokeEvent, method: DesktopMethod, vmId?: string, payload: Record<string, unknown> = {}): Promise<unknown> => {
     trusted(event)
     if ((!methods.has(method) && !workspaceMethods.has(method) && !agentMethods.has(method)) || (vmId !== undefined && !/^[A-Za-z0-9_.-]{1,128}$/.test(vmId)) || typeof payload !== 'object' || payload === null || Array.isArray(payload) || Buffer.byteLength(JSON.stringify(payload)) > (String(method) === 'agent.providers.save' ? 1024 * 1024 : 64 * 1024)) throw new Error('请求无效')
     if (handlingClose) throw new Error('正在退出，请稍候')
@@ -249,29 +271,106 @@ app.whenReady().then(async () => {
       throw new Error('不支持的会话操作')
     }
     const repository = conversations()
-    if (vmId && ['control.acquire', 'vms.stop', 'vms.restart', 'vms.reset', 'vms.delete'].includes(operation)) await agentServices.get(resolve(configRoot))?.stopVm(vmId)
     let expectedGeneration: string | undefined
+    if (method === 'vms.reboot') {
+      if (typeof payload.expected_instance_id !== 'string' || !payload.expected_instance_id) throw new Error('重启目标实例无效')
+      const owner = await call(runtimeRoot, 'hello')
+      if (!Array.isArray(owner.features) || !owner.features.includes('vm-reboot-v1')) throw new Error('后台需要升级才能强制重启虚拟机，请重启后台并重新连接后重试')
+      expectedGeneration = String(owner.generation)
+    }
+    if (vmId && ['control.acquire', 'vms.stop', 'vms.restart', 'vms.reboot', 'vms.reset', 'vms.delete'].includes(operation)) await agentServices.get(resolve(configRoot))?.stopVm(vmId)
+    if (method === 'vms.reboot' && vmId) {
+      const leaseId = leases.get(vmId)
+      closeInputStream(vmId, leaseId)
+      if (leaseId) {
+        leases.delete(vmId)
+        if (!window.isDestroyed()) window.webContents.send('control-lost', { vmId, leaseId })
+      }
+    }
     if (method === 'vms.stop' && payload.expected_instance_id !== undefined) {
       const owner = await call(runtimeRoot, 'hello')
       if (!Array.isArray(owner.features) || !owner.features.includes('vm-stop-identity')) throw new Error('后台需要升级才能校验关机目标，请重新连接后台后重试')
       expectedGeneration = String(owner.generation)
     }
-    const result = await call(runtimeRoot, method, vmId, payload, expectedGeneration)
+    const requestRoot = runtimeRoot
+    const requestConfig = resolve(configRoot)
+    const streamGeneration = inputStreamGeneration
+    if (method === 'control.acquire') expectedGeneration = streamGeneration
+    if (vmId && method === 'control.release') closeInputStream(vmId, String(payload.lease_id))
+    const stream = vmId && method === 'control.input' ? inputStreams.get(vmId) : undefined
+    if (method === 'control.input' && streamGeneration && !stream) throw new Error('人工输入连接已关闭，请重新接管')
+    const result = stream ? await stream.input(payload) : await call(requestRoot, method, vmId, payload, expectedGeneration)
     if (method === 'control.acquire' && vmId) {
+      if (requestRoot !== runtimeRoot || streamGeneration !== inputStreamGeneration) {
+        await call(requestRoot, 'control.release', vmId, { lease_id: result.lease_id }, streamGeneration)
+        throw new Error('后台已更换，请重新接管')
+      }
       leases.set(vmId, String(result.lease_id))
+      if (streamGeneration) {
+        try {
+          const opened = await InputStream.open(requestRoot, vmId, String(result.lease_id), streamGeneration)
+          if (leases.get(vmId) !== result.lease_id || requestRoot !== runtimeRoot || streamGeneration !== inputStreamGeneration) { opened.close(); throw new Error('人工控制已释放') }
+          closeInputStream(vmId)
+          inputStreams.set(vmId, opened)
+          opened.setFailureHandler(error => {
+            if (inputStreams.get(vmId) !== opened || leases.get(vmId) !== opened.leaseId || requestRoot !== runtimeRoot || streamGeneration !== inputStreamGeneration) return
+            captureDebugFailure(requestConfig, 'control.input', error, vmId)
+            // Retain the failed stream until release/reacquisition so queued input cannot
+            // fall through to the one-shot transport. Never replay an uncertain batch.
+            if (!window.isDestroyed()) window.webContents.send('control-lost', { vmId, leaseId: opened.leaseId, error: error.message })
+            void call(requestRoot, 'control.release', vmId, { lease_id: opened.leaseId }, streamGeneration).then(released => {
+              if (released.release_confirmed === true && leases.get(vmId) === opened.leaseId) leases.delete(vmId)
+            }).catch(error => captureDebugFailure(requestConfig, 'control.release', error, vmId))
+          })
+        } catch (error) {
+          await call(requestRoot, 'control.release', vmId, { lease_id: result.lease_id }, streamGeneration)
+          if (leases.get(vmId) === result.lease_id) leases.delete(vmId)
+          throw error
+        }
+      }
       if (!window.isFocused() || handlingClose) {
         try {
-          const released = await call(runtimeRoot, 'control.release', vmId, { lease_id: result.lease_id })
-          if (released.release_confirmed === true) leases.delete(vmId)
+          closeInputStream(vmId, String(result.lease_id))
+          const released = await call(requestRoot, 'control.release', vmId, { lease_id: result.lease_id }, streamGeneration)
+          if (released.release_confirmed === true && leases.get(vmId) === result.lease_id) leases.delete(vmId)
         } finally { throw new Error('窗口已失去焦点，请重新接管') }
       }
     }
     if (method === 'vms.delete' && vmId) { await agent().removeVm(vmId); await repository.removeVm(vmId) }
     if (method === 'control.release' && vmId) {
       if (result.release_confirmed !== true) throw new Error('输入释放尚未确认，已暂停写入；请检查虚拟机连接')
-      leases.delete(vmId)
+      if (leases.get(vmId) === payload.lease_id) leases.delete(vmId)
     }
     return result
+  }
+  ipcMain.handle('request', async (event, method: DesktopMethod, vmId?: string, payload: Record<string, unknown> = {}) => {
+    trusted(event)
+    const root = resolve(configRoot)
+    try { return await handleRequest(event, method, vmId, payload) }
+    catch (error) {
+      captureDebugFailure(root, String(method), error, vmId, payload?.key)
+      throw error
+    }
+  })
+  ipcMain.handle('copy-debug-info', async (event, request: CopyDebugInfoRequest) => {
+    trusted(event)
+    if (!request || !['agent', 'application', 'provider'].includes(request.source) || typeof request.error !== 'string' || request.error.length > 16000
+      || [request.vmId, request.conversationId].some(id => id !== undefined && (typeof id !== 'string' || !/^[A-Za-z0-9_.-]{1,128}$/.test(id)))) throw new Error('调试信息参数无效')
+    if (request.source === 'agent' && (!request.vmId || !request.conversationId)) throw new Error('缺少调试会话标识')
+    const root = resolve(configRoot)
+    const service = agentServices.get(root)
+    const context = service ? await service.diagnostics(request.vmId, request.conversationId).catch(() => ({})) : {}
+    const report = {
+      format: 'palette-debug-v1', capturedAt: new Date().toISOString(), source: request.source,
+      application: { version: app.getVersion(), platform: process.platform, arch: process.arch, electron: process.versions.electron, node: process.versions.node },
+      error: request.error, vmId: request.vmId, conversationId: request.conversationId,
+      recentFailure: debugInfo.find(root, request.error, request.vmId), ...context
+    }
+    let encoded = JSON.stringify(report)
+    if (service) encoded = await service.redactDiagnostics(encoded)
+    if (root !== resolve(configRoot)) throw new Error('配置目录已切换，请重新复制调试信息')
+    clipboard.writeText(JSON.stringify(scrubDebugInfo(JSON.parse(encoded)), null, 2))
+    return { copied: true }
   })
   ipcMain.handle('guest-cancel', (event, vmId: string) => { trusted(event); guestActions.get(vmId)?.abort() })
   ipcMain.handle('guest-action', async (event, vmId: string, instanceId: string, action: GuestAction, options: { path?: string; readOnly?: boolean; text?: string } = {}) => {
@@ -353,6 +452,7 @@ app.whenReady().then(async () => {
     if (!['background', 'shutdown'].includes(choice)) throw new Error('退出选项无效')
     if (choice === 'shutdown' && connectionsInFlight) throw new Error('正在连接后台，请等待连接完成后重试退出')
     const closingRuntime = runtimeRoot
+    const closingConfig = resolve(configRoot)
     handlingClose = true
     try {
       await stopAgents()
@@ -361,6 +461,7 @@ app.whenReady().then(async () => {
       allowedClose = true
       window.close()
     } catch (error) {
+      captureDebugFailure(closingConfig, 'finish-close', error, error instanceof VmShutdownTimeout ? error.target.vm_id : undefined)
       if (error instanceof VmShutdownTimeout) return { shutdownTimeout: error.target }
       throw error
     } finally {

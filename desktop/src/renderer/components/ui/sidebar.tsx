@@ -96,6 +96,7 @@ const SidebarRowActions = React.forwardRef<HTMLDivElement, React.HTMLAttributes<
       data-slot="sidebar-row-actions"
       className={cn(
         "invisible absolute inset-y-0 right-1 flex items-center bg-transparent",
+        "[&>button]:size-7 [&>button]:shrink-0 [&>button]:p-0",
         "group-hover/sidebar-row:visible group-focus-within/sidebar-row:visible group-has-[[aria-haspopup=menu][aria-expanded=true]]/sidebar-row:visible",
         className
       )}

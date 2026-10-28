@@ -1,6 +1,20 @@
 # Runs inside the Windows guest only. No host execution or Windows setup bypasses.
 param([switch]$Uninstall)
 $ErrorActionPreference = 'Stop'
+$helperInstalled = $false
+function Get-SerialDriverFamily([int]$Build, [int]$ProductType) {
+    if ($ProductType -eq 1) {
+        if ($Build -ge 22000) { return 'w11' }
+        return 'w10'
+    }
+    if ($ProductType -notin @(2, 3) -or $Build -lt 14393) {
+        throw 'The Windows version has no supported VirtIO serial driver.'
+    }
+    if ($Build -ge 26100) { return '2k25' }
+    if ($Build -ge 20348) { return '2k22' }
+    if ($Build -ge 17763) { return '2k19' }
+    return '2k16'
+}
 try {
     $architecture = $env:PROCESSOR_ARCHITECTURE
     if ($env:PROCESSOR_ARCHITEW6432) { $architecture = $env:PROCESSOR_ARCHITEW6432 }
@@ -47,21 +61,16 @@ try {
             throw ('Installation file checksum failed: ' + $payload.name)
         }
     }
-    Write-Host 'Installing VirtIO drivers, QEMU Guest Agent and SPICE Agent...'
-    $bundleLog = Join-Path $logs ($stamp + '-virtio.log')
-    $bundle = Start-Process -FilePath (Join-Path $PSScriptRoot 'virtio-win-guest-tools-0.1.285.exe') -ArgumentList ('/install /passive /norestart /log "' + $bundleLog + '"') -Wait -PassThru
-    if ($bundle.ExitCode -notin @(0, 3010)) { throw ('VirtIO installer failed: ' + $bundle.ExitCode + '. See ' + $bundleLog) }
-    Write-Host 'Installing SPICE WebDAV service...'
-    $davLog = Join-Path $logs ($stamp + '-webdav.log')
-    $davMsi = Join-Path $PSScriptRoot 'spice-webdavd-x64-2.4.msi'
-    $dav = Start-Process -FilePath 'msiexec.exe' -ArgumentList ('/i "' + $davMsi + '" /passive /norestart /L*v "' + $davLog + '"') -Wait -PassThru
-    if ($dav.ExitCode -notin @(0, 3010)) { throw ('WebDAV installer failed: ' + $dav.ExitCode + '. See ' + $davLog) }
-    foreach ($name in @('QEMU-GA', 'vdservice', 'spice-agent', 'spice-webdavd')) {
-        $service = Get-Service -Name $name -ErrorAction SilentlyContinue
-        if ($service) {
-            Set-Service -Name $name -StartupType Automatic
-            try { Start-Service -Name $name -ErrorAction Stop } catch { Write-Warning ('Service not ready yet: ' + $name + '. Restart Windows and check the service.') }
-        }
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem
+    $family = Get-SerialDriverFamily -Build ([int]$os.BuildNumber) -ProductType ([int]$os.ProductType)
+    $serialInf = Join-Path $PSScriptRoot ('drivers\vioserial\' + $family + '\amd64\vioser.inf')
+    if (-not (Test-Path -LiteralPath $serialInf)) { throw 'The matching VirtIO serial driver is missing.' }
+    Write-Host 'Installing the VirtIO serial driver...'
+    & pnputil.exe /add-driver $serialInf /install | Out-Host
+    if ($LASTEXITCODE -eq 259) {
+        Write-Warning 'No matching serial device was updated; its driver may already be current or the device may be absent.'
+    } elseif ($LASTEXITCODE -notin @(0, 3010)) {
+        throw ('VirtIO serial driver installation failed: ' + $LASTEXITCODE)
     }
     Write-Host 'Installing Palette Windows user-session tools...'
     if ($agentService) {
@@ -84,6 +93,30 @@ try {
     & sc.exe failure PaletteGuestTools reset= 86400 actions= restart/3000/restart/10000/restart/30000 | Out-Host
     if ($LASTEXITCODE -ne 0) { throw 'Could not configure guest helper recovery.' }
     Start-Service -Name 'PaletteGuestTools' -ErrorAction Stop
+    $helperInstalled = $true
+    Write-Host 'Installing VirtIO drivers, QEMU Guest Agent and SPICE Agent...'
+    $bundleLog = Join-Path $logs ($stamp + '-virtio.log')
+    $bundle = Start-Process -FilePath (Join-Path $PSScriptRoot 'virtio-win-guest-tools-0.1.285.exe') -ArgumentList ('/install /passive /norestart /log "' + $bundleLog + '"') -Wait -PassThru
+    if ($bundle.ExitCode -notin @(0, 3010)) { throw ('VirtIO installer failed: ' + $bundle.ExitCode + '. See ' + $bundleLog) }
+    Write-Host 'Installing SPICE WebDAV service...'
+    $davLog = Join-Path $logs ($stamp + '-webdav.log')
+    $davMsi = Join-Path $PSScriptRoot 'spice-webdavd-x64-2.4.msi'
+    $dav = Start-Process -FilePath 'msiexec.exe' -ArgumentList ('/i "' + $davMsi + '" /passive /norestart /L*v "' + $davLog + '"') -Wait -PassThru
+    if ($dav.ExitCode -notin @(0, 3010)) { throw ('WebDAV installer failed: ' + $dav.ExitCode + '. See ' + $davLog) }
+    if (-not (Get-Service -Name 'spice-webdavd' -ErrorAction SilentlyContinue)) {
+        throw 'WebDAV service is missing after installation.'
+    }
+    # The upstream proxy can exit during Windows startup. Let the service manager
+    # recover instead of leaving sharing stopped until an administrator starts it.
+    & sc.exe failure spice-webdavd reset= 86400 actions= restart/3000/restart/10000/restart/30000 | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'Could not configure WebDAV service recovery.' }
+    foreach ($name in @('QEMU-GA', 'vdservice', 'spice-agent', 'spice-webdavd')) {
+        $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($service) {
+            Set-Service -Name $name -StartupType Automatic
+            try { Start-Service -Name $name -ErrorAction Stop } catch { Write-Warning ('Service not ready yet: ' + $name + '. Restart Windows and check the service.') }
+        }
+    }
     Write-Host ('Installation completed. Logs: ' + $logs)
     Write-Host 'Restart Windows before using guest tools. Palette detects live service capabilities after boot and login.'
     Write-Host 'Palette detects file/system/App/UIA tools after a normal user logs in. The transport service never executes these operations as SYSTEM.'
@@ -92,6 +125,7 @@ try {
     exit 0
 } catch {
     Write-Host ('Installation failed: ' + $_.Exception.Message) -ForegroundColor Red
+    if ($helperInstalled) { Write-Host 'The Palette helper was installed. Check the serial driver and Palette status; other components may be unavailable.' }
     try { Stop-Transcript | Out-Null } catch { }
     exit 1
 }

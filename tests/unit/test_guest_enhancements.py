@@ -23,6 +23,7 @@ from palette.guest_desktop import CAPS, PROVIDE, TEXT, RfbGuestDesktop, decode_c
 from palette.guest_session import GuestSession
 from palette.guest_shares import MUX, GuestShares
 from palette.vm.launcher import build_launch_plan
+from palette.vm.manager import VmState
 
 
 class AgentWire:
@@ -284,6 +285,7 @@ def test_features_degrade_independently_and_resize_requires_live_session(
         }
     )
     instance = SimpleNamespace(
+        state=VmState.RUNNING,
         qemu_guest_agent=None,
         guest_desktop=SimpleNamespace(connected=True),
         enhancement_ports={"palette-vdagent": True, "palette-session": True},
@@ -302,6 +304,25 @@ def test_features_degrade_independently_and_resize_requires_live_session(
     assert enhancement_status(instance)["desktop"]["resize"]
     monkeypatch.setattr("palette.guest_session.time.monotonic", lambda: 19)
     assert not enhancement_status(instance)["desktop"]["resize"]
+
+
+@pytest.mark.parametrize("state", [state for state in VmState if state is not VmState.RUNNING])
+def test_nonrunning_guest_does_not_advertise_live_enhancements(profile, state):
+    agent = SimpleNamespace(status=lambda: {"online": True, "commands": ["guest-sync"]})
+    shares = SimpleNamespace(status=lambda enabled: {"available": True})
+    instance = SimpleNamespace(
+        state=state,
+        profile=profile,
+        qemu_guest_agent=agent,
+        guest_desktop=SimpleNamespace(connected=True),
+        guest_shares=shares,
+    )
+    status = enhancement_status(instance)
+    assert status["qga"]["online"] is False
+    assert status["qga"]["commands"] == []
+    assert status["desktop"]["clipboard"] is False
+    assert status["desktop"]["resize"] is False
+    assert status["shares"]["available"] is False
 
 
 async def test_webdav_head_preserves_file_length_without_sending_body(tmp_path):

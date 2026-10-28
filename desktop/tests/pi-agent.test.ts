@@ -39,6 +39,8 @@ async function environment() {
   const requests: Record<string, unknown>[] = []
   let slow = false
   let fail = false
+  let failureStatus = 401
+  let failureMessage = 'test-secret unauthorized'
   let measuredUsage = false
   let script: { name: string; arguments: Record<string, unknown> }[] | undefined
   const server = createServer(async (request, response) => {
@@ -47,7 +49,20 @@ async function environment() {
     const payload = JSON.parse(body)
     requests.push(payload)
     expect(request.headers.authorization).toBe('Bearer test-secret')
-    if (fail) { response.writeHead(401, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: { message: 'test-secret unauthorized' } })); return }
+    if (fail) { response.writeHead(failureStatus, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: { message: failureMessage } })); return }
+    const invalidItems = (value: unknown): boolean => {
+      if (Array.isArray(value)) return value.some(invalidItems)
+      if (!value || typeof value !== 'object') return false
+      const object = value as Record<string, unknown>
+      if ('items' in object && typeof object.items !== 'boolean' && (!object.items || typeof object.items !== 'object' || Array.isArray(object.items))) return true
+      return Object.values(object).some(invalidItems)
+    }
+    // Mirror the endpoint's JSON Schema meta-validation, not just its SSE response.
+    if (invalidItems(payload.tools)) {
+      response.writeHead(400, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ error: { message: 'Invalid schema for function: items must be boolean or object' } }))
+      return
+    }
     response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' })
     const chunk = (delta: unknown, finishReason: string | null = null) => response.write(`data: ${JSON.stringify({ id: 'chatcmpl-palette', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta, finish_reason: finishReason }], ...(measuredUsage && finishReason === 'stop' ? { usage: { prompt_tokens: 2048, completion_tokens: 128, total_tokens: 2176 } } : {}) })}\n\n`)
     chunk({ role: 'assistant' })
@@ -81,7 +96,7 @@ async function environment() {
   const configuration: AgentConfiguration = { providerId: 'custom-fixture', modelId: 'fixture', api: 'openai-completions', baseUrl: `http://127.0.0.1:${address.port}/v1`, custom: true, contextWindow: 128000, maxTokens: 1024, vision: true, reasoning: false, thinkingLevel: 'off', maxSteps: 100 }
   await service.saveProvider({ id: configuration.providerId, name: 'Fixture', api: configuration.api, baseUrl: configuration.baseUrl, models: [{ ...configuration, id: configuration.modelId, name: configuration.modelId }] }, 'test-secret')
   await service.updateSettings(configuration)
-  return { root, id, service, create, conversations, client, requests, events, configuration, script: (steps: NonNullable<typeof script>) => { script = steps }, slow: () => { slow = true }, fail: () => { fail = true }, measure: () => { measuredUsage = true },
+  return { root, id, service, create, conversations, client, requests, events, configuration, script: (steps: NonNullable<typeof script>) => { script = steps }, slow: () => { slow = true }, fail: (message?: string, status = 401) => { fail = true; failureStatus = status; failureMessage = message ?? failureMessage }, measure: () => { measuredUsage = true },
     close: async () => { await service.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); await rm(root, { recursive: true, force: true }) } }
 }
 async function settled(service: PiAgentService, id: string) {
@@ -162,11 +177,64 @@ it('reports provider failures while preserving the prompt and removing echoed cr
     await test.service.start('vm', test.id, 'keep this prompt', randomUUID())
     const result = await settled(test.service, test.id)
     expect(result.view.run?.state).toBe('failed')
+    expect(result.view.run?.error).toContain('HTTP 401')
+    expect(result.view.run?.error).not.toContain('test-secret')
     expect(result.view.messages.some(message => message.text === 'keep this prompt')).toBe(true)
     const directory = join(test.service.directory, 'sessions', test.id)
     const file = (await readdir(directory)).find(file => file.endsWith('.jsonl'))!
     expect(await readFile(join(directory, file), 'utf8')).not.toContain('test-secret')
   } finally { await test.close() }
+}, 20000)
+
+it('reports a rejected tool schema as an application compatibility error and redacts persisted details', async () => {
+  const test = await environment()
+  try {
+    test.fail("Invalid schema for function 'app': test-secret items is not of types boolean, object", 400)
+    await test.service.start('vm', test.id, 'keep this task', randomUUID())
+    const result = await settled(test.service, test.id)
+    expect(result.view.run?.error).toContain('工具参数格式不兼容')
+    expect(result.view.run?.error).toContain("'app'")
+    expect(result.view.run?.error).not.toContain('test-secret')
+    const run = await readFile(join(test.service.directory, 'sessions', test.id, 'run.json'), 'utf8')
+    expect(run).toContain('HTTP 400')
+    expect(run).not.toContain('test-secret')
+    expect(test.client.calls.at(-1)).toBe('driver_release')
+    const diagnostics = await test.service.diagnostics('vm', test.id)
+    expect(diagnostics).toMatchObject({ vmId: 'vm', conversationId: test.id, model: { api: 'openai-completions' }, run: { state: 'failed' }, modelError: expect.stringContaining('Invalid schema') })
+    expect(JSON.stringify(diagnostics)).not.toContain('test-secret')
+    expect(JSON.stringify(diagnostics)).not.toContain('keep this task')
+    const metadata = JSON.parse(run)
+    metadata.run.error = '模型请求失败，请检查端点、密钥和模型配置'
+    await atomicJson(join(test.service.directory, 'sessions', test.id, 'run.json'), metadata)
+    const reopened = test.create()
+    try {
+      expect((await reopened.snapshot('vm', test.id)).view.run?.error).toContain('工具参数格式不兼容')
+    } finally { await reopened.close() }
+  } finally { await test.close() }
+}, 20000)
+
+it('sends built-in DeepSeek Flash tool declarations accepted by schema-validating endpoints', async () => {
+  const test = await environment()
+  const fetch = globalThis.fetch.bind(globalThis)
+  const models = (await test.service.settings()).models
+  const model = models.find(model => model.providerId === 'deepseek' && model.id === 'deepseek-flash')!
+  expect(model).toBeDefined()
+  const intercept = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+    const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+    if (url.origin !== new URL(model.baseUrl).origin) throw new Error('Unexpected model network request')
+    const target = test.configuration.baseUrl + '/chat/completions'
+    return fetch(input instanceof Request ? new Request(target, input) : target, init)
+  })
+  try {
+    await test.service.configureCredential('deepseek', 'test-secret')
+    await test.service.updateSettings({ ...test.configuration, providerId: 'deepseek', modelId: 'deepseek-flash', custom: false, thinkingLevel: 'max' })
+    await test.service.start('vm', test.id, 'test tool schema compatibility', randomUUID())
+    const result = await settled(test.service, test.id)
+    expect(result.view.run?.state).toBe('completed')
+    expect(test.requests[0].model).toBe('deepseek-flash')
+    expect((test.requests[0].tools as { function: { name: string } }[]).some(tool => tool.function.name === 'app')).toBe(true)
+    expect(result.view.run?.error).toBeUndefined()
+  } finally { intercept.mockRestore(); await test.close() }
 }, 20000)
 
 it('validates custom endpoints and bounds before saving configuration', () => {
@@ -434,6 +502,8 @@ it('rejects invalid Windows tool arguments in the real SDK before sending any gu
       { name: 'powershell', arguments: { ...identity, command: 'Get-Process', timeout_seconds: 61 } },
       { name: 'multi_select', arguments: { ...identity, locs: [[10, 20]] } },
       { name: 'multi_edit', arguments: { ...identity, frame_id: 'frame', locs: [[10, 'missing-y']] } },
+      { name: 'multi_edit', arguments: { ...identity, frame_id: 'frame', locs: [[10, 'invalid-y', 'text']] } },
+      { name: 'multi_edit', arguments: { ...identity, frame_id: 'frame', labels: [['invalid-label', 'text']] } },
       { name: 'registry', arguments: { ...identity, mode: 'set', path: 'HKCU:\\Software\\Palette', name: 'Invalid', value: { command: 'not registry data' } } },
       { name: 'app', arguments: { ...identity, mode: 'resize', window_id: 'window-1', window_size: [0, 600] } },
       { name: 'snapshot', arguments: { ...identity, max_elements: 2001 } }

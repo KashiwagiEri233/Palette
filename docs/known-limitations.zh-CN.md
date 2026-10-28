@@ -28,7 +28,7 @@
 * **开启 `allow_agent_qemu_args` 会取消宿主机边界**：允许调用方追加原始 QEMU 参数等同于允许读写宿主机文件或开启第二条控制通道（详见[威胁模型](threat-model.zh-CN.md)）。在需要严格隔离的环境中，请务必将其设为 `false`（如 `profiles/strict-example.toml`）。
 * **像素校验无法替代业务层语义确认**：`frame_id` 校验保证点击落在你所见截图的准确像素上，但网页或窗口可能在两张外表相同的截图之间移动按钮位置。涉及付款、删除或提交表单时，调用方必须实施自己的业务确认策略。
 * **幂等去重仅限单次服务进程生命周期内**：`request_id` 去重表保存在当前服务进程的有界内存中。若服务在发出输入后、记录回执前崩溃或断连，会返回 `unknown`（`ACTION_OUTCOME_UNKNOWN`）而非自动重放。
-* **私有匿名 QMP 管道不可跨服务重启恢复**：当 `daemon` 或 `serve` 进程退出时，Windows Job Object 或 POSIX Supervisor 会自动清理其管理的 QEMU 子进程；重启服务后需重新启动虚拟机实例（持久虚拟机的磁盘与 UEFI 变量在重启后依然完整保留）。
+* **私有 QMP 会话不可跨服务重启恢复**：当 `daemon` 或 `serve` 进程退出时，Windows Job Object 或 POSIX Supervisor 会自动清理其管理的 QEMU 子进程；重启服务后需重新启动虚拟机实例（持久虚拟机的磁盘与 UEFI 变量在重启后依然完整保留）。
 * **不观测客户机硬件光标位置**：除非当前服务自己在本次实例中移动过指针，否则 `cursor_position_source` 始终报告为 `not_observed`。
 * **`screendump` 非事务性原子快照**：QMP 帧缓冲导出在客户机高帧率刷新时可能出现轻微画面撕裂。
 

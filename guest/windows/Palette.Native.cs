@@ -118,7 +118,10 @@ internal static class Native {
             if(!DuplicateTokenEx(linked!=IntPtr.Zero?linked:token,0x02000000,IntPtr.Zero,2,1,out primary)) throw new Win32Exception();
             using(var identity=new WindowsIdentity(primary)) sid=identity.User;
             if(!CreateEnvironmentBlock(out env,primary,false)) throw new Win32Exception();
-            var start=new StartupInfo(); start.cb=Marshal.SizeOf(start); start.desktop=@"winsta0\default";
+            // Let Windows select the logged-in user's session desktop. Explicitly naming
+            // WinSta0\Default can make CreateProcessAsUser's child fail during DLL startup.
+            // Interactive operations still require the worker's input-desktop check.
+            var start=new StartupInfo(); start.cb=Marshal.SizeOf(start);
             ProcessInfo process;
             var args=new StringBuilder(Quote(executable)+" --worker "+Quote(pipe));
             if(!CreateProcessAsUser(primary,executable,args,IntPtr.Zero,IntPtr.Zero,false,0x08000400,env,Path.GetDirectoryName(executable),ref start,out process)) throw new Win32Exception();
@@ -131,8 +134,8 @@ internal static class Native {
         try { using(var identity=new WindowsIdentity(token)) return identity.User; } finally { CloseHandle(token); }
     }
     internal static uint StartDetachedApplication(string executable,string arguments,string cwd) {
-        // Apps intentionally outlive a helper reconnect; command subprocesses do not.
-        var start=new StartupInfo(); start.cb=Marshal.SizeOf(start); start.desktop=@"winsta0\default";
+        // Apps intentionally outlive a helper reconnect and inherit the worker's desktop.
+        var start=new StartupInfo(); start.cb=Marshal.SizeOf(start);
         ProcessInfo process;
         if(!CreateProcess(executable,new StringBuilder(Quote(executable)+" "+arguments),IntPtr.Zero,IntPtr.Zero,false,0x01000000,IntPtr.Zero,cwd,ref start,out process)) throw new Win32Exception();
         CloseHandle(process.thread); CloseHandle(process.process); return process.pid;

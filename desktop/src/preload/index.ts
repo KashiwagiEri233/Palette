@@ -4,6 +4,7 @@ import type { WorkspaceMethod } from '../shared/workspace'
 import type { AgentMethod, AgentEvent } from '../shared/agent'
 
 const api: DesktopApi = {
+  copyDebugInfo: request => ipcRenderer.invoke('copy-debug-info', request),
   guestAction: (vmId, instanceId, action, options) => ipcRenderer.invoke('guest-action', vmId, instanceId, action, options),
   cancelGuestAction: vmId => ipcRenderer.invoke('guest-cancel', vmId),
   onGuestProgress: callback => { const listener = (_event: Electron.IpcRendererEvent, event: import('../shared/guest').GuestProgress): void => callback(event); ipcRenderer.on('guest-progress', listener); return () => ipcRenderer.removeListener('guest-progress', listener) },
@@ -18,4 +19,4 @@ const api: DesktopApi = {
   finishClose: choice => ipcRenderer.invoke('finish-close', choice)
 }
 contextBridge.exposeInMainWorld('palette', api)
-ipcRenderer.on('control-lost', () => window.dispatchEvent(new Event('palette-control-lost')))
+ipcRenderer.on('control-lost', (_event, detail?: { vmId: string; leaseId: string; error?: string }) => window.dispatchEvent(new CustomEvent('palette-control-lost', { detail })))

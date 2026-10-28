@@ -64,6 +64,6 @@ Backend tests live under `tests/`; desktop tests live under `desktop/tests/` and
 * **`tests/qmp/`**: QMP protocol tests against a programmable in-process QMP peer covering framing, timeouts, disconnects, and interleaved events.
 * **`tests/guest_tools/`**: Guest enhancement contract tests against a mock transport verifying capability intersection, timeouts, and receipts.
 * **`tests/operator_ipc/`**: Local operator IPC framing, payload limits, and Windows Named Pipe adapter tests.
-* **`tests/integration/`**: Real supervised child processes speaking QMP over real pipes, plus `daemon`, persistent desktop definitions, and the MCP tool surface.
+* **`tests/integration/`**: Real supervised child processes speaking QMP over real pipes or AF_UNIX sockets, plus `daemon`, persistent desktop definitions, and the MCP tool surface.
 * **`tests/e2e/`**: Physical QEMU hardware acceleration and guest image acceptance tests (skipped unless `PALETTE_E2E=1` is set).
 * **`desktop/tests/` & `desktop/e2e/`**: Vitest unit tests for frontend/IPC logic and Playwright Electron end-to-end tests covering VM creation, hardware settings, live console, and shutdown flows.

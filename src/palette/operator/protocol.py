@@ -88,12 +88,15 @@ class DesktopCommand(StrictModel):
         "vms.start",
         "vms.stop",
         "vms.restart",
+        "vms.reboot",
         "vms.reset",
         "vms.delete",
         "display.ticket",
         "display.sync",
         "control.acquire",
         "control.input",
+        "control.stream.open",
+        "control.metrics",
         "control.heartbeat",
         "control.release",
         "guest.status",
@@ -173,11 +176,19 @@ def decode_json(data: bytes) -> dict[str, Any]:
 
 
 async def receive_frame(
-    channel: Channel, *, timeout: float = FRAME_TIMEOUT, max_bytes: int = MAX_FRAME_BYTES
+    channel: Channel,
+    *,
+    timeout: float = FRAME_TIMEOUT,
+    max_bytes: int = MAX_FRAME_BYTES,
+    first_byte: bytes = b"",
 ) -> bytes:
     # One deadline covers header and body, including a peer trickling partial bytes.
     async with asyncio.timeout(timeout):
-        (size,) = _HEADER.unpack(await channel.readexactly(_HEADER.size))
+        if len(first_byte) > 1:
+            raise ValueError("invalid frame prefix")
+        (size,) = _HEADER.unpack(
+            first_byte + await channel.readexactly(_HEADER.size - len(first_byte))
+        )
         if not 0 < size <= max_bytes:
             raise PaletteError(ErrorCode.INVALID_ARGUMENT, "invalid operator message length")
         return await channel.readexactly(size)

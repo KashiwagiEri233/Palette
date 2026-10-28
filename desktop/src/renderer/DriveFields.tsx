@@ -1,3 +1,4 @@
+import { ErrorWithDebugInfo } from './components/CopyDebugInfoButton'
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -28,6 +29,6 @@ export function DriveFields({ drive, change, remove, resize, resizeDisabled, inf
     {info?.path && <p className="path-value">{info.path}</p>}
     {resize && <div><Button variant="outline" disabled={resizeDisabled} onClick={resize}>扩容磁盘</Button><p className="field-hint">容量只能增大；需先保存或丢弃其他修改。</p></div>}
     <div className="drive-remove"><Button variant="destructive" onClick={remove}>删除驱动器…</Button><p className="field-hint">{info ? '保存后删除此磁盘文件及设备，取消设置可放弃删除。' : '删除在保存后生效；外部源文件和 ISO 保留。'}</p></div>
-    {error && <p role="alert" className="text-destructive">{error}</p>}
+    {error && <ErrorWithDebugInfo className="text-destructive" error={error} />}
   </div>
 }

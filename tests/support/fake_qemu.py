@@ -565,6 +565,41 @@ def render_png(width: int, height: int, *, frame: int) -> bytes:
     )
 
 
+def socket_monitor(argv: list[str]):
+    option = next((arg for arg in argv if arg.startswith("socket,id=qmp,path=")), None)
+    if option is None:
+        return None
+    options = option.replace(",,", "\0").split(",")
+    endpoint = next(item[5:].replace("\0", ",") for item in options if item.startswith("path="))
+    with socket.socket(1, socket.SOCK_STREAM) as listener:
+        if os.name == "nt":
+            import ctypes
+
+            class Address(ctypes.Structure):
+                _fields_ = [("family", ctypes.c_ushort), ("path", ctypes.c_char * 108)]
+
+            library = ctypes.WinDLL("ws2_32")
+            bind = library.bind
+            bind.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int]
+            bind.restype = ctypes.c_int
+            accept = library.accept
+            accept.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+            accept.restype = ctypes.c_size_t
+            address = Address(family=1, path=endpoint.encode("utf-8"))
+            if bind(listener.fileno(), ctypes.byref(address), ctypes.sizeof(address)):
+                raise OSError("fake QEMU could not bind its QMP socket")
+            listener.listen(1)
+            handle = accept(listener.fileno(), None, None)
+            if handle == ctypes.c_size_t(-1).value:
+                raise OSError("fake QEMU could not accept its QMP peer")
+            connection = socket.socket(1, socket.SOCK_STREAM, fileno=handle)
+        else:
+            listener.bind(endpoint)
+            listener.listen(1)
+            connection, _ = listener.accept()
+    return connection.makefile("rw", encoding="utf-8")
+
+
 def main(argv: list[str]) -> int:
     if "--version" in argv:
         print(f"QEMU emulator version {VERSION} (fake test double)")
@@ -601,6 +636,9 @@ def main(argv: list[str]) -> int:
         print("Available audio drivers:\ncoreaudio\ndsound\npipewire\npa\nalsa")
         return 0
 
+    monitor = socket_monitor(argv)
+    if monitor is not None:
+        sys.stdin = sys.stdout = monitor
     qemu = FakeQemu(argv)
 
     def on_signal(signum, _frame):

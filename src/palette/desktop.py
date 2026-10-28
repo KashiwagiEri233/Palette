@@ -669,6 +669,28 @@ class DesktopManager:
             root / "manifest.json",
         )
 
+    async def reboot(self, vm_id: str, *, expected_instance_id: str) -> dict[str, Any]:
+        """Reset the running hardware without replacing its process or writable storage."""
+        manager = self.service.manager
+        manager.operations.require_accepting()
+        async with manager.operations.hold(vm_id):
+            manager.operations.require_accepting()
+            instance = await manager.require_running(vm_id)
+            self.service.require_instance_id(instance, expected_instance_id)
+            if instance.qmp is None or not instance.view.qmp_ready:
+                raise PaletteError(ErrorCode.QMP_UNAVAILABLE, "the management channel is not ready")
+            if not await self.service.control.revoke(vm_id):
+                raise PaletteError(ErrorCode.QMP_UNAVAILABLE, "input release was not confirmed")
+            await manager.take_control(vm_id, expected_instance_id=expected_instance_id)
+            manager.operations.require_accepting()
+            await manager.require_running(vm_id)
+            await instance.qmp.execute("system_reset")
+            return {
+                "vm_id": vm_id,
+                "instance_id": instance.view.instance_id,
+                "state": str(instance.state),
+            }
+
     async def restart(self, vm_id: str) -> dict[str, Any]:
         async with self.service.manager.operations.hold(vm_id, starting=True):
             await self._stop_before_rebuild(vm_id)

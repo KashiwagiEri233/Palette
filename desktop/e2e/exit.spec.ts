@@ -113,11 +113,161 @@ test('power buttons confirm forced shutdown, cancel safely and preserve persiste
       await confirmation.getByRole('button', { name: '确认', exact: true }).click()
       await expect(confirmation).toBeHidden({ timeout: 10000 })
       expect(await status()).toMatchObject({ state: 'STOPPED', process_running: false })
+      const latePolls = await page.evaluate(async ({ vmId, instanceId }) => {
+        const guest = await window.palette.request('guest.status', vmId, { instance_id: instanceId }) as { qga: { online: boolean }; desktop: { resize: boolean } }
+        const display = await window.palette.request('display.sync', vmId) as { status: { state: string } }
+        return { guest, display }
+      }, { vmId, instanceId: before.instance_id })
+      expect(latePolls.guest.qga.online).toBe(false)
+      expect(latePolls.guest.desktop.resize).toBe(false)
+      expect(latePolls.display.status.state).toBe('STOPPED')
+      await expect(page.locator('.desktop-error')).toHaveCount(0)
       expect(await readFile(disk)).toEqual(diskBefore)
       const commands = (await readFile(`${disk}.log.jsonl`, 'utf8')).trim().split('\n').map(line => JSON.parse(line).command)
       expect(commands).not.toContain('system_powerdown')
       expect(commands).toContain('quit')
     }
+  } finally { await cleanup(root, applications) }
+})
+
+test('restart entries reset hardware directly and release human control without replacing the instance', async () => {
+  test.setTimeout(120000)
+  const root = await fixture()
+  const applications: ElectronApplication[] = []
+  try {
+    const application = await launch(root)
+    applications.push(application)
+    const page = await application.firstWindow()
+    const vmId = await page.evaluate(async path => {
+      const vm = await window.palette.request('vms.create', undefined, { name: '硬件重启测试', profile_id: 'default', source: 'image', path, vcpus: 1, memory_mib: 512, disk_gib: 24, network: 'offline' }) as { vm_id: string }
+      await window.palette.request('vms.start', vm.vm_id)
+      return vm.vm_id
+    }, join(root, 'base.qcow2'))
+    const status = () => page.evaluate(async id => {
+      const { vms } = await window.palette.request('vms.list') as { vms: { vm_id: string; status: { state: string; instance_id: string; boot_epoch: number; process_running: boolean; control_state: string; input_ledger: { keys: string[]; buttons: string[] } } }[] }
+      return vms.find(vm => vm.vm_id === id)!.status
+    }, vmId)
+    const initial = await status()
+    const definition = JSON.parse(await readFile(join(root, '.runtime', 'definitions', `${vmId}.json`), 'utf8'))
+    const disk = join(root, '.runtime', 'vms', vmId, definition.storage_owner, 'disk', 'overlay.qcow2')
+    const before = await readFile(disk)
+    await writeFile(`${disk}.behavior.json`, JSON.stringify({ ignore_powerdown: true }))
+    const commands = async (): Promise<string[]> => (await readFile(`${disk}.log.jsonl`, 'utf8')).trim().split('\n').map(line => JSON.parse(line).command).filter(Boolean)
+    let resets = 0
+    for (const entry of ['console', 'console-menu', 'list', 'menu']) {
+      const width = entry === 'console-menu' ? 760 : 1440
+      await application.evaluate(({ BrowserWindow }, width) => {
+        const window = BrowserWindow.getAllWindows()[0]
+        window.setMinimumSize(600, 700)
+        window.setContentSize(width, 900)
+      }, width)
+      await page.waitForFunction(width => innerWidth === width, width)
+      await page.getByRole('button', { name: '虚拟机管理', exact: true }).click()
+      const row = page.getByRole('row').filter({ hasText: '硬件重启测试' })
+      await expect(row.getByText('运行中', { exact: true })).toBeVisible()
+      if (entry !== 'list') {
+        await row.getByRole('button', { name: '打开', exact: true }).click()
+        await expect(page.locator('.console-panel canvas')).toBeVisible()
+      }
+      if (entry === 'console' || entry === 'console-menu') {
+        await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].focus())
+        await page.getByRole('button', { name: '接管', exact: true }).click()
+        await expect(page.getByText('人工控制', { exact: true })).toBeVisible()
+        await page.keyboard.down('a')
+      }
+      if (entry === 'console') {
+        const button = page.locator('.console-panel').getByRole('button', { name: '重启', exact: true })
+        await expect(button).toBeEnabled()
+        // Two synchronous activations must still issue only one reset.
+        await button.evaluate(element => { (element as HTMLButtonElement).click(); (element as HTMLButtonElement).click() })
+      } else if (entry === 'console-menu') {
+        await page.getByRole('button', { name: '更多画面操作', exact: true }).click()
+        await page.getByRole('menuitem', { name: '重启虚拟机', exact: true }).click()
+      } else if (entry === 'list') {
+        await row.getByRole('button', { name: '重启', exact: true }).click()
+      } else {
+        await page.locator('.desktop-main').getByRole('button', { name: '硬件重启测试 的操作', exact: true }).click()
+        await page.getByRole('menuitem', { name: '重启', exact: true }).click()
+      }
+      resets++
+      await expect.poll(async () => (await status()).boot_epoch).toBe(initial.boot_epoch + resets)
+      await page.keyboard.up('a')
+      await expect(page.getByRole('dialog')).toHaveCount(0)
+      await expect(page.locator('.desktop-shutdown-status')).toHaveCount(0)
+      await expect(page.locator('.desktop-error')).toHaveCount(0)
+      await expect.poll(status).toMatchObject({ state: 'RUNNING', instance_id: initial.instance_id, process_running: true, control_state: 'available', input_ledger: { keys: [], buttons: [] } })
+      expect((await commands()).filter(command => command === 'system_reset')).toHaveLength(resets)
+      expect(await commands()).not.toContain('system_powerdown')
+      expect(await commands()).not.toContain('quit')
+      expect(await readFile(disk)).toEqual(before)
+      if (entry !== 'list') {
+        await expect(page.locator('.console-panel').getByText('仅查看', { exact: true })).toBeVisible()
+        await expect(page.locator('.console-panel canvas')).toHaveCSS('cursor', 'default')
+      }
+    }
+    await screenshot(page, 'test-results/hardware-reboot-view-only.png')
+  } finally { await cleanup(root, applications) }
+})
+
+test('view-only pointer stays visible across release, focus loss, reconnect and fullscreen without guest input', async () => {
+  test.setTimeout(120000)
+  const root = await fixture()
+  const applications: ElectronApplication[] = []
+  try {
+    const application = await launch(root)
+    applications.push(application)
+    const page = await application.firstWindow()
+    const vmId = await page.evaluate(async path => {
+      const vm = await window.palette.request('vms.create', undefined, { name: '查看鼠标测试', profile_id: 'default', source: 'image', path, vcpus: 1, memory_mib: 512, disk_gib: 24, network: 'offline' }) as { vm_id: string }
+      await window.palette.request('vms.start', vm.vm_id)
+      return vm.vm_id
+    }, join(root, 'base.qcow2'))
+    await page.getByRole('button', { name: '虚拟机管理', exact: true }).click()
+    await page.getByRole('row').filter({ hasText: '查看鼠标测试' }).getByRole('button', { name: '打开', exact: true }).click()
+    const panel = page.locator('.console-panel')
+    const canvas = panel.locator('canvas')
+    const inputCount = () => page.evaluate(async id => (await window.palette.request('control.metrics', id) as { input: { qmp_ms?: { count: number } } }).input.qmp_ms?.count ?? 0, vmId)
+    const verifyPointer = async () => {
+      await expect(canvas).toBeVisible()
+      await expect(panel.getByText('仅查看', { exact: true })).toBeVisible()
+      // noVNC can update this inline style whenever the guest hides its cursor.
+      await canvas.evaluate(element => { element.style.cursor = 'none' })
+      await expect(canvas).toHaveCSS('cursor', 'default')
+      const before = await inputCount()
+      await canvas.hover()
+      await page.mouse.click((await canvas.boundingBox())!.x + 10, (await canvas.boundingBox())!.y + 10)
+      await page.keyboard.press('a')
+      await page.mouse.wheel(0, 100)
+      expect(await inputCount()).toBe(before)
+    }
+    const takeOver = async () => {
+      await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].focus())
+      await panel.getByRole('button', { name: '接管', exact: true }).click()
+      await expect(panel.getByText('人工控制', { exact: true })).toBeVisible()
+      await canvas.evaluate(element => { element.style.cursor = 'none' })
+      await expect(canvas).toHaveCSS('cursor', 'none')
+    }
+    await verifyPointer()
+    await takeOver()
+    await panel.getByRole('button', { name: '结束控制', exact: true }).click()
+    await verifyPointer()
+    await takeOver()
+    await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].blur())
+    await verifyPointer()
+    await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].focus())
+    await panel.getByRole('button', { name: '重新连接画面', exact: true }).click()
+    await verifyPointer()
+    await panel.getByRole('button', { name: '全屏', exact: true }).click()
+    await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(true)
+    await verifyPointer()
+    await takeOver()
+    await panel.getByRole('button', { name: '结束控制', exact: true }).click()
+    await verifyPointer()
+    await screenshot(page, 'test-results/view-only-cursor-fullscreen.png')
+    await panel.getByRole('button', { name: '退出全屏', exact: true }).click()
+    await expect.poll(() => page.evaluate(() => !!document.fullscreenElement)).toBe(false)
+    await verifyPointer()
+    await expect(page.locator('.desktop-error')).toHaveCount(0)
   } finally { await cleanup(root, applications) }
 })
 
@@ -194,6 +344,9 @@ test('running VM survives window-only exit; shutdown failure preserves window an
     const duplicate = await page.evaluate(async () => { try { await window.palette.finishClose('shutdown'); return '' } catch (error) { return String(error) } })
     expect(duplicate).toContain('正在退出')
     await expect(page.getByRole('dialog').getByRole('alert')).toContainText('虚拟机未完成正常关机', { timeout: 15000 })
+    await page.getByRole('dialog').getByRole('button', { name: '复制调试信息', exact: true }).click()
+    await expect(page.getByRole('dialog').getByRole('alert')).toContainText('已复制')
+    expect(JSON.parse(await application.evaluate(({ clipboard }) => clipboard.readText()))).toMatchObject({ source: 'application', vmId, recentFailure: { operation: 'finish-close', error: { details: { vm_id: vmId } } } })
     await expect(page.getByRole('button', { name: '完全退出', exact: true })).toBeEnabled()
     await expect(page.getByRole('button', { name: '强制停止此虚拟机并退出…', exact: true })).toBeVisible()
     expect(backendInfo(root)!.pid).toBe(pid)
@@ -315,8 +468,7 @@ test('complete exit requires force confirmation for the timed-out VM and preserv
   } finally { await cleanup(root, applications) }
 })
 
-for (const action of ['关机', '重启'] as const) {
-test(`force stop interrupts a pending ${action} without waiting for its timeout`, async () => {
+test('force stop interrupts a pending graceful shutdown without waiting for its timeout', async () => {
   test.setTimeout(90000)
   const root = await fixture()
   const applications: ElectronApplication[] = []
@@ -340,12 +492,8 @@ test(`force stop interrupts a pending ${action} without waiting for its timeout`
     await row.getByRole('button', { name: '打开', exact: true }).click()
     const consolePanel = page.locator('.console-panel')
     await expect(consolePanel.locator('canvas')).toBeVisible()
-    if (action === '关机') {
-      await page.locator('.desktop-main').getByRole('button', { name: '中断关机测试 的操作', exact: true }).click()
-      await page.getByRole('menuitem', { name: '请求正常关机', exact: true }).click()
-    } else {
-      await consolePanel.getByRole('button', { name: action, exact: true }).click()
-    }
+    await page.locator('.desktop-main').getByRole('button', { name: '中断关机测试 的操作', exact: true }).click()
+    await page.getByRole('menuitem', { name: '请求正常关机', exact: true }).click()
     const progress = page.locator('.desktop-shutdown-status')
     await expect(progress).toContainText('正在等待')
     await expect(page.getByText('关机中', { exact: true })).toBeVisible()
@@ -353,7 +501,7 @@ test(`force stop interrupts a pending ${action} without waiting for its timeout`
     await expect(consolePanel.getByText('仅查看', { exact: true })).toBeVisible()
     await expect(consolePanel.locator('.console-placeholder')).toHaveCount(0)
     await expect(consolePanel.getByRole('button', { name: '接管', exact: true })).toBeDisabled()
-    await screenshot(page, `test-results/shutdown-uncovered-${action === '关机' ? 'stop' : 'restart'}.png`)
+    await screenshot(page, 'test-results/shutdown-uncovered-stop.png')
     await page.getByRole('button', { name: '虚拟机管理', exact: true }).click()
     await expect(row.getByText('关机中', { exact: true })).toBeVisible()
     await progress.getByRole('button', { name: '强制停止…', exact: true }).click()
@@ -362,7 +510,7 @@ test(`force stop interrupts a pending ${action} without waiting for its timeout`
     await confirmation.getByRole('button', { name: '取消', exact: true }).click()
     await expect(progress).toBeVisible()
     await progress.getByRole('button', { name: '强制停止…', exact: true }).click()
-    await screenshot(page, action === '关机' ? 'test-results/shutdown-force-interrupt.png' : 'test-results/shutdown-restart-force-interrupt.png')
+    await screenshot(page, 'test-results/shutdown-force-interrupt.png')
     await confirmation.getByRole('button', { name: '确认', exact: true }).click()
     await expect(confirmation).toBeHidden({ timeout: 6000 })
     await expect(row.getByText('已关机', { exact: true })).toBeVisible({ timeout: 6000 })
@@ -374,7 +522,6 @@ test(`force stop interrupts a pending ${action} without waiting for its timeout`
     expect(backendInfo(root)).toBeNull()
   } finally { await cleanup(root, applications) }
 })
-}
 
 test('complete exit stops the embedded MCP process while its stdin remains open', async () => {
   test.setTimeout(90000)

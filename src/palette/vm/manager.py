@@ -40,7 +40,11 @@ from ..guest_agent import QemuGuestAgent
 from ..guest_desktop import RfbGuestDesktop
 from ..guest_session import GuestSession
 from ..guest_shares import GuestShares
-from ..guest_tools.base import DisabledGuestToolBackend, GuestToolBackend
+from ..guest_tools.base import (
+    ConnectingGuestToolBackend,
+    DisabledGuestToolBackend,
+    GuestToolBackend,
+)
 from ..guest_tools.bridge import BridgeGuestToolBackend, GuestToolTransport
 from ..input.controller import ActionController
 from ..input.state import InstanceView
@@ -49,7 +53,7 @@ from ..operations import VmOperations
 from ..platforms import execution_info, validate_target
 from ..policy import PathGuard, Policy, validate_identifier
 from ..qmp.client import QmpClient
-from ..qmp.transport import ProcessQmpTransport
+from ..qmp.transport import QmpTransport, connect_process_qmp
 from .images import ImageManager, InstancePaths
 from .launcher import (
     LaunchOverrides,
@@ -97,6 +101,16 @@ _ALLOWED_TRANSITIONS: dict[VmState, frozenset[VmState]] = {
 }
 
 
+def _negotiation_hint(process: ManagedProcess) -> str | None:
+    """Report only what process liveness establishes, without guessing its wait site."""
+    if process.returncode is not None:
+        return None
+    return (
+        "QEMU is still running; inspect the QMP phase, stderr and guest_channels. "
+        "Optional guest sockets do not block management startup"
+    )
+
+
 @dataclass
 class VmInstance:
     """One running (or failed) QEMU process and everything attached to it."""
@@ -108,11 +122,12 @@ class VmInstance:
     cleanup_root: Path
     plan: LaunchPlan | None = None
     process: ManagedProcess | None = None
-    transport: ProcessQmpTransport | None = None
+    transport: QmpTransport | None = None
     qmp: QmpClient | None = None
     capture: CaptureBackend | None = None
     controller: ActionController | None = None
     guest_tools: GuestToolBackend | None = None
+    guest_tool_transport: GuestToolTransport | None = None
     qemu_guest_agent: QemuGuestAgent | None = None
     guest_desktop: RfbGuestDesktop | None = None
     guest_session: GuestSession | None = None
@@ -552,43 +567,62 @@ class VmManager:
             asyncio.create_task(self._consume_stderr(instance), name=f"stderr-{paths.vm_id}")
         )
 
-        # 5. QMP handshake over the private pipes (never stdio of this process).
+        # 5. Private QMP handshake: Windows AF_UNIX or POSIX child stdio.
         if plan.webdav_endpoint is not None:
             instance.guest_shares = GuestShares(plan.webdav_endpoint, profile.shared_folders)
-            instance.tasks.append(asyncio.create_task(instance.guest_shares.run()))
         if plan.session_endpoint is not None:
             instance.guest_session = GuestSession(plan.session_endpoint)
-            instance.tasks.append(asyncio.create_task(instance.guest_session.run()))
         if plan.guest_agent_endpoint is not None:
             instance.qemu_guest_agent = QemuGuestAgent(
                 plan.guest_agent_endpoint,
                 timeout_seconds=profile.guest_agent.request_timeout_seconds,
                 max_file_bytes=profile.guest_agent.max_file_bytes,
             )
-        # Windows initializes pipe chardevs before QMP; connect the private helper pipe
-        # immediately, while its optional guest-service handshake runs asynchronously.
-        instance.guest_tools = DisabledGuestToolBackend()
-        self._refresh_guest_tools(instance)
-        if plan.guest_agent_endpoint is not None or plan.guest_tools_endpoint is not None:
-            instance.tasks.append(asyncio.create_task(self._watch_enhancements(instance)))
-        transport = ProcessQmpTransport(process, name=f"qmp-{paths.vm_id}")
-        instance.transport = transport
-        qmp = QmpClient(
-            transport,
-            command_timeout=profile.timeouts.qmp_command_seconds,
-            handshake_timeout=profile.timeouts.qmp_handshake_seconds,
+        # Socket chardevs use wait=off. No optional guest service runs before QMP
+        # negotiation and cont, and absent service peers cannot hold up startup.
+        instance.guest_tools = (
+            ConnectingGuestToolBackend()
+            if profile.guest_tools.enabled
+            else DisabledGuestToolBackend()
         )
-        instance.qmp = qmp
-        qmp.on_disconnect(lambda failure: self._on_qmp_disconnect(instance, failure))
-        qmp.on_event(lambda name, data: self._on_qmp_event(instance, name, data))
+        if plan.qmp_endpoint is not None:
+            instance.tasks.append(asyncio.create_task(self._drain_stdout(instance)))
+        qmp = None
         try:
+            transport = await connect_process_qmp(
+                process,
+                plan.qmp_endpoint,
+                timeout=profile.timeouts.qmp_handshake_seconds,
+                name=f"qmp-{paths.vm_id}",
+            )
+            instance.transport = transport
+            qmp = QmpClient(
+                transport,
+                command_timeout=profile.timeouts.qmp_command_seconds,
+                handshake_timeout=profile.timeouts.qmp_handshake_seconds,
+            )
+            instance.qmp = qmp
+            qmp.on_disconnect(lambda failure: self._on_qmp_disconnect(instance, failure))
+            qmp.on_event(lambda name, data: self._on_qmp_event(instance, name, data))
             await qmp.start()
             await qmp.probe()
         except PaletteError as exc:
+            diagnostics = qmp.diagnostics() if qmp else {"phase": "connect"}
             raise PaletteError(
                 ErrorCode.STARTUP_FAILED,
                 f"QMP negotiation failed: {exc.code}",
-                details={"detail": exc.message, "stderr": instance.stderr_tail(6)},
+                details={
+                    "detail": exc.message,
+                    "phase": ("probe" if diagnostics["phase"] == "ready" else diagnostics["phase"]),
+                    "qmp": diagnostics,
+                    "stderr": instance.stderr_tail(6),
+                    "qemu_pid": process.pid,
+                    "returncode": process.returncode,
+                    "qemu_alive": process.returncode is None,
+                    "guest_pipes": self._guest_pipe_report(instance),
+                    "guest_channels": self._guest_channel_report(instance),
+                    "hint": _negotiation_hint(process),
+                },
             ) from exc
 
         instance.view.qmp_ready = True
@@ -603,6 +637,11 @@ class VmManager:
                 instance.console_password = password
         await qmp.execute("cont")
         instance.transition(VmState.RUNNING)
+        self._refresh_guest_tools(instance)
+        if instance.guest_shares is not None:
+            instance.tasks.append(asyncio.create_task(instance.guest_shares.run()))
+        if instance.guest_session is not None:
+            instance.tasks.append(asyncio.create_task(instance.guest_session.run()))
 
         if instance.console_address is not None and instance.console_password is not None:
             instance.guest_desktop = RfbGuestDesktop(
@@ -611,9 +650,9 @@ class VmManager:
                 max_clipboard_bytes=profile.guest_desktop.max_clipboard_bytes,
             )
         if (
-            instance.qemu_guest_agent is None
-            and plan.guest_tools_endpoint is None
-            and (
+            instance.qemu_guest_agent is not None
+            or plan.guest_tools_endpoint is not None
+            or (
                 instance.guest_desktop is not None
                 or instance.guest_shares is not None
                 or instance.guest_session is not None
@@ -683,6 +722,9 @@ class VmManager:
             instance_id=instance.view.instance_id,
             boot_epoch=instance.view.boot_epoch,
         )
+        # Register physical transport before HELLO finishes so in-flight tools are
+        # included in diagnostics rather than disappearing behind the disabled backend.
+        instance.guest_tool_transport = transport
         try:
             capabilities = await bridge.connect()
         except BaseException:
@@ -727,10 +769,54 @@ class VmManager:
                     await desktop.connect()
             await asyncio.sleep(3)
 
+    def _guest_pipe_report(self, instance: VmInstance) -> dict[str, bool]:
+        """Compatibility alias; guest_channels describes the actual socket transport."""
+        return {
+            key: bool(value["connected"])
+            for key, value in self._guest_channel_report(instance).items()
+        }
+
+    def _guest_channel_report(self, instance: VmInstance) -> dict[str, dict[str, Any]]:
+        candidates: dict[str, object | None] = {
+            "qga": getattr(instance.qemu_guest_agent, "channel", None),
+            "tools": getattr(instance.guest_tool_transport, "channel", None),
+            "shares": getattr(instance.guest_shares, "channel", None),
+            "session": getattr(instance.guest_session, "channel", None),
+        }
+        plan = instance.plan
+        enabled = {
+            "qga": plan.guest_agent_endpoint if plan else None,
+            "tools": plan.guest_tools_endpoint if plan else None,
+            "shares": plan.webdav_endpoint if plan else None,
+            "session": plan.session_endpoint if plan else None,
+        }
+        report: dict[str, dict[str, Any]] = {}
+        for key, channel in candidates.items():
+            if enabled[key] is None:
+                continue
+            status = getattr(channel, "status", None)
+            report[key] = (
+                status()
+                if callable(status)
+                else {
+                    "transport": "unix",
+                    "state": "pending",
+                    "connected": False,
+                    "elapsed_seconds": None,
+                    "error": None,
+                    "error_detail": None,
+                }
+            )
+        return report
+
     def _refresh_guest_tools(self, instance: VmInstance) -> None:
         instance.tasks[:] = [task for task in instance.tasks if not task.done()]
         previous = instance.guest_tools
-        instance.guest_tools = DisabledGuestToolBackend()
+        instance.guest_tools = (
+            ConnectingGuestToolBackend()
+            if instance.profile.guest_tools.enabled
+            else DisabledGuestToolBackend()
+        )
         if instance.guest_refresh is not None:
             instance.guest_refresh.cancel()
         task = asyncio.create_task(
@@ -955,6 +1041,30 @@ class VmManager:
                 ) from None
         if instance.guard is not None:
             instance.guard.close()
+        if instance.plan is not None and instance.plan.guest_ipc_directory is not None:
+            from ..windows_unix import cleanup_directory
+
+            try:
+                cleanup_directory(
+                    instance.plan.guest_ipc_directory,
+                    [
+                        endpoint
+                        for endpoint in (
+                            instance.plan.qmp_endpoint,
+                            instance.plan.guest_agent_endpoint,
+                            instance.plan.guest_tools_endpoint,
+                            instance.plan.webdav_endpoint,
+                            instance.plan.session_endpoint,
+                        )
+                        if endpoint is not None
+                    ],
+                )
+            except OSError:
+                logger.warning(
+                    "could not remove guest socket endpoints for %s",
+                    instance.view.vm_id,
+                    exc_info=True,
+                )
         instance.view.qmp_ready = False
         instance.view.screen_ready = False
         instance.view.desktop_ready = None
@@ -1112,6 +1222,15 @@ class VmManager:
             raise failure
 
     # -- background tasks ------------------------------------------------------------
+    async def _drain_stdout(self, instance: VmInstance) -> None:
+        process = instance.process
+        if process is not None and process.stdout is not None:
+            try:
+                while await process.stdout.read(65536):
+                    pass
+            except OSError as exc:
+                logger.debug("stdout consumer stopped: %s", exc)
+
     async def _consume_stderr(self, instance: VmInstance) -> None:
         process = instance.process
         if process is None or process.stderr is None:
@@ -1223,7 +1342,8 @@ class VmManager:
                     self._release_controller(instance), name=f"reset-release-{instance.view.vm_id}"
                 )
             )
-        self._refresh_guest_tools(instance)
+        if instance.state in {VmState.RUNNING, VmState.PAUSED}:
+            self._refresh_guest_tools(instance)
         with contextlib.suppress(PaletteError, OSError):
             self.images_for(instance.profile).update_manifest(
                 instance.paths, {"host_boot_epoch": epoch}

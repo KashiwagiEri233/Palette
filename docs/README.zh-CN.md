@@ -64,6 +64,6 @@
 * **`tests/qmp/`**：QMP 协议层测试，针对可编排的进程内 QMP 对端验证分帧、超时、断线与事件乱序。
 * **`tests/guest_tools/`**：客户机增强通道契约测试，针对 mock 传输验证握手交集、超时与状态回执。
 * **`tests/operator_ipc/`**：本地运维 IPC 协议、载荷上限与 Windows Named Pipe 适配器测试。
-* **`tests/integration/`**：启动真实受监督子进程并通过真实管道运行 QMP，验证 `daemon`、持久桌面定义、MCP 工具面、进程回收与故障恢复。
+* **`tests/integration/`**：启动真实受监督子进程并通过真实管道或 AF_UNIX 套接字运行 QMP，验证 `daemon`、持久桌面定义、MCP 工具面、进程回收与故障恢复。
 * **`tests/e2e/`**：真实 QEMU 硬件加速与客户机镜像验收测试（默认跳过，需设置 `PALETTE_E2E=1` 启用）。
 * **`desktop/tests/` & `desktop/e2e/`**：使用 Vitest 验证前端状态与 IPC 逻辑，使用 Playwright 驱动真实 Electron 窗口验证虚拟机创建、硬件设置、控制台与安全退出流程。

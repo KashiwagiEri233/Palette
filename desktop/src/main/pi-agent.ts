@@ -11,6 +11,8 @@ import { AgentCredentials, atomicJson, readJson, type SecretEncryption } from '.
 import { BackendError } from './ipc'
 import { AgentProviderStore, agentApis as apis, defaultConfiguration, validateAgentConfiguration, validateProvider, validateKey, validateBaseUrl, type AgentProviderState } from './agent-providers'
 import { discoverAgentModels } from './agent-model-discovery'
+import { providerToolSchemas } from './agent-schema'
+import { agentFailureMessage } from './agent-errors'
 export { validateAgentConfiguration } from './agent-providers'
 
 const validId = (value: unknown): value is string => typeof value === 'string' && value !== '.' && value !== '..' && /^[\w.-]{1,128}$/.test(value)
@@ -251,6 +253,7 @@ export class PiAgentService {
       Type.Object({ type: Type.Literal('drag'), points: Type.Array(Type.Object({ x: coordinate, y: coordinate }), { minItems: 2, maxItems: 64 }), button: Type.Optional(button), duration_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: 3000 })) })
     ])
     return pi => {
+      pi.on('before_provider_request', event => providerToolSchemas(event.payload))
       pi.on('message_end', async event => ({ message: JSON.parse(await this.credentials.redact(JSON.stringify(event.message))) as typeof event.message }))
       const execute = async (method: string, parameters: Record<string, unknown>, signal?: AbortSignal) => {
         if (record.stopRequested || !record.run || record.run.state !== 'running' || !record.client || !record.claim) throw new Error('任务已停止或控制权已释放')
@@ -414,15 +417,19 @@ export class PiAgentService {
       if (record.stopRequested) record.run!.state = 'cancelled'
       else if (last?.role === 'assistant' && last.stopReason === 'error') {
         record.run!.state = 'failed'
-        record.run!.error = '模型请求失败，请检查端点、密钥和模型配置'
+        record.run!.error = await this.failureMessage(last.errorMessage)
       } else record.run!.state = 'completed'
-    } catch {
+    } catch (error) {
       record.run!.state = record.stopRequested ? 'cancelled' : 'failed'
-      record.run!.error ??= '模型或工具调用失败，请检查配置后重试'
+      if (!record.stopRequested) record.run!.error ??= await this.failureMessage(error, '任务执行失败')
     } finally {
       try { await this.release(record); await this.saveRun(record) }
       finally { this.busyVms.delete(record.conversation.vm_id); this.publish(record) }
     }
+  }
+  private async failureMessage(error: unknown, fallback?: string): Promise<string> {
+    const detail = typeof error === 'string' ? error : error instanceof Error ? error.message : ''
+    return agentFailureMessage(await this.credentials.redact(detail), fallback)
   }
   private release(record: SessionRecord): Promise<void> {
     return record.releaseTask ??= this.releaseOwned(record)
@@ -521,6 +528,18 @@ export class PiAgentService {
     const record = await this.load(id, vmId)
     return { streamEpoch: this.streamEpoch, seq: this.seq, view: await this.view(record) }
   }
+  async diagnostics(vmId?: string, id?: string): Promise<Record<string, unknown>> {
+    const record = vmId && id ? await this.load(id, vmId) : undefined
+    const configuration = record?.settings ?? await this.configuration()
+    const last = record?.manager.getBranch().slice().reverse().find(entry => entry.type === 'message' && entry.message.role === 'assistant')
+    const info = {
+      model: { providerId: configuration.providerId, modelId: configuration.modelId, api: configuration.api, baseUrl: configuration.baseUrl, thinkingLevel: configuration.thinkingLevel, contextWindow: configuration.contextWindow, maxTokens: configuration.maxTokens, vision: configuration.vision },
+      ...(record ? { conversationId: record.conversation.id, vmId: record.conversation.vm_id, run: record.run } : {}),
+      ...(last?.type === 'message' && last.message.role === 'assistant' && last.message.stopReason === 'error' ? { modelError: last.message.errorMessage, errorAt: last.timestamp } : {})
+    }
+    return await this.credentials.redactJson(info) as Record<string, unknown>
+  }
+  async redactDiagnostics(value: string): Promise<string> { return JSON.stringify(await this.credentials.redactJson(JSON.parse(value))) }
   private async contextUsage(record: SessionRecord): Promise<AgentContextUsage | null> {
     const live = record.session?.getContextUsage()
     if (live) return live
@@ -559,6 +578,10 @@ export class PiAgentService {
     const messages: AgentMessageView[] = []
     const toText = (content: unknown): string => typeof content === 'string' ? content : Array.isArray(content) ? content.filter(part => part?.type === 'text').map(part => part.text).join('\n') : ''
     const branch = record.manager.getBranch()
+    if (run?.state === 'failed' && run.error === '模型请求失败，请检查端点、密钥和模型配置') {
+      const failed = branch.slice().reverse().find(entry => entry.type === 'message' && entry.message.role === 'assistant' && entry.message.stopReason === 'error')
+      if (failed?.type === 'message' && failed.message.role === 'assistant') run.error = await this.failureMessage(failed.message.errorMessage)
+    }
     for (const entry of branch) {
       if (entry.type === 'message') {
         const message = entry.message

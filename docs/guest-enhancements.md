@@ -4,6 +4,8 @@
 
 Palette reuses QEMU Guest Agent, SPICE vdagent and spice-webdavd, and provides a Windows user-session helper. The desktop remains usable without these guest services: missing responses mean **currently unavailable**, not proof that software is uninstalled. Availability is checked repeatedly, including after guest reboot. QGA retains binary transfer/time/shutdown; Windows file management, PowerShell, process/registry tools, App and UIA use the private `org.palette.tools.0` channel.
 
+On Windows hosts, the four optional channels use AF_UNIX sockets in separate current-user-only `%TEMP%\Palette\ipc` instance directories. Windows QMP uses a separate private AF_UNIX socket in the same instance directory; POSIX QMP keeps child stdin/stdout. QMP negotiation and resume finish before guest-service connections begin, so an absent helper or delayed HELLO cannot prevent the VM from starting. Reconnecting a helper does not restart QMP. After consumers stop and QEMU exits, the backend removes that instance's socket nodes and directory. The temporary namespace avoids Windows hosts where socket nodes directly under LocalAppData bind but cannot be connected to or deleted. Guest VirtIO port names and installed services are unchanged.
+
 ## Windows file, system and application tools
 
 Rebuild and mount the Windows tools disc, then run `Install.cmd` **inside the guest** as described below. The installer compiles the bundled C# sources with Windows' inbox .NET Framework compiler; no Python runtime or guest network is required. Restart the VM to attach the new VirtIO port, and log in normally. `vm_status.enhancements.windows` reports the handshake, interactive-desktop state and granted capabilities.
@@ -31,7 +33,7 @@ Every new call uses the existing authenticated Agent IPC, profile grants, instan
 
 Ordinary profiles enable the new capabilities by default after a successful handshake. Explicit capability lists and `strict-example` remain restrictive; `guest_desktop.clipboard` independently controls clipboard access. The older `vm_guest_launch_app(app_id, options)` keeps its application whitelist contract. The new `vm_guest_app` uses the separate `guest.app` grant.
 
-Automated tests compile and run the Windows worker's framed diagnostic path for Unicode files, PowerShell output/deadline limits and disposable HKCU values. Service installation, VirtIO access, logon/logoff, real window focus, UIA input and human takeover still require real Windows VM acceptance; simulated tests and host diagnostic tests do not establish that acceptance.
+Automated tests compile and run the Windows worker's framed diagnostic path for Unicode files, PowerShell output/deadline limits and disposable HKCU values. Service installation, VirtIO access, logon/logoff, real window focus, UIA input and human takeover require real Windows VM acceptance for each target; simulated tests and host diagnostic tests do not establish that acceptance.
 
 For QWord registry values above JavaScript's exact integer range, use a decimal string; reads return such values as decimal strings too. Agent response metadata is bounded to 1 MiB, with images on their separate bounded binary frame; ordinary operator messages retain their 256 KiB limit.
 
@@ -88,7 +90,9 @@ pnputil /add-driver E:\drivers\NetKVM\w11\amd64\netkvm.inf /install
 
 ### Install enhancement services after Windows setup
 
-After reaching the Windows desktop, open the tools disc, run **Install.cmd**, approve administrator elevation and restart after installation. This script is not for Windows Setup / WinPE: when WinPE is detected it explains how to load drivers from `drivers` and exits. The script verifies embedded files and runs upstream installers in sequence. Logs stay in `%ProgramData%\Palette\GuestTools\Logs`. Failures stop and report logs, retaining installed components for repair. Re-run to retry a failed installation, or repair/uninstall components using Windows Apps. The script never reboots automatically or changes driver-signing policy, TPM or Windows setup checks.
+After reaching the Windows desktop, open the tools disc, run **Install.cmd**, approve administrator elevation and restart after installation. This script is not for Windows Setup / WinPE: when WinPE is detected it explains how to load drivers from `drivers` and exits. After verifying embedded files, it stages the matching VirtIO serial driver and installs the Palette helper, then runs the upstream installers. If Windows reports that no serial device was updated, the installer warns that the driver may already be current or the device may be absent. Logs stay in `%ProgramData%\Palette\GuestTools\Logs`. A later upstream failure is reported as an installation failure, while the helper remains installed; QGA, SPICE and WebDAV may still be unavailable. Re-run to retry a failed installation, or repair/uninstall components using Windows Apps. The script never reboots automatically or changes driver-signing policy, TPM or Windows setup checks.
+
+The installer configures the WebDAV service to restart after a service failure. If QGA installation fails during VSS registration, inspect the MSI and Windows COM+ event logs. On one customized Windows 11 guest, COM+ event 4691 reported a disabled MS-DTC service; an administrator set it to Manual, started it and retried the installation successfully. The installer does not change the MS-DTC configuration.
 
 The disc supports **x64** Windows 10/11 and Server 2016 or newer. ARM64 and Linux presets cannot mount this package; custom configurations require the operator to confirm Windows x64. Clipboard, Unicode paste, QGA file operations and WebDAV still require enabled host Profile channels; mounting does not change channel policy. Windows automatic resolution remains unavailable: the Linux X11 session helper does not apply. Mounting does not establish installation, and installation does not establish live services. Agents continue to use runtime handshakes and capabilities with baseline fallback.
 
@@ -117,7 +121,7 @@ path = "exchange"
 read_only = true
 ```
 
-Relative export paths resolve from the configuration root. Only configured or explicitly selected directories are exposed. QGA and WebDAV use separate per-instance private Unix sockets on POSIX or named pipes on Windows; no guest management/file-sharing TCP port is opened on the host. Restart the shared daemon after upgrading the backend and restart the VM after channel configuration changes. On Windows, host pipe connections start before QMP because QEMU's pipe initialization waits for a client.
+Relative export paths resolve from the configuration root. Only configured or explicitly selected directories are exposed. QGA and WebDAV use separate per-instance private Unix sockets on all supported hosts; no guest management/file-sharing TCP port is opened on the host. Restart the shared daemon after upgrading the backend and restart the VM after channel configuration changes. Guest-service connections begin after QMP negotiation and resume.
 
 ## Direct agent operations and degradation
 
@@ -164,10 +168,13 @@ Trusted Profile `[[shared_folders]]` entries explicitly configure host exports, 
 | Electron console on Windows | Console flow and baseline control with the manual enhancement entry removed are tested; built-in pi SDK model-tool calls have separate contract tests |
 | Linux/macOS hosts | POSIX channel implementation included; no physical acceptance claimed on this Windows development host |
 | Debian/XFCE guest with installed tools | Installer/helper included; clipboard, live resizing, QGA operations and WebDAV mounting still require real desktop-image acceptance |
-| Windows x64 tools disc | Pinned payloads and ISO contents verified; real QEMU 11.1 validates the dedicated tools drive, read-only cold/live insertion and eject with original system media preserved; Windows installation and services still need guest acceptance |
+| Windows x64 tools disc | Pinned payloads and ISO contents verified; real QEMU 11.1 validates the dedicated tools drive, read-only cold/live insertion and eject with original system media preserved |
+| Windows 11 x64 guest on Windows/WHPX | Real MCP verified the Palette helper's PowerShell, Unicode file and clipboard round trips, registry, process list, app launch, window controls and UIA text input; QGA binary transfer and time sync; and read-only WebDAV access. The services recovered after a graceful shutdown and cold start, and WebDAV restarted after a deliberately terminated service process. An earlier guest reboot left display output inactive; cold start restored the desktop. The guest clock was eight hours behind again after cold start and required another QGA sync. |
 | Windows/Wayland guests | No automatic-resolution helper; in-guest QGA/SPICE/WebDAV capabilities require separate acceptance |
 
 `palette doctor` reports host virtio-serial and qemu-vdagent prerequisites as nonblocking checks. Runtime `vm_status.enhancements` and operator `guest.status` expose actual availability; QGA readiness never implies an interactive desktop is ready.
+
+After shutdown, a pending desktop capability poll reports enhancements as unavailable. A pending display sync returns the stopped VM status. Operations that change the guest still require a running VM and valid control authority.
 
 Unit/integration tests cover delayed service startup, fragmented messages, QGA resynchronization after timeouts, disabled commands, ownership fencing, uncertain shutdown, transfer limits/cleanup, Unicode clipboard and decompression bounds, and read-only/Unicode/traversal WebDAV behavior. Agent tests cover Unicode input, clipboard, binary transfer without human leases, authenticated IPC, deduplication and takeover. Built-in pi SDK tests drive model tool calls; Electron tests cover continued baseline console control.
 

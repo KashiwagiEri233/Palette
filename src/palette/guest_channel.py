@@ -1,11 +1,14 @@
-"""Private QEMU chardev streams. Windows pipes are connected before QMP startup."""
+"""Instance-private socket streams for optional QEMU guest services."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import sys
+import time
 from typing import Any
+
+CHANNEL_ATTACH_TIMEOUT = 30.0
 
 
 class GuestChannel:
@@ -13,41 +16,91 @@ class GuestChannel:
         self.endpoint = endpoint
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
-        self.pipe: Any = None
         self.buffer = bytearray()
+        self._open_lock = asyncio.Lock()
+        self._generation = 0
+        self._state = "pending"
+        self._started: float | None = None
+        self._elapsed: float | None = None
+        self._error: str | None = None
+        self._error_detail: str | None = None
 
     @property
     def connected(self) -> bool:
-        return self.pipe is not None or self.writer is not None
+        return (
+            self.writer is not None
+            and not self.writer.is_closing()
+            and self.reader is not None
+            and not self.reader.at_eof()
+            and self.reader.exception() is None
+        )
 
-    async def open(self) -> None:
-        if self.connected:
-            return
-        if sys.platform == "win32":
-            from .operator.windows import connect
+    def status(self) -> dict[str, Any]:
+        elapsed = self._elapsed
+        if self._state == "connecting" and self._started is not None:
+            elapsed = time.monotonic() - self._started
+        return {
+            "transport": "unix",
+            "state": (
+                "connected"
+                if self.connected
+                else "closed"
+                if self._state == "connected"
+                else self._state
+            ),
+            "connected": self.connected,
+            "elapsed_seconds": elapsed,
+            "error": self._error,
+            "error_detail": self._error_detail,
+        }
 
-            self.pipe = await connect(self.endpoint)
-        else:
-            self.reader, self.writer = await asyncio.open_unix_connection(self.endpoint)
+    async def open(self, *, timeout: float = CHANNEL_ATTACH_TIMEOUT) -> None:
+        budget = asyncio.timeout(timeout)
+        async with budget, self._open_lock:
+            if self.connected:
+                return
+            await self.close()
+            generation = self._generation
+            self._state = "connecting"
+            self._started = time.monotonic()
+            self._elapsed = None
+            self._error = None
+            self._error_detail = None
+            try:
+                if sys.platform == "win32":
+                    from .windows_unix import open_connection
+
+                    reader, writer = await open_connection(self.endpoint)
+                else:
+                    reader, writer = await asyncio.open_unix_connection(self.endpoint)
+                if generation != self._generation:
+                    writer.close()
+                    await writer.wait_closed()
+                    raise ConnectionError("guest channel was closed during connection")
+                self.reader, self.writer = reader, writer
+                self._state = "connected"
+            except BaseException as exc:
+                if budget.expired():
+                    self._state = "failed"
+                    self._error = "TimeoutError"
+                    self._error_detail = "guest socket attachment exceeded its deadline"
+                else:
+                    self._state = (
+                        "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                    )
+                    self._error = type(exc).__name__
+                    self._error_detail = str(exc)[:1024]
+                raise
+            finally:
+                self._elapsed = time.monotonic() - self._started
 
     async def read(self, timeout: float = 3.0) -> bytes:
-        if self.pipe is not None:
-            # Kernel deadline avoids cancelling overlapped I/O and destroying the pipe
-            # when the guest service has not booted yet.
-            worker = asyncio.create_task(self.pipe._io("read", 65536, timeout))
-            try:
-                return bytes(await asyncio.shield(worker))
-            except asyncio.CancelledError:
-                # Preserve the duplex pipe for resynchronization after a cancelled RPC.
-                # The overlapped read has its own kernel timeout.
-                with contextlib.suppress(OSError, TimeoutError):
-                    await worker
-                raise
         if self.reader is None:
             raise ConnectionError("guest channel is closed")
         async with asyncio.timeout(timeout):
             data = await self.reader.read(65536)
         if not data:
+            self._state = "closed"
             raise EOFError("guest channel disconnected")
         return data
 
@@ -62,21 +115,18 @@ class GuestChannel:
         return result
 
     async def write(self, data: bytes) -> None:
-        if self.pipe is not None:
-            await self.pipe.write(data)
-        elif self.writer is not None:
+        if self.writer is not None:
             self.writer.write(data)
             await self.writer.drain()
         else:
             raise ConnectionError("guest channel is closed")
 
     async def close(self) -> None:
-        pipe, self.pipe = self.pipe, None
+        self._generation += 1
         writer, self.writer = self.writer, None
         self.reader = None
         self.buffer.clear()
-        if pipe is not None:
-            await pipe.close()
+        self._state = "closed"
         if writer is not None:
             writer.close()
             with contextlib.suppress(ConnectionError, OSError, TimeoutError):

@@ -32,9 +32,10 @@ from typing import Any, cast
 
 from ..audit import AuditLog
 from ..capture.base import CaptureBackend, CapturedImage
+from ..capture.work import image_work
 from ..cleanup import join_cleanup
 from ..config import Profile
-from ..errors import ErrorCode, PaletteError
+from ..errors import ErrorCode, PaletteError, QmpCommandError
 from ..guest_tools.base import GuestToolOutcome
 from ..models import (
     Action,
@@ -55,6 +56,7 @@ from ..models import (
     parse_action,
 )
 from ..qmp.client import QmpClient
+from ..timing import TimingWindow
 from .coordinates import CoordinateTransform, transform_id_for
 from .dedupe import RequestDeduplicator
 from .events import InputPlanner, button_event, key_event, key_plan_batches
@@ -74,6 +76,11 @@ logger = logging.getLogger("palette.input")
 
 #: A job may wait this long for the queue before the service reports BUSY.
 DEFAULT_QUEUE_WAIT_SECONDS = 5.0
+
+#: The only run state in which QEMU accepts ``input-send-event`` from a guest that is not
+#: suspended. Spelled as a literal because ``InstanceView`` stores the state as text and
+#: importing the lifecycle enum here would close an import cycle through ``vm.manager``.
+_RUNNING_STATE = "RUNNING"
 
 #: Pixel-difference heuristic settings for ``vm_wait``.
 _STABLE_SAMPLE_INTERVAL = 0.25
@@ -137,6 +144,7 @@ class ActionController:
         self._capture = capture
         self._frames_dir = frames_dir
         self._audit = audit
+        self.operator_timings = TimingWindow()
         self._ledger = InputLedger()
         self._frames = FrameRegistry()
         self._dedupe = RequestDeduplicator()
@@ -797,11 +805,17 @@ class ActionController:
             display_id=self.view.display_id, head=self.view.head, sink=sink
         )
         self._require_identity(identity)
-        if max_long_edge is not None and max_long_edge != self.profile.capture.max_long_edge:
-            captured = rescale(captured, max_long_edge, self.profile.capture.max_bytes)
+
+        def process() -> tuple[CapturedImage, bytes]:
+            result = captured
+            if max_long_edge is not None and max_long_edge != self.profile.capture.max_long_edge:
+                result = rescale(result, max_long_edge, self.profile.capture.max_bytes)
+            return result, image_thumbnail(result.png_bytes)
+
+        captured, thumbnail = await image_work(process)
+        self._require_identity(identity)
         frame = self._build_frame(captured, cursor_position_source=cursor_position_source)
         self._last_capture_at = time.monotonic()
-        thumbnail = image_thumbnail(captured.png_bytes)
         return self._frames.add(frame, thumbnail), captured
 
     def _frame_path(self) -> Path:
@@ -988,9 +1002,22 @@ class ActionController:
     ) -> None:
         arguments = self._event_prefix()
         arguments["events"] = events
-        await self._qmp.execute(
-            "input-send-event", arguments, timeout=timeout, on_sending=on_sending
-        )
+        try:
+            await self._qmp.execute(
+                "input-send-event", arguments, timeout=timeout, on_sending=on_sending
+            )
+        except QmpCommandError as exc:
+            # QEMU refuses ``input-send-event`` unless it is running or suspended, and
+            # says so as a generic error. Reporting that as a failed QMP command makes a
+            # paused or shutting-down guest look like a broken channel; the honest answer
+            # is that the guest was not in a state that accepts input.
+            if exc.description.strip() == "VM not running":
+                raise PaletteError(
+                    ErrorCode.VM_NOT_RUNNING,
+                    "虚拟机未在运行, 输入未发送",
+                    details={"qmp_class": exc.qmp_class, "command": exc.command},
+                ) from None
+            raise
 
     async def operator_enhancement(
         self,
@@ -1028,10 +1055,28 @@ class ActionController:
     ) -> int:
         """Send one authenticated batch; successful held inputs survive the batch."""
         identity = self._identity()
+        queued = time.perf_counter()
+        # Human input is best-effort by nature: a keystroke that arrives while the guest is
+        # pausing or shutting down must not cost the operator the control lease, and QEMU
+        # would reject it anyway. Refuse it here, before anything is sent, so the receipt
+        # is honest about the batch never leaving the service.
+        if self.view.state != _RUNNING_STATE:
+            raise PaletteError(
+                ErrorCode.VM_NOT_RUNNING,
+                "虚拟机未在运行, 输入未发送",
+                details={"state": self.view.state},
+            )
 
         async def run() -> int:
+            started = time.perf_counter()
             validate()
             self._require_identity(identity)
+            if self.view.state != _RUNNING_STATE:
+                raise PaletteError(
+                    ErrorCode.VM_NOT_RUNNING,
+                    "虚拟机未在运行, 输入未发送",
+                    details={"state": self.view.state},
+                )
             self._ledger.note_presses(events)
             progress = _InputProgress(self.view, self.view.action_seq)
             await self._send_events(
@@ -1039,10 +1084,17 @@ class ActionController:
                 timeout=self.profile.timeouts.qmp_command_seconds,
                 on_sending=progress.sending,
             )
+            acknowledged = time.perf_counter()
             self._ledger.note_releases(events)
             self._require_identity(identity)
             if self._audit is not None:
                 self._audit.record("operator.input", vm_id=self.view.vm_id, count=len(events))
+            self.operator_timings.record(
+                queue_ms=(started - queued) * 1000,
+                qmp_ms=(acknowledged - started) * 1000,
+                audit_ms=(time.perf_counter() - acknowledged) * 1000,
+                total_ms=(time.perf_counter() - queued) * 1000,
+            )
             return self.view.action_seq
 
         return cast(

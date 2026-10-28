@@ -60,7 +60,7 @@ class GuestToolTransport(Protocol):
 
 
 class VirtioSerialGuestToolTransport:
-    """Instance-private ``org.palette.tools.0`` Windows pipe or Unix socket stream."""
+    """Instance-private ``org.palette.tools.0`` socket stream."""
 
     def __init__(
         self, *, port_name: str = "org.palette.tools.0", endpoint: str | None = None
@@ -70,6 +70,10 @@ class VirtioSerialGuestToolTransport:
         self._online = False
         self._channel = GuestChannel(endpoint) if endpoint else None
         self._write_lock = asyncio.Lock()
+
+    @property
+    def channel(self) -> GuestChannel | None:
+        return self._channel
 
     @property
     def online(self) -> bool:
@@ -266,9 +270,13 @@ class BridgeGuestToolBackend:
         return tuple(sorted(set(self.config.input_methods) & set(self._guest_methods)))
 
     # -- lifecycle -------------------------------------------------------------------
-    async def connect(self) -> GuestCapabilities:
+    async def connect(self, *, attach_timeout: float | None = None) -> GuestCapabilities:
         """Open the channel and complete the handshake. Never raises for a missing guest
-        service: an unavailable enhancement path is a reportable state, not a crash."""
+        service: an unavailable enhancement path is a reportable state, not a crash.
+
+        ``attach_timeout`` bounds transport attachment independently of the optional
+        guest-service handshake. Neither phase holds up QMP startup.
+        """
         if not self.config.enabled:
             self._detail = "guest enhancement tools are disabled for this profile"
             return await self.capabilities()
@@ -279,7 +287,7 @@ class BridgeGuestToolBackend:
         self._negotiated = None
         self._service_online = False
         try:
-            async with asyncio.timeout(self.config.request_timeout_seconds):
+            async with asyncio.timeout(attach_timeout or self.config.request_timeout_seconds):
                 await self.transport.open()
         except Exception as exc:
             self._detail = f"guest tool transport unavailable: {type(exc).__name__}"

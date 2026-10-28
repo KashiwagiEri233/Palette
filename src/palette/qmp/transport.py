@@ -1,7 +1,7 @@
 """Private QMP transports.
 
-Palette talks to QEMU over pipes attached to a child process it started itself. There is
-no TCP listener, no HMP, and no path by which an agent can reach the management channel:
+Palette uses child stdio on POSIX and an instance-private AF_UNIX socket on Windows.
+There is no TCP listener, no HMP, and no path by which an agent can reach the management channel:
 the agent speaks MCP to the service, and only the service speaks QMP.
 
 The transport is deliberately thin so that tests can substitute an in-process fake QEMU
@@ -47,12 +47,15 @@ class QmpTransport:
         *,
         process: ManagedProcess | None = None,
         name: str = "qmp",
+        kind: str = "stream",
     ) -> None:
         self.reader = reader
         self.writer = writer
         self.process = process
         self.name = name
+        self.kind = kind
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     async def send_json(
         self, payload: dict[str, Any], *, on_sending: Callable[[], None] | None = None
@@ -71,9 +74,12 @@ class QmpTransport:
             raise QmpDisconnectedError(f"QMP channel write failed: {type(exc).__name__}") from exc
 
     async def close(self) -> None:
-        if self._closed:
-            return
         self._closed = True
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_writer(), name="qmp-transport-close")
+        await asyncio.shield(self._close_task)
+
+    async def _close_writer(self) -> None:
         try:
             self.writer.close()
         except Exception:
@@ -104,7 +110,42 @@ class ProcessQmpTransport(QmpTransport):
     def __init__(self, process: ManagedProcess, *, name: str = "qmp") -> None:
         if process.stdin is None or process.stdout is None:
             raise QmpDisconnectedError("QEMU was started without usable QMP pipes")
-        super().__init__(process.stdout, process.stdin, process=process, name=name)
+        super().__init__(process.stdout, process.stdin, process=process, name=name, kind="stdio")
+
+
+async def connect_process_qmp(
+    process: ManagedProcess, endpoint: str | None, *, timeout: float, name: str = "qmp"
+) -> QmpTransport:
+    if endpoint is None:
+        return ProcessQmpTransport(process, name=name)
+    from ..errors import ErrorCode, PaletteError
+    from ..windows_unix import open_connection
+
+    connecting = asyncio.create_task(open_connection(endpoint, limit=DEFAULT_STREAM_LIMIT))
+    exited = asyncio.create_task(process.wait())
+    handed_over = False
+    try:
+        async with asyncio.timeout(timeout):
+            await asyncio.wait({connecting, exited}, return_when=asyncio.FIRST_COMPLETED)
+            if connecting.done():
+                reader, writer = connecting.result()
+                handed_over = True
+                return QmpTransport(reader, writer, process=process, name=name, kind="unix")
+            raise QmpDisconnectedError(f"QEMU exited before QMP connection ({exited.result()})")
+    except TimeoutError as exc:
+        raise PaletteError(ErrorCode.QMP_UNAVAILABLE, "QMP socket connection timed out") from exc
+    except OSError as exc:
+        raise QmpDisconnectedError(f"QMP socket connection failed: {exc}") from exc
+    finally:
+        connecting.cancel()
+        exited.cancel()
+        await asyncio.gather(connecting, exited, return_exceptions=True)
+        if not handed_over and not connecting.cancelled() and connecting.exception() is None:
+            _reader, writer = connecting.result()
+            writer.close()
+            with contextlib.suppress(OSError, TimeoutError):
+                async with asyncio.timeout(1):
+                    await writer.wait_closed()
 
 
 class MemoryTransport(QmpTransport):

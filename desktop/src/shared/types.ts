@@ -8,7 +8,7 @@ export type InputEvent =
   | { type: 'key'; key: string; down: boolean }
   | { type: 'wheel'; direction: 'up' | 'down' | 'left' | 'right'; steps: number }
 
-export type DesktopMethod = 'guest.status' | 'control.display.resize' | 'profiles' | 'os_presets.list' | 'doctor' | 'image.info' | 'hardware.capabilities' | 'vms.settings.get' | 'vms.disk.resize' | 'vms.disk.delete' | 'vms.list' | 'vms.tools.mount' | 'vms.tools.eject' | 'vms.create' | 'vms.update' | 'vms.start' | 'vms.stop' | 'vms.restart' | 'vms.reset' | 'vms.delete' | 'display.ticket' | 'display.sync' | 'control.acquire' | 'control.input' | 'control.heartbeat' | 'control.release'
+export type DesktopMethod = 'guest.status' | 'control.display.resize' | 'profiles' | 'os_presets.list' | 'doctor' | 'image.info' | 'hardware.capabilities' | 'vms.settings.get' | 'vms.disk.resize' | 'vms.disk.delete' | 'vms.list' | 'vms.tools.mount' | 'vms.tools.eject' | 'vms.create' | 'vms.update' | 'vms.start' | 'vms.stop' | 'vms.restart' | 'vms.reboot' | 'vms.reset' | 'vms.delete' | 'display.ticket' | 'display.sync' | 'control.acquire' | 'control.input' | 'control.metrics' | 'control.heartbeat' | 'control.release'
 export interface OwnerInfo { owner_kind: 'embedded' | 'daemon'; config_root: string; runtime_root: string; version: string; features: string[] }
 export interface Profile { profile_id: string; qemu: { arch: string; accelerator: string }; resources: { vcpus: number; memory_mib: number }; images: { size_gib: number }; network: { mode: string; model?: string | null; mac?: string | null }; devices: { display_model: string; default_resolution: boolean }; display: { width: number; height: number }; audio: { enabled: boolean } }
 export interface PortForward { protocol: 'tcp' | 'udp'; host_port: number; guest_port: number }
@@ -29,6 +29,7 @@ export interface ControlLease { lease_id: string; instance_id: string; controlle
 export interface ShutdownTimeout { vm_id: string; name: string; instance_id: string }
 export interface DoctorReport { ok: boolean; checks: { name: string; ok: boolean; blocking?: boolean; detail?: unknown }[] }
 export interface DesktopApi {
+  copyDebugInfo(request: import('./diagnostics').CopyDebugInfoRequest): Promise<{ copied: true }>
   guestAction(vmId: string, instanceId: string, action: GuestAction, options?: { path?: string; readOnly?: boolean; text?: string }): Promise<{ completed: boolean }>
   cancelGuestAction(vmId: string): Promise<void>
   onGuestProgress(callback: (event: GuestProgress) => void): () => void

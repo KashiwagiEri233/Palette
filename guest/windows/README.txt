@@ -18,8 +18,14 @@ Install.cmd is for the installed Windows desktop, not Windows Setup / WinPE.
 
 Inside the Windows guest, open this optical disc and run Install.cmd.
 Accept Windows administrator approval. Restart Windows after installation.
-The installer does not restart the guest automatically. Re-run to retry failed
-installation, or use each upstream component's Windows Apps repair/uninstaller.
+The installer first stages the matching serial driver and installs the Palette helper.
+If an upstream installer fails, it reports failure and keeps the helper installed;
+QGA, SPICE or WebDAV may still be unavailable. WebDAV is configured to restart
+after a service failure. The installer does not restart Windows automatically.
+Re-run to retry, or use each upstream component's Windows Apps repair/uninstaller.
+If QGA VSS registration fails, inspect the MSI and Windows COM+ event logs. On one
+customized Windows 11 guest, COM+ event 4691 identified a disabled MS-DTC service;
+an administrator set it to Manual, started it, and then retried successfully.
 
 Includes VirtIO drivers, QEMU Guest Agent and SPICE Agent from the official
 virtio-win 0.1.285 bundle, and SPICE WebDAV daemon 2.4. Payloads retain upstream

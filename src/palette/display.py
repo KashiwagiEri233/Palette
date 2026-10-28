@@ -17,6 +17,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.typing import Origin
 
 from .errors import ErrorCode, PaletteError
+from .timing import TimingWindow
 
 if TYPE_CHECKING:
     from .service import PaletteService
@@ -146,6 +147,7 @@ class DisplayGateway:
         self.server: Server | None = None
         self.port = 0
         self.tickets: dict[str, Ticket] = {}
+        self.timings = TimingWindow()
 
     async def start(self) -> None:
         self.server = await serve(
@@ -247,8 +249,10 @@ class DisplayGateway:
                     if not data:
                         return
                     # RFB updates are incremental; never discard bytes under backpressure.
+                    started = time.perf_counter()
                     async with asyncio.timeout(5):
                         await ws.send(data)
+                    self.timings.record(forward_ms=(time.perf_counter() - started) * 1000)
 
             async def downstream_messages() -> None:
                 parser = RfbFilter()
@@ -285,6 +289,13 @@ class DisplayGateway:
             with contextlib.suppress(ConnectionClosed):
                 await ws.close(code=1008, reason="display connection ended")
         finally:
+            # Capture ownership before any awaited teardown. An old viewer's cleanup
+            # must not revoke a lease acquired while its TCP writer is still closing.
+            disconnect_lease = (
+                self.service.control.leases.get(ticket.vm_id)
+                if accepted and ticket is not None
+                else None
+            )
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -292,10 +303,12 @@ class DisplayGateway:
                 writer.close()
                 with contextlib.suppress(OSError):
                     await writer.wait_closed()
-            if accepted and ticket is not None:
+            if disconnect_lease is not None and ticket is not None:
                 with contextlib.suppress(PaletteError):
                     current = self.service.manager.find(ticket.vm_id)
                     if current is not None and current.view.instance_id == ticket.instance_id:
                         await self.service.control.revoke(
-                            ticket.vm_id, expected_instance_id=ticket.instance_id
+                            ticket.vm_id,
+                            expected_lease=disconnect_lease,
+                            expected_instance_id=ticket.instance_id,
                         )
