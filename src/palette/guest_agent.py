@@ -9,6 +9,7 @@ import contextlib
 import json
 import secrets
 import time
+from collections.abc import Callable
 from typing import Any
 
 from .errors import ErrorCode, PaletteError
@@ -206,7 +207,12 @@ class QemuGuestAgent:
             return self.status()
 
     async def _command(
-        self, name: str, args: dict[str, Any] | None = None, *, response: bool = True
+        self,
+        name: str,
+        args: dict[str, Any] | None = None,
+        *,
+        response: bool = True,
+        on_sending: Callable[[], None] | None = None,
     ) -> Any:
         if not self.online:
             raise PaletteError(ErrorCode.GUEST_TOOL_UNAVAILABLE, "客户机增强服务不可用")
@@ -216,6 +222,8 @@ class QemuGuestAgent:
         attempted = False
         try:
             await self._synchronize()
+            if on_sending is not None:
+                on_sending()
             attempted = True
             await self._send(name, args)
             result = await self._reply() if response else {}
@@ -233,9 +241,9 @@ class QemuGuestAgent:
                 "增强操作结果未知, 未自动重试" if attempted else "增强通道不可用",
             ) from exc
 
-    async def sync_time(self) -> dict[str, Any]:
+    async def sync_time(self, *, on_sending: Callable[[], None] | None = None) -> dict[str, Any]:
         async with self.lock:
-            await self._command("guest-set-time", {"time": time.time_ns()})
+            await self._command("guest-set-time", {"time": time.time_ns()}, on_sending=on_sending)
             return {"synced": True}
 
     async def shutdown(self) -> None:
@@ -244,7 +252,9 @@ class QemuGuestAgent:
             await self._command("guest-shutdown", {"mode": "powerdown"}, response=False)
             self.synced = False
 
-    async def file_open(self, path: str, mode: str) -> dict[str, Any]:
+    async def file_open(
+        self, path: str, mode: str, *, on_sending: Callable[[], None] | None = None
+    ) -> dict[str, Any]:
         if (
             mode not in {"r", "w"}
             or not path
@@ -256,7 +266,9 @@ class QemuGuestAgent:
         async with self.lock:
             if len(self.transfers) >= 4:
                 raise PaletteError(ErrorCode.BUSY, "同时传输的文件过多")
-            handle = await self._command("guest-file-open", {"path": path, "mode": mode + "b"})
+            handle = await self._command(
+                "guest-file-open", {"path": path, "mode": mode + "b"}, on_sending=on_sending
+            )
             if type(handle) is not int:
                 raise PaletteError(ErrorCode.GUEST_TOOL_UNAVAILABLE, "客户机返回了无效文件句柄")
             token = secrets.token_hex(16)
@@ -269,12 +281,20 @@ class QemuGuestAgent:
             raise PaletteError(ErrorCode.INVALID_ARGUMENT, "文件传输已结束或不属于当前客户机")
         return item[0], item[2]
 
-    async def file_read(self, token: str, count: int = CHUNK_BYTES) -> dict[str, Any]:
+    async def file_read(
+        self,
+        token: str,
+        count: int = CHUNK_BYTES,
+        *,
+        on_sending: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         if type(count) is not int or not 1 <= count <= CHUNK_BYTES:
             raise PaletteError(ErrorCode.INVALID_ARGUMENT, "文件块大小无效")
         async with self.lock:
             handle, total = self._transfer(token, "r")
-            result = await self._command("guest-file-read", {"handle": handle, "count": count})
+            result = await self._command(
+                "guest-file-read", {"handle": handle, "count": count}, on_sending=on_sending
+            )
             try:
                 data = base64.b64decode(result["buf-b64"], validate=True)
                 if len(data) > count or result["count"] != len(data):
@@ -290,7 +310,9 @@ class QemuGuestAgent:
                 "eof": bool(result.get("eof")),
             }
 
-    async def file_write(self, token: str, encoded: str) -> dict[str, Any]:
+    async def file_write(
+        self, token: str, encoded: str, *, on_sending: Callable[[], None] | None = None
+    ) -> dict[str, Any]:
         try:
             if len(encoded) > CHUNK_BYTES * 4 // 3 + 4:
                 raise ValueError
@@ -303,7 +325,9 @@ class QemuGuestAgent:
             handle, total = self._transfer(token, "w")
             if total + len(data) > self.max_file_bytes:
                 raise PaletteError(ErrorCode.INVALID_ARGUMENT, "文件超过传输大小限制")
-            result = await self._command("guest-file-write", {"handle": handle, "buf-b64": encoded})
+            result = await self._command(
+                "guest-file-write", {"handle": handle, "buf-b64": encoded}, on_sending=on_sending
+            )
             self.transfers[token] = (handle, "w", total + len(data))
             if not isinstance(result, dict) or result.get("count") != len(data):
                 raise PaletteError(
@@ -311,11 +335,20 @@ class QemuGuestAgent:
                 )
             return {"count": len(data)}
 
-    async def file_close(self, token: str) -> dict[str, Any]:
+    async def file_close(
+        self, token: str, *, on_sending: Callable[[], None] | None = None
+    ) -> dict[str, Any]:
         async with self.lock:
-            item = self.transfers.pop(token, None)
+            item = self.transfers.get(token)
             if item is not None:
-                await self._command("guest-file-close", {"handle": item[0]})
+
+                def sending() -> None:
+                    # Once the close may have reached the guest, never reuse this handle.
+                    self.transfers.pop(token, None)
+                    if on_sending is not None:
+                        on_sending()
+
+                await self._command("guest-file-close", {"handle": item[0]}, on_sending=sending)
             return {}
 
     async def close_files(self) -> None:
@@ -323,8 +356,13 @@ class QemuGuestAgent:
             # Revoking control must also be bounded while another transfer owns the lock.
             async with asyncio.timeout(self.timeout):
                 for token in list(self.transfers):
-                    with contextlib.suppress(PaletteError):
+                    try:
                         await self.file_close(token)
+                    except PaletteError:
+                        pass
+                    finally:
+                        # Revocation fences all old handles even if a close was not sent.
+                        self.transfers.pop(token, None)
         except TimeoutError:
             self.invalidate()
 

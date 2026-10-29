@@ -182,15 +182,16 @@ async def execute(
             raise PaletteError(
                 ErrorCode.UNSUPPORTED_CAPABILITY, "required QGA commands are disabled"
             )
-        on_sending()
         if operation == "sync_time":
-            data = await agent.sync_time()
+            data = await agent.sync_time(on_sending=on_sending)
         elif operation == "file.open":
-            data = await agent.file_open(request.path, request.mode)
+            data = await agent.file_open(request.path, request.mode, on_sending=on_sending)
         elif operation == "file.read":
-            data = await agent.file_read(request.transfer_id, request.count)
+            data = await agent.file_read(request.transfer_id, request.count, on_sending=on_sending)
         elif operation == "file.write":
-            data = await agent.file_write(request.transfer_id, request.data_base64)
+            data = await agent.file_write(
+                request.transfer_id, request.data_base64, on_sending=on_sending
+            )
         else:
-            data = await agent.file_close(request.transfer_id)
+            data = await agent.file_close(request.transfer_id, on_sending=on_sending)
     return GuestToolOutcome(ok=True, method=operation, data=data)

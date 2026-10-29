@@ -159,6 +159,15 @@ async def test_qga_files_have_opaque_boot_bound_handles_and_total_limit():
         await agent.file_read(token)
 
 
+async def test_qga_control_revocation_fences_files_when_close_cannot_be_sent():
+    agent, _ = agent_for_test()
+    await agent.refresh_info()
+    token = (await agent.file_open("/home/user/example", "w"))["transfer_id"]
+    agent._synchronize = AsyncMock(side_effect=ConnectionError)
+    await agent.close_files()
+    assert token not in agent.transfers
+
+
 async def test_shutdown_does_not_wait_for_nonexistent_success_response():
     agent, wire = agent_for_test()
     await agent.refresh_info()

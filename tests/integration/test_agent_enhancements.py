@@ -72,7 +72,14 @@ def enhanced(service, running_vm):
             "eof": stream.tell() == len(files[path]),
         }
 
-    agent._command = AsyncMock(side_effect=command)
+    replies = []
+
+    async def send(name, arguments):
+        replies.append(await command(name, arguments))
+
+    agent._synchronize = AsyncMock()
+    agent._send = AsyncMock(side_effect=send)
+    agent._reply = AsyncMock(side_effect=lambda: replies.pop(0))
     running_vm.qemu_guest_agent = agent
     return service, running_vm, desktop, agent, files
 
@@ -216,7 +223,7 @@ async def test_invalid_and_unsupported_data_are_rejected_before_sending(enhanced
         server, "vm_guest_file_open", instance, "no-close", path="/home/guest/file", mode="w"
     )
     assert result.is_error and result.structured_content["effect_state"] == "not_sent"
-    agent._command.assert_not_awaited()
+    agent._send.assert_not_awaited()
     with pytest.raises(PaletteError):
         await service.guest_enhancement(
             "desktop",
@@ -226,6 +233,143 @@ async def test_invalid_and_unsupported_data_are_rejected_before_sending(enhanced
             operation="guest-exec",
             parameters={},
         )
+
+
+@pytest.mark.parametrize(
+    ("operation", "parameters", "transfers", "error_code"),
+    [
+        ("read", {"transfer_id": "missing"}, {}, ErrorCode.INVALID_ARGUMENT),
+        (
+            "read",
+            {"transfer_id": "writer"},
+            {"writer": (1, "w", 0)},
+            ErrorCode.INVALID_ARGUMENT,
+        ),
+        (
+            "write",
+            {"transfer_id": "missing", "data_base64": "eA=="},
+            {},
+            ErrorCode.INVALID_ARGUMENT,
+        ),
+        (
+            "write",
+            {"transfer_id": "full", "data_base64": "eA=="},
+            {"full": (1, "w", 5)},
+            ErrorCode.INVALID_ARGUMENT,
+        ),
+        (
+            "open",
+            {"path": "/home/guest/new", "mode": "w"},
+            {str(index): (index, "w", 0) for index in range(4)},
+            ErrorCode.BUSY,
+        ),
+    ],
+)
+async def test_local_file_errors_are_not_sent_and_allow_corrected_requests(
+    enhanced, operation, parameters, transfers, error_code
+):
+    service, instance, _, agent, _ = enhanced
+    server = build_server(service)
+    agent.max_file_bytes = 5
+    agent.transfers.update(transfers)
+    sequence = instance.view.action_seq
+    result = await invoke(server, "vm_guest_file_" + operation, instance, "invalid", **parameters)
+    assert result.is_error
+    assert result.structured_content["effect_state"] == "not_sent"
+    assert result.structured_content["error"]["code"] == error_code
+    assert result.structured_content["action_seq"] == sequence
+    assert instance.view.action_seq == sequence
+    agent._send.assert_not_awaited()
+    agent.transfers.clear()
+    corrected = await invoke(
+        server, "vm_guest_file_open", instance, "corrected", path="/home/guest/new", mode="w"
+    )
+    assert not corrected.is_error
+    assert corrected.structured_content["effect_state"] == "submitted"
+    assert corrected.structured_content["action_seq"] == sequence + 1
+    agent._send.assert_awaited_once()
+
+
+async def test_qga_reply_loss_is_unknown_and_not_replayed(enhanced):
+    service, instance, _, agent, _ = enhanced
+    server = build_server(service)
+    agent._reply.side_effect = TimeoutError
+    sequence = instance.view.action_seq
+    for attempt in range(2):
+        result = await invoke(
+            server, "vm_guest_file_open", instance, "lost-reply", path="/home/guest/new", mode="w"
+        )
+        assert result.is_error
+        assert result.structured_content["effect_state"] == "unknown"
+        assert result.structured_content["action_seq"] == sequence + 1
+        assert result.structured_content["deduplicated"] == bool(attempt)
+    agent._send.assert_awaited_once()
+
+
+async def test_qga_sync_failure_does_not_mark_file_request_sent(enhanced):
+    service, instance, _, agent, _ = enhanced
+    agent._synchronize.side_effect = ConnectionError
+    sequence = instance.view.action_seq
+    result = await invoke(
+        build_server(service),
+        "vm_guest_file_open",
+        instance,
+        "sync-failed",
+        path="/home/guest/new",
+        mode="w",
+    )
+    assert result.is_error
+    assert result.structured_content["effect_state"] == "not_sent"
+    assert result.structured_content["action_seq"] == sequence
+    agent._send.assert_not_awaited()
+
+
+async def test_qga_close_can_retry_when_sync_fails_before_sending(enhanced):
+    service, instance, _, agent, _ = enhanced
+    server = build_server(service)
+    opened = await invoke(
+        server, "vm_guest_file_open", instance, "open-to-close", path="/home/guest/file", mode="w"
+    )
+    token = opened.structured_content["data"]["transfer_id"]
+    sequence = instance.view.action_seq
+    agent._send.reset_mock()
+    agent._synchronize.side_effect = ConnectionError
+    failed = await invoke(
+        server, "vm_guest_file_close", instance, "unsent-close", transfer_id=token
+    )
+    assert failed.is_error and failed.structured_content["effect_state"] == "not_sent"
+    assert failed.structured_content["action_seq"] == sequence
+    assert token in agent.transfers
+    agent._send.assert_not_awaited()
+
+    agent.online = True
+    agent._synchronize.side_effect = None
+    closed = await invoke(server, "vm_guest_file_close", instance, "retry-close", transfer_id=token)
+    assert not closed.is_error and closed.structured_content["effect_state"] == "submitted"
+    assert closed.structured_content["action_seq"] == sequence + 1
+    assert token not in agent.transfers
+    agent._send.assert_awaited_once_with("guest-file-close", {"handle": 1})
+
+
+async def test_qga_close_lost_reply_is_unknown_and_not_replayed(enhanced):
+    service, instance, _, agent, _ = enhanced
+    server = build_server(service)
+    opened = await invoke(
+        server, "vm_guest_file_open", instance, "open-to-close", path="/home/guest/file", mode="w"
+    )
+    token = opened.structured_content["data"]["transfer_id"]
+    agent._send.reset_mock()
+    agent._reply.side_effect = TimeoutError
+    sequence = instance.view.action_seq
+    for attempt in range(2):
+        result = await invoke(
+            server, "vm_guest_file_close", instance, "lost-close", transfer_id=token
+        )
+        assert result.is_error and result.structured_content["effect_state"] == "unknown"
+        assert result.structured_content["action_seq"] == sequence + 1
+        assert result.structured_content["deduplicated"] == bool(attempt)
+    assert token not in agent.transfers
+    agent._send.assert_awaited_once_with("guest-file-close", {"handle": 1})
 
 
 async def test_unknown_write_is_retained_and_never_replayed(enhanced):

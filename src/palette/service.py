@@ -462,7 +462,9 @@ class PaletteService:
             controller = self.controller_for(instance)
 
             async def paste(on_sending: Callable[[], None]) -> GuestToolOutcome:
-                await execute(instance, "clipboard.set", parameters, on_sending)
+                result = await execute(instance, "clipboard.set", parameters, on_sending)
+                if not result.ok:
+                    return result
                 # One queued transaction: another writer cannot replace the clipboard
                 # between setting it and sending the paste chord.
                 await controller.paste_guest_clipboard()

@@ -10,6 +10,7 @@ from palette.capture.qmp import QmpCaptureBackend
 from palette.config import GuestDesktopConfig, GuestToolsConfig
 from palette.errors import ErrorCode, PaletteError
 from palette.guest_tools.base import GuestToolOutcome, MockGuestToolBackend
+from palette.models import EffectState
 from palette.operator.server import OperatorServer
 from palette.server import build_server
 
@@ -102,6 +103,46 @@ async def test_helper_clipboard_works_without_spice_and_stays_guest_only(windows
     status = await service.status("desktop")
     assert status.status.enhancements["desktop"]["clipboard"]
     assert "guest.app" in status.status.enhancements["windows"]["capabilities"]
+
+
+@pytest.mark.parametrize("effect_state", [EffectState.NOT_SENT, EffectState.UNKNOWN])
+async def test_clipboard_paste_preserves_helper_failure_without_pasting(windows_vm, effect_state):
+    service, instance = windows_vm
+    failure = GuestToolOutcome(
+        ok=False,
+        effect_state=effect_state,
+        detail="clipboard is unavailable",
+        error=PaletteError(ErrorCode.GUEST_TOOL_UNAVAILABLE, "clipboard write failed"),
+    )
+
+    async def execute_operation(*, operation, parameters, on_sending):
+        assert operation == "clipboard.set"
+        assert parameters == {"text": "new clipboard text"}
+        if effect_state is not EffectState.NOT_SENT:
+            on_sending()
+        return failure
+
+    instance.guest_tools.execute_operation = AsyncMock(side_effect=execute_operation)
+    frame = (await service.observe("desktop")).frame.frame_id
+    sequence = instance.view.action_seq
+    for attempt in range(2):
+        result, _ = await service.guest_input_text(
+            "desktop",
+            instance_id=instance.view.instance_id,
+            boot_epoch=instance.view.boot_epoch,
+            frame_id=frame,
+            request_id="failed-paste",
+            text="new clipboard text",
+            method="clipboard_paste",
+        )
+        assert not result.ok
+        assert result.effect_state is effect_state
+        assert result.error.code == ErrorCode.GUEST_TOOL_UNAVAILABLE
+        assert result.detail == failure.detail
+        assert result.deduplicated == bool(attempt)
+        assert result.action_seq == sequence + (effect_state is not EffectState.NOT_SENT)
+    instance.guest_tools.execute_operation.assert_awaited_once()
+    assert not any(item["command"] == "input-send-event" for item in read_command_log(instance))
 
 
 async def test_bounded_large_uia_data_crosses_authenticated_agent_ipc(windows_vm):
