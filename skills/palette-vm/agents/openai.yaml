@@ -1,0 +1,4 @@
+interface:
+  display_name: "Palette VM"
+  short_description: "Operate Palette VMs with verified task progress"
+  default_prompt: "Use $palette-vm to complete the task in the selected virtual machine, keep the task plan current, and verify the result."

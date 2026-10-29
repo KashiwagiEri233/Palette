@@ -155,6 +155,35 @@ it('runs the real SDK through VM tools, persists history and reopens its tree', 
   } finally { await test.close() }
 }, 20000)
 
+it.each([true, false])('delivers visible-progress instructions matching the actual tool capabilities (vision: %s)', async vision => {
+  const test = await environment()
+  try {
+    await test.service.saveProvider({ id: test.configuration.providerId, name: 'Fixture', api: test.configuration.api, baseUrl: test.configuration.baseUrl, models: [{ ...test.configuration, id: test.configuration.modelId, name: test.configuration.modelId, vision }] })
+    await test.service.start('vm', test.id, 'Answer a simple question', randomUUID())
+    expect((await settled(test.service, test.id)).view.run?.state).toBe('completed')
+    const messages = test.requests[0].messages as { role: string; content: unknown }[]
+    const instructions = messages.filter(message => message.role === 'system').map(message => String(message.content)).join('\n')
+    expect(instructions).toContain('must call todo_write before starting')
+    expect(instructions).toContain('before starting that work')
+    expect(instructions).toContain('write an accurate final snapshot')
+    expect(instructions).toContain('never delete unfinished items')
+    expect(instructions).toContain('Simple questions and genuinely single-step tasks')
+    expect(instructions).toContain('user\'s language')
+    const tools = (test.requests[0].tools ?? []) as { function: { name: string; description: string } }[]
+    expect(tools.find(tool => tool.function.name === 'todo_write')?.function.description).toContain('visible task-progress panel')
+    if (vision) {
+      expect(instructions).toContain('Observe before acting')
+      expect(instructions).toContain('Outcomes marked unknown must not be replayed blindly')
+      expect(tools.some(tool => tool.function.name === 'observe')).toBe(true)
+      expect(instructions).not.toContain('No VM observation or control tools are available')
+    } else {
+      expect(instructions).toContain('No VM observation or control tools are available')
+      expect(instructions).not.toContain('Windows enhancement tools')
+      expect(tools.map(tool => tool.function.name)).toEqual(['todo_write'])
+    }
+  } finally { await test.close() }
+}, 20000)
+
 it('persists successful Todo snapshots for text models without claiming the VM or counting operations', async () => {
   const test = await environment()
   try {

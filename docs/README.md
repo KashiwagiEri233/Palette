@@ -29,7 +29,7 @@ Two core invariants run through every page:
 | [In-Guest Agent Contract (../guest/agent/README.md)](../guest/agent/README.md) · [简体中文](../guest/agent/README.zh-CN.md) | Length-prefixed JSON protocol, capability handshake, and security rules for the optional `virtio-serial` guest service |
 | [Guest Images Directory (../images/README.md)](../images/README.md) · [简体中文](../images/README.zh-CN.md) | Base image storage conventions and `palette doctor` verification |
 
-> **Bilingual Pairing Rule**: Every user documentation page ships in both English (`*.md`) and Simplified Chinese (`*.zh-CN.md`). `scripts/check_docs.py` enforces language switchers, resolvable relative links, balanced code fences, and valid UTF-8 in CI.
+> **Bilingual Pairing Rule**: Every user documentation page ships in both English (`*.md`) and Simplified Chinese (`*.zh-CN.md`). `scripts/check_docs.py` enforces language switchers, resolvable relative links, balanced code fences, and valid UTF-8 in CI. Machine-facing `skills/<name>/SKILL.md` and skill references follow the same encoding, link and fence checks, with no translation requirement; user-facing READMEs and guides remain paired.
 
 ## Source Code Map
 

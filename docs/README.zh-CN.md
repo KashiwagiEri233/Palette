@@ -29,7 +29,7 @@
 | [客户机内增强服务契约 (../guest/agent/README.zh-CN.md)](../guest/agent/README.zh-CN.md) · [English](../guest/agent/README.md) | 客户机内 `virtio-serial` 增强服务的长度分帧协议、能力握手与安全约束 |
 | [镜像目录说明 (../images/README.zh-CN.md)](../images/README.zh-CN.md) · [English](../images/README.md) | 只读基础镜像存放规范与 `palette doctor` 校验机制 |
 
-> **双语同步约定**：仓库内所有用户文档均提供中英双语配对版本（`*.md` 与 `*.zh-CN.md`），并由 `scripts/check_docs.py` 在 CI 中强制校验语言切换器、相对链接、代码块闭合与 UTF-8 编码。
+> **双语同步约定**：仓库内所有用户文档均提供中英双语配对版本（`*.md` 与 `*.zh-CN.md`），并由 `scripts/check_docs.py` 在 CI 中强制校验语言切换器、相对链接、代码块闭合与 UTF-8 编码。面向 Agent 的 `skills/<名称>/SKILL.md` 与 skill 参考资料仍校验编码、链接和代码块，但不要求翻译；用户阅读的 README 与指南继续保持双语配对。
 
 ## 代码模块映射
 
