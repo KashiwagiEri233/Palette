@@ -20,6 +20,8 @@ it('persists only encrypted credentials and serializes concurrent modifications'
     const report = await store.redactJson({ error: escapedKey, nested: [escapedKey], modelId: 'fixture' })
     expect(report).toEqual({ error: '[redacted]', nested: ['[redacted]'], modelId: 'fixture' })
     expect(JSON.parse(JSON.stringify(report))).toEqual(report)
+    expect(await store.redactJson({ type: 'image', mimeType: 'image/png', data: escapedKey, caption: escapedKey }))
+      .toEqual({ type: 'image', mimeType: 'image/png', data: escapedKey, caption: '[redacted]' })
     await store.delete('a')
     expect(await store.read('a')).toBeUndefined()
   } finally { await rm(root, { recursive: true, force: true }) }

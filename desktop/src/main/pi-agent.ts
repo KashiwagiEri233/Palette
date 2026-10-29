@@ -5,7 +5,7 @@ import { calculateContextTokens, createAgentSession, DefaultResourceLoader, esti
 import type { TextContent, ImageContent } from '@earendil-works/pi-ai'
 import { Type } from 'typebox'
 import type { Conversation } from '../shared/workspace'
-import { activeRun, type AgentConfiguration, type AgentSettings, type AgentView, type AgentSnapshot, type AgentEvent, type AgentRunView, type AgentMessageView, type AgentTreeEntry, type AgentApiKind, type AgentContextUsage, type AgentModelDefinition, type AgentModelDiscovery, type AgentModel } from '../shared/agent'
+import { activeRun, type AgentConfiguration, type AgentSettings, type AgentView, type AgentSnapshot, type AgentEvent, type AgentRunView, type AgentTreeEntry, type AgentApiKind, type AgentContextUsage, type AgentModelDefinition, type AgentModelDiscovery, type AgentModel } from '../shared/agent'
 import { AgentClient, type AgentReply } from './agent-client'
 import { AgentCredentials, atomicJson, readJson, type SecretEncryption } from './agent-storage'
 import { BackendError } from './ipc'
@@ -13,6 +13,8 @@ import { AgentProviderStore, agentApis as apis, defaultConfiguration, validateAg
 import { discoverAgentModels } from './agent-model-discovery'
 import { providerToolSchemas } from './agent-schema'
 import { agentFailureMessage } from './agent-errors'
+import { contentText, exportMessage, messageImage, projectMessages } from './agent-projection'
+import { normalizeTodos } from '../shared/agent-content'
 export { validateAgentConfiguration } from './agent-providers'
 
 const validId = (value: unknown): value is string => typeof value === 'string' && value !== '.' && value !== '..' && /^[\w.-]{1,128}$/.test(value)
@@ -36,6 +38,9 @@ interface SessionRecord {
   publishTimer?: ReturnType<typeof setTimeout>
   stopRequested: boolean
   settings?: AgentConfiguration
+  partialArguments?: Map<number, string>
+  executingToolId?: string
+  unknownToolId?: string
 }
 /** Palette metadata owns identity; pi owns transcript, compaction and branching. */
 export class PiAgentService {
@@ -235,11 +240,25 @@ export class PiAgentService {
     await resourceLoader.reload()
     const created = await createAgentSession({ cwd: record.manager.getCwd(), agentDir: this.directory, sessionManager: record.manager,
       modelRuntime, model, thinkingLevel: model.reasoning ? configuration.thinkingLevel : 'off', settingsManager, resourceLoader,
-      tools: model.input.includes('image') ? vmTools : [] })
+      tools: model.input.includes('image') ? [...vmTools, 'todo_write'] : ['todo_write'] })
     record.session = created.session
     record.session.agent.toolExecution = 'sequential'
     record.settings = { ...configuration, vision: model.input.includes('image') }
-    record.session.subscribe(() => this.schedulePublish(record))
+    record.session.subscribe(event => {
+      if (event.type === 'tool_execution_start') record.executingToolId = event.toolCallId
+      if (event.type === 'tool_execution_end' && record.executingToolId === event.toolCallId) record.executingToolId = undefined
+      if (event.type === 'message_start' && event.message.role === 'assistant') record.partialArguments = new Map()
+      if (event.type === 'message_update' && event.assistantMessageEvent.type === 'toolcall_delta') {
+        const { contentIndex, delta } = event.assistantMessageEvent
+        record.partialArguments ??= new Map()
+        record.partialArguments.set(contentIndex, (record.partialArguments.get(contentIndex) ?? '') + delta)
+      }
+      if (['entry_appended', 'tool_execution_start', 'agent_end'].includes(event.type)) {
+        // pi persists message_end after notifying public subscribers.
+        if (record.publishTimer) clearTimeout(record.publishTimer)
+        record.publishTimer = setTimeout(() => { record.publishTimer = undefined; this.publish(record) }, 0)
+      } else this.schedulePublish(record)
+    })
   }
   private extension(record: SessionRecord): ExtensionFactory {
     const coordinate = Type.Integer({ minimum: 0, maximum: 8192 })
@@ -254,7 +273,23 @@ export class PiAgentService {
     ])
     return pi => {
       pi.on('before_provider_request', event => providerToolSchemas(event.payload))
-      pi.on('message_end', async event => ({ message: JSON.parse(await this.credentials.redact(JSON.stringify(event.message))) as typeof event.message }))
+      pi.on('message_end', async event => {
+        const message = event.message.role === 'toolResult' && event.message.toolCallId === record.unknownToolId
+          ? { ...event.message, details: { ...(event.message.details as Record<string, unknown> | undefined), effect_state: 'unknown' } } : event.message
+        return { message: await this.credentials.redactJson(message) as typeof event.message }
+      })
+      pi.registerTool({
+        name: 'todo_write', label: '更新任务进度',
+        description: 'Replace the entire task plan. For complex multi-step tasks, write concrete steps before working, mark the current step in_progress and update completed steps promptly. Simple tasks need no plan. At most one step can be in_progress. This is reported progress, not proof of completion.',
+        parameters: Type.Object({ todos: Type.Array(Type.Object({ content: Type.String({ minLength: 1, maxLength: 1000 }), status: Type.Union(['pending', 'in_progress', 'completed'].map(value => Type.Literal(value))) }), { maxItems: 100 }) }),
+        executionMode: 'sequential',
+        execute: async (_id, params, signal) => {
+          signal?.throwIfAborted()
+          if (record.stopRequested || record.run?.state !== 'running') throw new Error('任务已停止')
+          const todos = normalizeTodos(params.todos)
+          return { content: [{ type: 'text' as const, text: `已更新任务列表：${todos.filter(item => item.status === 'completed').length}/${todos.length} 已完成` }], details: { todos } }
+        }
+      })
       const execute = async (method: string, parameters: Record<string, unknown>, signal?: AbortSignal) => {
         if (record.stopRequested || !record.run || record.run.state !== 'running' || !record.client || !record.claim) throw new Error('任务已停止或控制权已释放')
         if (record.run.stepCount >= (record.settings?.maxSteps ?? 100)) {
@@ -270,6 +305,7 @@ export class PiAgentService {
         try { reply = await record.client.request(method, record.conversation.vm_id, parameters, record.claim, signal) }
         catch (error) {
           if (['act', 'guest_input_text', 'guest_enhancement'].includes(method) && (!(error instanceof BackendError) || ['ACTION_OUTCOME_UNKNOWN', 'TIMEOUT', 'INTERNAL_ERROR'].includes(error.code))) {
+            record.unknownToolId = record.executingToolId
             record.stopRequested = true
             record.run.error = '操作结果未知，任务已停止；请先观察虚拟机状态'
             queueMicrotask(() => { void record.session?.abort() })
@@ -279,6 +315,7 @@ export class PiAgentService {
         if (record.stopRequested) throw new Error('任务已停止')
         const failure = reply.result.error as { code?: string } | undefined
         if (['act', 'guest_input_text', 'guest_enhancement'].includes(method) && (reply.result.effect_state === 'unknown' || (reply.result.ok === false && failure?.code === 'ACTION_OUTCOME_UNKNOWN'))) {
+          record.unknownToolId = record.executingToolId
           record.stopRequested = true
           record.run.error = '操作结果未知，任务已停止；请先观察虚拟机状态'
           queueMicrotask(() => { void record.session?.abort() })
@@ -370,6 +407,7 @@ export class PiAgentService {
       await this.prepare(record, configuration)
       const run: AgentRunView = { id: randomUUID(), state: 'starting', stepCount: 0 }
       record.stopRequested = false
+      record.unknownToolId = undefined
       record.releaseTask = undefined
       record.run = run
       this.busyVms.set(vmId, id)
@@ -552,6 +590,10 @@ export class PiAgentService {
     const record = await this.load(id, vmId)
     return { streamEpoch: this.streamEpoch, seq: this.seq, view: await this.view(record) }
   }
+  async image(vmId: string, id: string, entryId: unknown, contentIndex: unknown): Promise<{ mimeType: 'image/png'; dataBase64: string }> {
+    const record = await this.load(id, vmId)
+    return messageImage(record.manager.getBranch(), entryId, contentIndex)
+  }
   async diagnostics(vmId?: string, id?: string): Promise<Record<string, unknown>> {
     const record = vmId && id ? await this.load(id, vmId) : undefined
     const configuration = record?.settings ?? await this.configuration()
@@ -600,34 +642,19 @@ export class PiAgentService {
     const run = record.run ? { ...record.run } : null
     if (run && record.stopTask && !activeRun(run)) run.state = 'stopping'
     const compacting = record.compacting
-    const messages: AgentMessageView[] = []
-    const toText = (content: unknown): string => typeof content === 'string' ? content : Array.isArray(content) ? content.filter(part => part?.type === 'text').map(part => part.text).join('\n') : ''
     const branch = record.manager.getBranch()
     if (run?.state === 'failed' && run.error === '模型请求失败，请检查端点、密钥和模型配置') {
       const failed = branch.slice().reverse().find(entry => entry.type === 'message' && entry.message.role === 'assistant' && entry.message.stopReason === 'error')
       if (failed?.type === 'message' && failed.message.role === 'assistant') run.error = await this.failureMessage(failed.message.errorMessage)
     }
-    for (const entry of branch) {
-      if (entry.type === 'message') {
-        const message = entry.message
-        if (message.role === 'user' || message.role === 'assistant' || message.role === 'toolResult') {
-          const text = toText(message.content)
-          if (message.role === 'assistant' && !text && message.stopReason !== 'error' && message.stopReason !== 'aborted') continue
-          messages.push({ id: entry.id, role: message.role === 'toolResult' ? 'tool' : message.role,
-            text: message.role === 'toolResult' ? (message.isError ? '工具执行失败' : '操作已完成') : text,
-            ...(message.role === 'toolResult' ? { toolName: message.toolName } : {}),
-            status: message.role === 'assistant' && ['error', 'aborted'].includes(message.stopReason) ? 'error' : 'complete' })
-        }
-      } else if (entry.type === 'compaction') messages.push({ id: entry.id, role: 'system', text: '上下文已压缩', status: 'complete' })
-    }
     const streaming = record.session?.agent.state.streamingMessage
-    if (streaming && streaming.role === 'assistant') messages.push({ id: `stream-${record.run?.id}`, role: 'assistant', text: toText(streaming.content), status: 'streaming' })
+    const { messages, todos } = projectMessages(branch, streaming, record.session?.agent.state.pendingToolCalls ?? new Set(), run, record.partialArguments)
     const active = new Set(branch.map(entry => entry.id))
     const tree: AgentTreeEntry[] = record.manager.getEntries().filter(entry => entry.type === 'compaction' || entry.type === 'message' && ['user', 'assistant', 'toolResult'].includes(entry.message.role)).map(entry => ({
-      id: entry.id, parentId: entry.parentId, label: entry.type === 'message' ? `${entry.message.role === 'user' ? '用户' : entry.message.role === 'assistant' ? '助手' : '工具'}：${toText('content' in entry.message ? entry.message.content : '').slice(0, 70)}` : '上下文压缩', active: active.has(entry.id)
+      id: entry.id, parentId: entry.parentId, label: entry.type === 'message' ? `${entry.message.role === 'user' ? '用户' : entry.message.role === 'assistant' ? '助手' : '工具'}：${contentText('content' in entry.message ? entry.message.content : '').slice(0, 70)}` : '上下文压缩', active: active.has(entry.id)
     }))
-    const view: AgentView = { conversationId: record.conversation.id, run, messages, tree, compacting, contextUsage }
-    return JSON.parse(await this.credentials.redact(JSON.stringify(view))) as AgentView
+    const view: AgentView = { conversationId: record.conversation.id, run, messages, tree, compacting, contextUsage, todos }
+    return await this.credentials.redactJson(view) as AgentView
   }
   private schedulePublish(record: SessionRecord): void {
     if (record.publishTimer) return
@@ -641,6 +668,6 @@ export class PiAgentService {
   async exportMarkdown(vmId: string, id: string): Promise<string> {
     const record = await this.load(id, vmId)
     const view = await this.view(record)
-    return `# ${record.conversation.title}\n\n` + view.messages.map(message => `## ${message.role === 'user' ? '用户' : message.role === 'assistant' ? '助手' : message.toolName ?? '系统'}\n\n${message.text}\n`).join('\n')
+    return `# ${record.conversation.title}\n\n` + view.messages.map(message => `## ${message.role === 'user' ? '用户' : message.role === 'assistant' ? '助手' : message.toolName ?? '系统'}\n\n${exportMessage(message)}\n`).join('\n')
   }
 }

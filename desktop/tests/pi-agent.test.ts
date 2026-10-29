@@ -127,8 +127,12 @@ it('runs the real SDK through VM tools, persists history and reopens its tree', 
     expect(result.view.contextUsage).toMatchObject({ tokens: 2176, contextWindow: 128000 })
     expect(result.view.contextUsage!.percent).toBeCloseTo(1.7)
     const names = ((test.requests[0].tools ?? []) as { function: { name: string } }[]).map(tool => tool.function.name)
-    expect(names.sort()).toEqual(['act', 'app', 'clipboard_get', 'clipboard_set', 'display_resize', 'file_close', 'file_open', 'file_read', 'file_write', 'filesystem', 'input_text', 'multi_edit', 'multi_select', 'observe', 'powershell', 'process', 'registry', 'release_inputs', 'snapshot', 'status', 'sync_time', 'wait'])
+    expect(names.sort()).toEqual(['act', 'app', 'clipboard_get', 'clipboard_set', 'display_resize', 'file_close', 'file_open', 'file_read', 'file_write', 'filesystem', 'input_text', 'multi_edit', 'multi_select', 'observe', 'powershell', 'process', 'registry', 'release_inputs', 'snapshot', 'status', 'sync_time', 'todo_write', 'wait'])
     expect(JSON.stringify(result)).not.toContain('test-secret')
+    const screenshot = result.view.messages.flatMap(message => message.blocks ?? []).flatMap(block => block.type === 'tool-call' ? block.tool.images : []).at(0)!
+    expect(await test.service.image('vm', test.id, screenshot.entryId, screenshot.contentIndex)).toEqual({ mimeType: 'image/png', dataBase64: pixel.toString('base64') })
+    expect(JSON.stringify(result)).not.toContain(pixel.toString('base64'))
+    await expect(test.service.image('other-vm', test.id, screenshot.entryId, screenshot.contentIndex)).rejects.toThrow('不属于')
     const directory = join(test.service.directory, 'sessions', test.id)
     const files = (await readdir(directory)).filter(file => file.endsWith('.jsonl'))
     expect(files).toHaveLength(1)
@@ -145,7 +149,34 @@ it('runs the real SDK through VM tools, persists history and reopens its tree', 
       const user = snapshot.view.tree.find(entry => entry.label.startsWith('用户'))!
       const branch = await reopened.navigate('vm', test.id, user.id)
       expect(branch.editorText).toBe('visual task')
+      await expect(reopened.image('vm', test.id, screenshot.entryId, screenshot.contentIndex)).rejects.toThrow('分支')
       expect(test.requests).toHaveLength(3)
+    } finally { await reopened.close() }
+  } finally { await test.close() }
+}, 20000)
+
+it('persists successful Todo snapshots for text models without claiming the VM or counting operations', async () => {
+  const test = await environment()
+  try {
+    await test.service.saveProvider({ id: test.configuration.providerId, name: 'Fixture', api: test.configuration.api, baseUrl: test.configuration.baseUrl, models: [{ ...test.configuration, id: test.configuration.modelId, name: test.configuration.modelId, vision: false }] })
+    const todos = [{ content: ' Read ', status: 'in_progress' }, { content: 'Write', status: 'pending' }]
+    test.script([{ name: 'todo_write', arguments: { todos } }, { name: 'todo_write', arguments: { todos: [{ content: 'bad', status: 'invalid' }] } }])
+    await test.service.start('vm', test.id, 'text plan', randomUUID())
+    const complete = await settled(test.service, test.id)
+    expect(complete.view.todos).toEqual([{ content: 'Read', status: 'in_progress' }, { content: 'Write', status: 'pending' }])
+    expect(complete.view.run).toMatchObject({ state: 'completed', stepCount: 0 })
+    expect(test.client.calls).toEqual([])
+    const calls = complete.view.messages.flatMap(message => message.blocks ?? []).flatMap(block => block.type === 'tool-call' ? [block.tool] : [])
+    expect(calls.map(tool => tool.status)).toEqual(['complete', 'error'])
+    await test.service.close()
+    const reopened = test.create()
+    try {
+      expect((await reopened.snapshot('vm', test.id)).view.todos).toEqual(complete.view.todos)
+      await reopened.start('vm', test.id, 'new text task', randomUUID())
+      expect((await settled(reopened, test.id)).view.todos).toEqual([])
+      const user = complete.view.tree.find(entry => entry.label.startsWith('用户'))!
+      await reopened.navigate('vm', test.id, user.id)
+      expect((await reopened.snapshot('vm', test.id)).view.todos).toEqual([])
     } finally { await reopened.close() }
   } finally { await test.close() }
 }, 20000)
@@ -355,6 +386,8 @@ it.each(['limit', 'unknown', 'timeout'])('halts the SDK tool loop on %s without 
     const result = await settled(test.service, test.id)
     expect(result.view.run?.state).toBe('cancelled')
     expect(result.view.run?.error).toContain(mode === 'limit' ? '最大工具调用次数' : '操作结果未知')
+    const action = result.view.messages.flatMap(message => message.blocks ?? []).find(block => block.type === 'tool-call' && block.tool.name === 'act')
+    expect(action).toMatchObject({ tool: { status: mode === 'limit' ? 'cancelled' : 'unknown' } })
     expect(test.client.calls.filter(method => method === 'act')).toHaveLength(mode === 'limit' ? 0 : 1)
     expect(test.requests).toHaveLength(2)
     expect(test.client.calls.filter(method => method === 'driver_release')).toHaveLength(1)

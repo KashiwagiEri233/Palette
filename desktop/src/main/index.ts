@@ -176,7 +176,7 @@ app.whenReady().then(async () => {
   })
   const handleRequest = async (event: Electron.IpcMainInvokeEvent, method: DesktopMethod, vmId?: string, payload: Record<string, unknown> = {}): Promise<unknown> => {
     trusted(event)
-    if ((!methods.has(method) && !workspaceMethods.has(method) && !agentMethods.has(method)) || (vmId !== undefined && !/^[A-Za-z0-9_.-]{1,128}$/.test(vmId)) || typeof payload !== 'object' || payload === null || Array.isArray(payload) || Buffer.byteLength(JSON.stringify(payload)) > (String(method) === 'agent.providers.save' ? 1024 * 1024 : 64 * 1024)) throw new Error('请求无效')
+    if ((!methods.has(method) && !workspaceMethods.has(method) && !agentMethods.has(method)) || (vmId !== undefined && !/^[A-Za-z0-9_.-]{1,128}$/.test(vmId)) || typeof payload !== 'object' || payload === null || Array.isArray(payload) || Buffer.byteLength(JSON.stringify(payload)) > (String(method) === 'agent.providers.save' || String(method) === 'window.command' && payload.action === 'copy_text' ? 1024 * 1024 : 64 * 1024)) throw new Error('请求无效')
     if (handlingClose) throw new Error('正在退出，请稍候')
     const operation = String(method)
     if (agentMethods.has(operation)) {
@@ -189,6 +189,7 @@ app.whenReady().then(async () => {
       if (operation === 'agent.credentials.set' || operation === 'agent.credentials.remove') return service.configureCredential(payload.providerId as string, operation.endsWith('.set') ? payload.key as string : null)
       if (!vmId || typeof payload.conversationId !== 'string') throw new Error('会话参数无效')
       if (operation === 'agent.snapshot') return service.snapshot(vmId, payload.conversationId)
+      if (operation === 'agent.message.image') return service.image(vmId, payload.conversationId, payload.entryId, payload.contentIndex)
       if (operation === 'agent.start') return service.start(vmId, payload.conversationId, payload.text as string, payload.requestId as string)
       if (operation === 'agent.stop') return service.stop(vmId, payload.conversationId)
       if (operation === 'agent.compact') return service.compact(vmId, payload.conversationId)
@@ -197,6 +198,10 @@ app.whenReady().then(async () => {
     }
     if (operation === 'window.command') {
       if (payload.action === 'close') window.close()
+      else if (payload.action === 'copy_text') {
+        if (typeof payload.text !== 'string') throw new Error('复制内容无效')
+        clipboard.writeText(payload.text)
+      }
       else if (payload.action === 'open_external') {
         const url = externalLink(payload.url)
         if (!url) throw new Error('链接地址无效')

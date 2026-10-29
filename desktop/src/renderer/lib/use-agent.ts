@@ -20,20 +20,29 @@ export function useAgentSettings(scope?: string) {
 }
 
 export function acceptAgentSnapshot(previous: AgentSnapshot | null, next: AgentSnapshot): AgentSnapshot {
-  return previous?.streamEpoch === next.streamEpoch && previous.seq > next.seq ? previous : next
+  if (previous?.streamEpoch === next.streamEpoch && previous.seq > next.seq) return previous
+  if (!previous || previous.view.conversationId !== next.view.conversationId) return next
+  const cached = new Map(previous.view.messages.map(message => [message.id, message]))
+  const messages = next.view.messages.map(message => {
+    const old = cached.get(message.id)
+    return old && JSON.stringify(old) === JSON.stringify(message) ? old : message
+  })
+  const same = messages.length === previous.view.messages.length && messages.every((message, index) => message === previous.view.messages[index])
+  return { ...next, view: { ...next.view, messages: same ? previous.view.messages : messages } }
 }
 
 export function useAgent(vmId: string, conversationId: string, reportError: (error: unknown) => void) {
   const [snapshot, setSnapshot] = useState<AgentSnapshot | null>(null)
-  const alive = useRef(false)
+  const scope = useRef<string | null>(null)
+  const requestScope = `${vmId}:${conversationId}`
   const refresh = useCallback(async () => {
     const value = await window.palette.request('agent.snapshot', vmId, { conversationId })
-    if (alive.current) setSnapshot(previous => acceptAgentSnapshot(previous, value))
+    if (scope.current === `${vmId}:${conversationId}`) setSnapshot(previous => acceptAgentSnapshot(previous, value))
     return value
   }, [vmId, conversationId])
   useEffect(() => {
     let disposed = false
-    alive.current = true
+    scope.current = requestScope
     setSnapshot(null)
     // Subscribe first; the snapshot and sequenced full views close the bootstrap race.
     const unsubscribe = window.palette.onAgentEvent(event => {
@@ -43,7 +52,7 @@ export function useAgent(vmId: string, conversationId: string, reportError: (err
     const focus = () => { void refresh().catch(reportError) }
     window.addEventListener('focus', focus)
     const timer = setInterval(focus, 5000)
-    return () => { disposed = true; alive.current = false; unsubscribe(); clearInterval(timer); window.removeEventListener('focus', focus) }
+    return () => { disposed = true; scope.current = null; unsubscribe(); clearInterval(timer); window.removeEventListener('focus', focus) }
   }, [conversationId, refresh, reportError])
-  return { snapshot, refresh }
+  return { snapshot: snapshot?.view.conversationId === conversationId ? snapshot : null, refresh }
 }

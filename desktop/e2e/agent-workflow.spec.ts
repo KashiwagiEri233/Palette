@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 test('built-in pi configures a model, operates the VM, stops and restores history', async () => {
-  test.setTimeout(180000)
+  test.setTimeout(240000)
   const repository = resolve('..')
   const temporary = join(repository, '.runtime', 'desktop-agent-tests')
   await mkdir(temporary, { recursive: true })
@@ -14,6 +14,9 @@ test('built-in pi configures a model, operates the VM, stops and restores histor
   execFileSync(uv, ['run', '--offline', 'python', resolve('scripts/setup_fixture.py'), root], { cwd: repository })
   let slow = false
   let rejectSchema = false
+  let finishArguments: (() => void) | undefined
+  let finishFinal: (() => void) | undefined
+  let appendSlow: ((text: string) => void) | undefined
   const requestedTools = new Set<string>()
   const server = createServer(async (request, response) => {
     let body = ''
@@ -35,21 +38,37 @@ test('built-in pi configures a model, operates the VM, stops and restores histor
     response.writeHead(200, { 'content-type': 'text/event-stream' })
     const chunk = (delta: unknown, reason: string | null = null) => response.write(`data: ${JSON.stringify({ id: 'palette-test', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta, finish_reason: reason }], ...(reason === 'stop' ? { usage: { prompt_tokens: 2048, completion_tokens: 128, total_tokens: 2176 } } : {}) })}\n\n`)
     chunk({ role: 'assistant' })
-    if (slow) { chunk({ content: '正在等待下一步' }); return }
+    if (slow) {
+      chunk({ content: '正在等待下一步\n\n' + Array.from({ length: 100 }, (_, index) => `流式段落 ${index + 1}：保留历史内容并跟随新输出。`).join('\n\n') })
+      appendSlow = text => chunk({ content: text })
+      return
+    }
     const tools = payload.messages.filter(message => message.role === 'tool')
-    if (tools.length < 2) {
-      const name = tools.length === 0 ? 'observe' : 'act'
+    if (tools.length < 4) {
+      const name = ['todo_write', 'observe', 'act', 'todo_write'][tools.length]
       requestedTools.add(name)
       let parameters: Record<string, unknown> = {}
-      if (tools.length) {
+      if (name === 'todo_write') {
+        const completed = tools.length === 3
+        parameters = { todos: [{ content: '观察虚拟机画面', status: completed ? 'completed' : 'in_progress' }, { content: '单击目标并确认结果', status: completed ? 'completed' : 'pending' }] }
+      } else if (name === 'act') {
         const content = tools.at(-1)!.content
         const text = typeof content === 'string' ? content : (content as { type: string; text?: string }[]).map(part => part.text ?? '').join('')
         const frame = JSON.parse(text).frame as { frame_id: string; instance_id: string }
         parameters = { frame_id: frame.frame_id, instance_id: frame.instance_id, action: { type: 'click', x: 10, y: 10 } }
       }
-      chunk({ tool_calls: [{ index: 0, id: `call-${tools.length}`, type: 'function', function: { name, arguments: JSON.stringify(parameters) } }] })
+      if (!tools.length) {
+        chunk({ reasoning_content: '先查看客户机画面，' })
+        chunk({ reasoning_content: '再执行点击并确认结果。' })
+        chunk({ content: '我会先检查画面，再完成操作。' })
+        const args = JSON.stringify(parameters)
+        chunk({ tool_calls: [{ index: 0, id: 'call-0', type: 'function', function: { name, arguments: args.slice(0, 10) } }] })
+        await new Promise<void>(resolve => { finishArguments = resolve })
+        chunk({ tool_calls: [{ index: 0, function: { arguments: args.slice(10) } }] })
+      } else chunk({ tool_calls: [{ index: 0, id: `call-${tools.length}`, type: 'function', function: { name, arguments: JSON.stringify(parameters) } }] })
       chunk({}, 'tool_calls')
     } else {
+      if (!finishFinal) await new Promise<void>(resolve => { finishFinal = resolve })
       chunk({ content: '## 已完成虚拟机视觉操作\n\n**操作结果**\n\n- 观察画面\n- 单击目标\n\n```json\n{"ok":true}\n```\n\n| 检查项 | 结果 |\n| --- | --- |\n| 视觉操作 | 通过 |\n\n[查看说明](https://example.com/docs)' })
       chunk({}, 'stop')
     }
@@ -92,9 +111,53 @@ test('built-in pi configures a model, operates the VM, stops and restores histor
     await page.getByRole('button', { name: 'Agent 验证', exact: true }).click()
     await page.getByRole('textbox', { name: '任务内容' }).fill('观察画面并单击一次')
     await page.getByRole('button', { name: '发送', exact: true }).click()
+    const processRegion = page.locator('.agent-process').first()
+    const processTrigger = processRegion.locator(':scope > .process-trigger')
+    await expect(processTrigger).toHaveAttribute('aria-expanded', 'false')
+    await processTrigger.click()
+    const preparing = processRegion.locator('.tool-status-preparing').first()
+    await preparing.locator(':scope > .process-trigger').click()
+    await expect(preparing).toContainText('参数（生成中）')
+    await expect(preparing.locator('.tool-json')).toContainText('{"todos":[')
+    finishArguments!()
+    const progress = page.locator('.agent-todo-panel')
+    await expect(progress).toContainText('已完成 2', { timeout: 30000 })
+    await expect(progress.locator(':scope > .process-trigger')).toHaveAttribute('aria-expanded', 'false')
+    await progress.locator(':scope > .process-trigger').click()
+    await expect(progress.locator('[data-todo-status=completed]')).toHaveCount(2)
+    await expect(processRegion.locator('.screenshot-preview')).toHaveCount(0)
+    const reasoning = processRegion.locator('.agent-reasoning').first()
+    await reasoning.locator(':scope > .process-trigger').click()
+    await expect(reasoning.locator('.agent-message-markdown')).toContainText('先查看客户机画面，再执行点击并确认结果。')
+    const observation = processRegion.locator('.agent-tool-row').filter({ hasText: '观察画面 · 已完成' }).first()
+    await observation.locator(':scope > .process-trigger').click()
+    await expect(observation.locator('.screenshot-preview img')).toBeVisible()
+    await observation.getByRole('button', { name: '放大截图 1', exact: true }).click()
+    await expect(page.getByRole('dialog', { name: '工具截图 1', exact: true })).toBeVisible()
+    await page.keyboard.press('Escape')
+    await page.evaluate(() => {
+      const fixture = window as typeof window & { restoreScreenshotUrl?: typeof URL.createObjectURL }
+      fixture.restoreScreenshotUrl = URL.createObjectURL
+      URL.createObjectURL = () => { throw new Error('fixture screenshot load failure') }
+    })
+    const actionRow = processRegion.locator('.agent-tool-row').filter({ hasText: '操作虚拟机 · 已完成' }).first()
+    await actionRow.locator(':scope > .process-trigger').click()
+    await expect(actionRow.getByRole('button', { name: '重试加载截图', exact: true })).toBeVisible()
+    await page.evaluate(() => { URL.createObjectURL = (window as typeof window & { restoreScreenshotUrl: typeof URL.createObjectURL }).restoreScreenshotUrl })
+    await actionRow.getByRole('button', { name: '重试加载截图', exact: true }).click()
+    await expect(actionRow.locator('.screenshot-preview img')).toBeVisible()
+    await actionRow.locator(':scope > .process-trigger').click()
+    const lastTodo = processRegion.locator('.agent-tool-row').filter({ hasText: '更新任务进度' }).last()
+    await lastTodo.locator(':scope > .process-trigger').click()
+    await expect(lastTodo).toContainText('进度变化')
+    await expect(lastTodo).toContainText('待开始 → 已完成')
+    await page.screenshot({ path: 'test-results/pi-agent-process.png', animations: 'disabled' })
+    await expect.poll(() => typeof finishFinal).toBe('function')
+    finishFinal!()
     await expect(page.getByText('已完成虚拟机视觉操作', { exact: true })).toBeVisible({ timeout: 30000 })
+    await expect(processTrigger).toHaveAttribute('aria-expanded', 'true')
     await expect(page.getByRole('status').filter({ hasText: '已完成 · 2 次工具调用' })).toBeVisible()
-    expect([...requestedTools].sort()).toEqual(['act', 'observe'])
+    expect([...requestedTools].sort()).toEqual(['act', 'observe', 'todo_write'])
     const contextTrigger = page.getByRole('button', { name: '上下文使用状况：已用 2%', exact: true })
     const modelSelect = page.getByRole('button', { name: '选择模型', exact: true })
     await expect(contextTrigger).toBeVisible()
@@ -104,7 +167,7 @@ test('built-in pi configures a model, operates the VM, stops and restores histor
     expect(contextBounds!.x + contextBounds!.width).toBeLessThanOrEqual(modelBounds!.x)
     expect(modelBounds!.x + modelBounds!.width).toBeLessThanOrEqual(sendBounds!.x)
     await expect(page.getByRole('button', { name: '压缩上下文', exact: true })).toHaveCount(0)
-    await contextTrigger.hover()
+    await contextTrigger.click()
     await expect(page.getByText('2% 已用（剩余 98%）', { exact: true })).toBeVisible()
     await expect(page.getByText('已用 2.2K / 128K tokens（估算）', { exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: '压缩上下文', exact: true })).toBeEnabled()
@@ -200,6 +263,17 @@ test('built-in pi configures a model, operates the VM, stops and restores histor
     await expect(reply.locator('strong')).toHaveText('操作结果')
     await expect(reply.getByRole('listitem')).toHaveCount(2)
     await expect(reply.locator('pre code.language-json')).toContainText('{"ok":true}')
+    await reply.getByRole('button', { name: '复制代码', exact: true }).click()
+    await expect(reply.getByText('已复制', { exact: true })).toBeVisible()
+    expect(await application.evaluate(({ clipboard }) => clipboard.readText())).toBe('{"ok":true}\n')
+    await application.evaluate(({ clipboard }) => {
+      const fixture = globalThis as typeof globalThis & { restoreCodeClipboard?: typeof clipboard.writeText }
+      fixture.restoreCodeClipboard = clipboard.writeText
+      clipboard.writeText = () => { throw new Error('fixture clipboard failure') }
+    })
+    await reply.getByRole('button', { name: '复制代码', exact: true }).click()
+    await expect(reply.getByText('复制失败，重试', { exact: true })).toBeVisible()
+    await application.evaluate(({ clipboard }) => { clipboard.writeText = (globalThis as typeof globalThis & { restoreCodeClipboard: typeof clipboard.writeText }).restoreCodeClipboard })
     await expect(reply.getByRole('table')).toBeVisible()
     await expect(page.getByRole('button', { name: '会话分支', exact: true })).toHaveCount(0)
     await expect(page.getByRole('dialog', { name: '会话分支', exact: true })).toHaveCount(0)
@@ -211,15 +285,28 @@ test('built-in pi configures a model, operates the VM, stops and restores histor
     for (const url of ['file:///etc/passwd', 'javascript:alert(1)']) {
       expect(await page.evaluate(url => window.palette.request('window.command', undefined, { action: 'open_external', url }).then(() => false, () => true), url)).toBe(true)
     }
+    await processTrigger.click()
+    await progress.locator(':scope > .process-trigger').click()
     await page.screenshot({ path: 'test-results/pi-agent-workflow.png' })
     await page.evaluate(() => document.documentElement.classList.add('dark'))
     await page.screenshot({ path: 'test-results/pi-agent-markdown-dark.png', animations: 'disabled' })
     await page.evaluate(() => document.documentElement.classList.remove('dark'))
+    await processTrigger.click()
+    await progress.locator(':scope > .process-trigger').click()
+    const savedScroll = page.locator('.conversation-transcript [data-slot=scroll-area-viewport]')
+    await savedScroll.evaluate(element => { element.scrollTop = 0 })
+    await expect.poll(() => savedScroll.evaluate(element => element.scrollTop)).toBe(0)
+    await page.getByRole('button', { name: '主页', exact: true }).click()
+    await page.getByRole('button', { name: '观察画面并单击一次', exact: true }).click()
+    await expect(processTrigger).toHaveAttribute('aria-expanded', 'true')
+    await expect.poll(() => savedScroll.evaluate(element => element.scrollTop)).toBeLessThan(5)
+    await expect(page.getByRole('button', { name: '有新消息 ↓', exact: true })).toHaveCount(0)
     rejectSchema = true
     await page.getByRole('textbox', { name: '任务内容' }).fill('debug-private-task')
     await page.getByRole('button', { name: '发送', exact: true }).click()
     const runError = page.locator('.agent-run-error')
     await expect(runError).toContainText('工具参数格式不兼容', { timeout: 20000 })
+    await expect(page.locator('.agent-todo-panel')).toHaveCount(0)
     await runError.getByRole('button', { name: '复制调试信息', exact: true }).click()
     await expect(runError).toContainText('已复制')
     const debugText = await application.evaluate(({ clipboard }) => clipboard.readText())
@@ -232,12 +319,22 @@ test('built-in pi configures a model, operates the VM, stops and restores histor
     await page.getByRole('textbox', { name: '任务内容' }).fill('等待任务')
     await page.getByRole('button', { name: '发送', exact: true }).click()
     await expect(page.getByRole('button', { name: '停止 Agent', exact: true })).toBeVisible()
+    await expect(page.locator('.agent-answer').last()).toContainText('流式段落 100')
+    const scroll = page.locator('.conversation-transcript [data-slot=scroll-area-viewport]')
+    await scroll.evaluate(element => { element.scrollTop = 0 })
+    await expect.poll(() => scroll.evaluate(element => element.scrollTop)).toBe(0)
+    appendSlow!('\n\n新的流式输出，不应打断向上阅读。')
+    await expect(page.getByRole('button', { name: '有新消息 ↓', exact: true })).toBeVisible()
+    expect(await scroll.evaluate(element => element.scrollTop)).toBeLessThan(5)
+    await page.getByRole('button', { name: '有新消息 ↓', exact: true }).click()
+    await expect.poll(() => scroll.evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(5)
     await expect(modelSelect).toBeDisabled()
     await page.getByRole('button', { name: /上下文使用状况/ }).click()
     await expect(page.getByRole('button', { name: '压缩上下文', exact: true })).toBeDisabled()
     await page.keyboard.press('Escape')
     await page.getByRole('button', { name: '停止 Agent', exact: true }).click()
     await expect(page.getByRole('status').filter({ hasText: '已停止' })).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('.agent-answer').last()).toContainText('新的流式输出')
     await page.evaluate(() => window.palette.finishClose('background'))
     await application.close()
     application = await launch()
@@ -245,6 +342,12 @@ test('built-in pi configures a model, operates the VM, stops and restores histor
     await expect(page.getByText('后台已连接', { exact: true })).toBeVisible({ timeout: 30000 })
     await page.getByRole('button', { name: '观察画面并单击一次', exact: true }).click()
     await expect(page.getByText('已完成虚拟机视觉操作', { exact: true })).toBeVisible()
+    await expect(page.locator('.agent-answer').last()).toContainText('新的流式输出')
+    const restoredProcess = page.locator('.agent-process').first()
+    await expect(restoredProcess.locator(':scope > .process-trigger')).toHaveAttribute('aria-expanded', 'false')
+    await restoredProcess.locator(':scope > .process-trigger').click()
+    await restoredProcess.locator('.agent-tool-row').filter({ hasText: '观察画面 · 已完成' }).first().locator(':scope > .process-trigger').click()
+    await expect(restoredProcess.locator('.screenshot-preview img').first()).toBeVisible()
     await expect(page.getByRole('status').filter({ hasText: '已停止' })).toBeVisible()
     await page.evaluate(async id => { await window.palette.request('vms.stop', id); await window.palette.finishClose('shutdown') }, vmId)
   } finally {
