@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PiAgentService, validateAgentConfiguration } from '../src/main/pi-agent'
 import { AgentClient, type AgentReply } from '../src/main/agent-client'
-import type { AgentConfiguration, AgentEvent } from '../src/shared/agent'
+import type { AgentConfiguration, AgentEvent, AgentRunView } from '../src/shared/agent'
 import type { Conversation } from '../src/shared/workspace'
 import { atomicJson } from '../src/main/agent-storage'
 
@@ -148,6 +148,110 @@ it('runs the real SDK through VM tools, persists history and reopens its tree', 
       expect(test.requests).toHaveLength(3)
     } finally { await reopened.close() }
   } finally { await test.close() }
+}, 20000)
+
+it.each([true, false])('keeps a run active until control release completes (confirmed: %s)', async confirmed => {
+  const test = await environment()
+  let enteredRelease!: () => void
+  let finishRelease!: () => void
+  const entered = new Promise<void>(resolve => { enteredRelease = resolve })
+  const blocked = new Promise<void>(resolve => { finishRelease = resolve })
+  const request = test.client.request.bind(test.client)
+  let releases = 0
+  vi.spyOn(test.client, 'request').mockImplementation(async (...args) => {
+    if (args[0] === 'driver_release' && ++releases === 1) {
+      enteredRelease()
+      await blocked
+      const reply = await request(...args)
+      return { ...reply, result: { release_confirmed: confirmed } }
+    }
+    return request(...args)
+  })
+  try {
+    await test.service.start('vm', test.id, 'complete then release', randomUUID())
+    await entered
+    expect((await test.service.snapshot('vm', test.id)).view.run?.state).toBe('running')
+    await expect(test.service.start('vm', test.id, 'next task', randomUUID())).rejects.toThrow('已有运行中的任务')
+    await expect(test.service.compact('vm', test.id)).rejects.toThrow('请先停止当前任务')
+    finishRelease()
+    const result = await settled(test.service, test.id)
+    expect(result.view.run?.state).toBe(confirmed ? 'completed' : 'failed')
+    if (!confirmed) expect(result.view.run?.error).toContain('输入释放未确认')
+    await expect(test.service.start('vm', test.id, 'next task', randomUUID())).resolves.toHaveProperty('runId')
+    expect((await settled(test.service, test.id)).view.run?.state).toBe('completed')
+  } finally { finishRelease(); await test.close() }
+}, 20000)
+
+it('keeps a text-only run active until its final state is saved', async () => {
+  const test = await environment()
+  let enteredSave!: () => void
+  let finishSave!: () => void
+  const entered = new Promise<void>(resolve => { enteredSave = resolve })
+  const blocked = new Promise<void>(resolve => { finishSave = resolve })
+  const internals = test.service as unknown as { saveRun(record: { run: AgentRunView | null }, run?: AgentRunView | null): Promise<void> }
+  const save = internals.saveRun.bind(test.service)
+  let blockedOnce = false
+  vi.spyOn(internals, 'saveRun').mockImplementation(async (record, run) => {
+    if (!blockedOnce && (run ?? record.run)?.state === 'completed') {
+      blockedOnce = true
+      enteredSave()
+      await blocked
+    }
+    return save(record, run)
+  })
+  try {
+    await test.service.saveProvider({ id: test.configuration.providerId, name: 'Fixture', api: test.configuration.api, baseUrl: test.configuration.baseUrl, models: [{ ...test.configuration, id: test.configuration.modelId, name: test.configuration.modelId, vision: false }] })
+    await test.service.start('vm', test.id, 'text-only task', randomUUID())
+    await entered
+    expect((await test.service.snapshot('vm', test.id)).view.run?.state).toBe('running')
+    await expect(test.service.start('vm', test.id, 'next task', randomUUID())).rejects.toThrow('已有运行中的任务')
+    finishSave()
+    expect((await settled(test.service, test.id)).view.run?.state).toBe('completed')
+    const saved = JSON.parse(await readFile(join(test.service.directory, 'sessions', test.id, 'run.json'), 'utf8'))
+    expect(saved.run.state).toBe('completed')
+    await expect(test.service.start('vm', test.id, 'next task', randomUUID())).resolves.toHaveProperty('runId')
+    expect((await settled(test.service, test.id)).view.run?.state).toBe('completed')
+  } finally { finishSave(); await test.close() }
+}, 20000)
+
+it('stops a run while its control release is pending without releasing twice', async () => {
+  const test = await environment()
+  let enteredRelease!: () => void
+  let finishRelease!: () => void
+  let enteredAbort!: () => void
+  let finishAbort!: () => void
+  const entered = new Promise<void>(resolve => { enteredRelease = resolve })
+  const blocked = new Promise<void>(resolve => { finishRelease = resolve })
+  const abortEntered = new Promise<void>(resolve => { enteredAbort = resolve })
+  const abortBlocked = new Promise<void>(resolve => { finishAbort = resolve })
+  const request = test.client.request.bind(test.client)
+  vi.spyOn(test.client, 'request').mockImplementation(async (...args) => {
+    if (args[0] === 'driver_release') { enteredRelease(); await blocked }
+    return request(...args)
+  })
+  try {
+    await test.service.start('vm', test.id, 'complete then stop', randomUUID())
+    await entered
+    const internals = test.service as unknown as { records: Map<string, { run: AgentRunView | null; session: { abort(): Promise<void> } }> }
+    const record = internals.records.get(test.id)!
+    const abort = record.session.abort.bind(record.session)
+    vi.spyOn(record.session, 'abort').mockImplementation(async () => { enteredAbort(); await abortBlocked; await abort() })
+    const stopping = test.service.stop('vm', test.id)
+    await vi.waitFor(async () => expect((await test.service.snapshot('vm', test.id)).view.run?.state).toBe('stopping'))
+    await expect(test.service.start('vm', test.id, 'next task', randomUUID())).rejects.toThrow('已有运行中的任务')
+    finishRelease()
+    await abortEntered
+    await vi.waitFor(() => expect(record.run?.state).toBe('cancelled'))
+    expect((await test.service.snapshot('vm', test.id)).view.run?.state).toBe('stopping')
+    const other = { ...test.conversations[0], id: randomUUID() }
+    test.conversations.push(other)
+    await expect(test.service.start('vm', other.id, 'competing task', randomUUID())).rejects.toThrow('已有运行中的任务')
+    finishAbort()
+    expect((await stopping).view.run?.state).toBe('cancelled')
+    expect(test.client.calls.filter(method => method === 'driver_release')).toHaveLength(1)
+    await expect(test.service.start('vm', test.id, 'next task', randomUUID())).resolves.toHaveProperty('runId')
+    expect((await settled(test.service, test.id)).view.run?.state).toBe('completed')
+  } finally { finishRelease(); finishAbort(); await test.close() }
 }, 20000)
 
 it('stops a slow response, rejects same-VM competition and never dispatches late tools', async () => {

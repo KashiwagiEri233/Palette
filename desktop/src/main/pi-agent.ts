@@ -16,7 +16,7 @@ import { agentFailureMessage } from './agent-errors'
 export { validateAgentConfiguration } from './agent-providers'
 
 const validId = (value: unknown): value is string => typeof value === 'string' && value !== '.' && value !== '..' && /^[\w.-]{1,128}$/.test(value)
-const running = (record: SessionRecord): boolean => activeRun(record.run) || record.compacting
+const running = (record: SessionRecord): boolean => activeRun(record.run) || record.compacting || !!record.stopTask
 const vmTools = ['status', 'observe', 'act', 'wait', 'release_inputs', 'input_text', 'clipboard_get', 'clipboard_set', 'file_open', 'file_read', 'file_write', 'file_close', 'display_resize', 'sync_time', 'filesystem', 'powershell', 'process', 'registry', 'app', 'snapshot', 'multi_select', 'multi_edit']
 interface RunRecord { run: AgentRunView | null; requestId?: string; textHash?: string }
 interface SessionRecord {
@@ -29,7 +29,7 @@ interface SessionRecord {
   compacting: boolean
   task?: Promise<void>
   stopTask?: Promise<void>
-  releaseTask?: Promise<void>
+  releaseTask?: Promise<boolean>
   client?: AgentClient
   claim?: string
   heartbeat?: ReturnType<typeof setInterval>
@@ -207,8 +207,8 @@ export class PiAgentService {
     this.loading.set(id, task)
     try { return await task } finally { this.loading.delete(id) }
   }
-  private saveRun(record: SessionRecord): Promise<void> {
-    return atomicJson(join(this.directory, 'sessions', record.conversation.id, 'run.json'), { run: record.run, requestId: record.requestId, textHash: record.textHash })
+  private saveRun(record: SessionRecord, run: AgentRunView | null = record.run): Promise<void> {
+    return atomicJson(join(this.directory, 'sessions', record.conversation.id, 'run.json'), { run, requestId: record.requestId, textHash: record.textHash })
   }
   private async prepare(record: SessionRecord, configuration: AgentConfiguration): Promise<void> {
     if (record.session) return
@@ -401,52 +401,70 @@ export class PiAgentService {
         this.schedulePublish(record)
         return { runId: run.id }
       } catch (error) {
-        run.state = 'failed'
-        run.error = '无法开始任务，请检查虚拟机与模型配置'
-        try { await this.release(record); await this.saveRun(record) }
-        finally { this.busyVms.delete(vmId); this.publish(record) }
+        const failed: AgentRunView = { ...run, state: 'failed', error: '无法开始任务，请检查虚拟机与模型配置' }
+        try {
+          if (!await this.release(record)) failed.error = '输入释放未确认，请检查虚拟机控制状态后再继续'
+          await this.saveRun(record, failed)
+        } finally { record.run = failed; this.busyVms.delete(vmId); this.publish(record) }
         throw error
       }
     })
   }
   private async executePrompt(record: SessionRecord, text: string): Promise<void> {
+    let state: AgentRunView['state'] = 'completed'
+    let errorMessage: string | undefined
     try {
       await record.session!.prompt(text, { expandPromptTemplates: false })
       await record.session!.waitForIdle()
       const last = record.session!.messages.at(-1)
-      if (record.stopRequested) record.run!.state = 'cancelled'
+      if (record.stopRequested) state = 'cancelled'
       else if (last?.role === 'assistant' && last.stopReason === 'error') {
-        record.run!.state = 'failed'
-        record.run!.error = await this.failureMessage(last.errorMessage)
-      } else record.run!.state = 'completed'
+        state = 'failed'
+        errorMessage = await this.failureMessage(last.errorMessage)
+      }
     } catch (error) {
-      record.run!.state = record.stopRequested ? 'cancelled' : 'failed'
-      if (!record.stopRequested) record.run!.error ??= await this.failureMessage(error, '任务执行失败')
+      state = record.stopRequested ? 'cancelled' : 'failed'
+      if (!record.stopRequested) errorMessage = record.run!.error ?? await this.failureMessage(error, '任务执行失败')
     } finally {
-      try { await this.release(record); await this.saveRun(record) }
-      finally { this.busyVms.delete(record.conversation.vm_id); this.publish(record) }
+      const result: AgentRunView = { ...record.run!, state, ...(errorMessage === undefined ? {} : { error: errorMessage }) }
+      try {
+        const confirmed = await this.release(record)
+        if (!confirmed) {
+          result.state = 'failed'
+          result.error = '输入释放未确认，请检查虚拟机控制状态后再继续'
+        } else if (record.stopRequested) result.state = 'cancelled'
+        await this.saveRun(record, result)
+        // A stop can arrive while the final state is being persisted.
+        if (confirmed && record.stopRequested && result.state !== 'cancelled') {
+          result.state = 'cancelled'
+          await this.saveRun(record, result)
+        }
+      } finally {
+        record.run = result
+        if (!record.stopTask) this.busyVms.delete(record.conversation.vm_id)
+        this.publish(record)
+      }
     }
   }
   private async failureMessage(error: unknown, fallback?: string): Promise<string> {
     const detail = typeof error === 'string' ? error : error instanceof Error ? error.message : ''
     return agentFailureMessage(await this.credentials.redact(detail), fallback)
   }
-  private release(record: SessionRecord): Promise<void> {
+  private release(record: SessionRecord): Promise<boolean> {
     return record.releaseTask ??= this.releaseOwned(record)
   }
-  private async releaseOwned(record: SessionRecord): Promise<void> {
+  private async releaseOwned(record: SessionRecord): Promise<boolean> {
     if (record.heartbeat) clearInterval(record.heartbeat)
     record.heartbeat = undefined
+    let confirmed = true
     if (record.claim && record.client) {
       try {
         const result = await record.client.request('driver_release', record.conversation.vm_id, {}, record.claim)
         if (result.result.release_confirmed !== true) throw new Error('release failed')
-      } catch {
-        record.run!.state = 'failed'
-        record.run!.error = '输入释放未确认，请检查虚拟机控制状态后再继续'
-      }
+      } catch { confirmed = false }
     }
     record.claim = undefined
+    return confirmed
   }
   async stop(vmId: string, id: string): Promise<AgentSnapshot> {
     await this.gate
@@ -465,13 +483,19 @@ export class PiAgentService {
       await this.release(record)
       await record.session?.abort()
       await record.task?.catch(() => {})
-      if (record.run?.state === 'stopping') record.run.state = 'cancelled'
-      await this.saveRun(record)
-      this.publish(record)
+      if (record.run?.state === 'stopping') {
+        record.run.state = 'cancelled'
+        await this.saveRun(record)
+      }
     })()
     // Concurrent stops share cleanup and the final run metadata write.
     record.stopTask = task
-    try { await task } finally { record.stopTask = undefined }
+    try { await task } finally {
+      record.stopTask = undefined
+      const vmId = record.conversation.vm_id
+      if (!activeRun(record.run) && !record.compacting && this.busyVms.get(vmId) === record.conversation.id) this.busyVms.delete(vmId)
+      this.publish(record)
+    }
   }
   async stopVm(vmId: string): Promise<void> {
     await this.gate
@@ -574,6 +598,7 @@ export class PiAgentService {
   private async view(record: SessionRecord): Promise<AgentView> {
     const contextUsage = await this.contextUsage(record)
     const run = record.run ? { ...record.run } : null
+    if (run && record.stopTask && !activeRun(run)) run.state = 'stopping'
     const compacting = record.compacting
     const messages: AgentMessageView[] = []
     const toText = (content: unknown): string => typeof content === 'string' ? content : Array.isArray(content) ? content.filter(part => part?.type === 'text').map(part => part.text).join('\n') : ''
