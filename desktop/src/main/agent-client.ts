@@ -46,7 +46,7 @@ export class AgentClient {
         try {
           if (!response && bytes.length >= 4) {
             const length = bytes.readUInt32BE(0)
-            if (!length || length > 256 * 1024) throw new Error('Agent JSON 响应大小无效')
+            if (!length || length > 1024 * 1024) throw new Error('Agent JSON 响应大小无效')
             if (bytes.length < length + 4) return
             const parsed = JSON.parse(bytes.subarray(4, length + 4).toString('utf8'))
             if (parsed.version !== 1 || parsed.request_id !== requestId || parsed.generation !== this.endpoint.generation) throw new Error('Agent 响应身份不匹配')

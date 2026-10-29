@@ -73,3 +73,12 @@ allow_agent_qemu_args = true
 
 [guest_tools]
 enabled = false
+
+# Optional upstream tools: missing guest services preserve basic VM operation.
+[guest_agent]
+enabled = true
+
+[guest_desktop]
+clipboard = true
+resize = true
+shared_folders = true

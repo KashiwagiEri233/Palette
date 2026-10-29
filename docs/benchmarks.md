@@ -37,11 +37,23 @@ When a host misses a latency target, break the elapsed time down across these fi
 
 1. **Image Encoding & Resizing (Pillow PNG)**: Compressing raw framebuffer bytes into PNG is typically the single largest CPU cost.
 2. **Scratch File I/O**: QEMU `screendump` writes to `.runtime/vms/<vm_id>/<instance_id>/frames/`, which Palette reads back and unlinks immediately.
-3. **QMP Pipe Round-Trip**: One pipe write plus one newline-delimited JSON response from the QEMU main loop.
+3. **QMP Transport Round-Trip**: One private transport write (child stdio on POSIX, AF_UNIX on Windows) plus one newline-delimited JSON response from the QEMU main loop.
 4. **Post-Input Settle (`settle_after_input_ms`)**: The configured delay between submitting input and capturing the post-action screenshot (`120 ms` by default).
 5. **Queue Wait**: Time spent queued behind another in-flight action on the same VM.
 
-## 4. Physical Correctness & Endurance Criteria
+## 4. Human Input and Live Display
+
+Human input uses `control.input` → QMP `input-send-event`; it does not incur the Agent's post-input settle or per-action screenshot. Live display uses the separate, read-only VNC/WebSocket stream. Discrete keys/buttons flush in a microtask; motion-only batches use an 8 ms minimum send interval. Waiting for an outstanding ACK or a running transaction is additional latency, not part of that scheduling budget.
+
+Desktop negotiates `operator-input-stream-v1` and opens one lease-bound connection for input. Each batch retains authentication, sequence receipts and epoch checks. Older backends keep one-shot requests. Heartbeats and releases use independent connections; a disconnect never replays uncertain input. At most two input streams occupy the eight local connection slots. Streams close on lease loss, and a started frame must complete within two seconds even though an idle valid lease may remain connected.
+
+For diagnostics, `window.palette.request('control.metrics', VM_ID)` returns rolling P50/P95/P99 milliseconds and sample counts (up to 256 per metric). `input` covers the current instance's queue/QMP/audit/total times; `runtime` reports event-loop lag and `display` reports gateway forwarding/backpressure time across the runtime. These are transport/service metrics, not guest presentation latency. The renderer emits `palette-input-timing` CustomEvents containing only `queue_ms` and `roundtrip_ms`; diagnostic listeners must bound their own history. No key values, text or screenshots are recorded.
+
+Compare the same host/guest before and after at 1280×800 and 1920×1080, both idle and with repeated background `vm_observe`. Record input-to-ACK separately from input-to-visible guest response, plus frame intervals during dragging and large-area scrolling. Use a guest test target that visibly changes on each numbered input; correlate its rendered marker with the input rather than treating the next arbitrary VNC update as a response. Report accelerator, architectures, resolution and sample count. Mock timings verify application overhead only; real motion-to-display latency requires a real guest. Image processing runs in at most two workers and remains serialized with input at the transaction level.
+
+After building Desktop, run `npm exec -- playwright test e2e/human-input.spec.ts` from `desktop/` for the isolated application-level regression. Its attached `human-input-mock.json` contains frontend and backend timing windows explicitly labelled `mock`; it also checks tiny-wheel accumulation and drag release outside the canvas. This report is not a real-QEMU performance result.
+
+## 5. Physical Correctness & Endurance Criteria
 
 These physical acceptance criteria require a real QEMU hypervisor and guest image and have no meaningful mock equivalent:
 

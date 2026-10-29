@@ -148,6 +148,9 @@ uv run python scripts/mcp_click_test.py   --root CONFIG_ROOT --vm-id VM_ID --x X
 3. 在控制台画面上按住按键、拖拽鼠标与滚动滚轮，核对客户机响应，并通过另一客户端调用 `vm_status` 确认按键保持期间账本非空。
 4. 点击**“交还 Agent”**或按 **`Ctrl+Alt+G`** 释放控制权：验证重新 `vm_observe` 后 Agent 点击恢复正常，而继续使用接管前的旧 `frame_id` 会返回 `STALE_FRAME`。
 5. 验证失焦、切换页面、隐藏窗口、断开连接或停止心跳满 **3 秒**后，控制权租约自动过期且按住的键鼠状态被清空。
+6. 将拖拽移出画布的四个边缘后释放：指针应限制在边缘，按钮不能残留按下状态。测试触控板微小位移、水平与对角滚动、双击和修饰键组合；微小位移应累计，不能每次都放大为一格滚动。
+7. 开启自动分辨率后连续调整尺寸：同步不得重叠，旧拖拽应取消，旧坐标不能重放。确认空闲超过两秒后仍可继续接管操作，输入通道断开后释放按住状态且不重放输入。
+8. 让第二客户端持续观察，同时重复上述交互。按[性能基准](benchmarks.zh-CN.md)分别采集输入、ACK、可见反馈和帧间隔指标，再使用真实客体完成 30 分钟稳定性验收。模拟测试不能建立硬件性能验收结论。
 
 ## 8. 边界回归与安全退出检查清单
 
@@ -157,7 +160,10 @@ uv run python scripts/mcp_click_test.py   --root CONFIG_ROOT --vm-id VM_ID --x X
 | **幂等去重** | 使用相同 `request_id` 与完全相同的参数重发 `vm_act` | 返回缓存回执（`deduplicated = true`），无重复点击；若参数不同则返回 `REQUEST_ID_CONFLICT` |
 | **缩放坐标映射** | 在适应窗口、原始尺寸与高 DPI 下分别通过 MCP 和人工点击同一目标 | 均准确命中目标（MCP 使用图像像素坐标，GUI 人工使用映射坐标） |
 | **全屏切换** | 进入并退出控制台全屏模式 | 画面正常显示，退出全屏时自动释放人工控制权 |
-| **持久重启** | 正常关机后再次启动同一持久虚拟机 | 生成新 `instance_id`，持久磁盘文件与 UEFI 变量保留，旧 frame 失效 |
+| **硬件重启** | 在控制台、列表和菜单点击重启；客户机忽略 ACPI | 不弹确认或等待关机；仅发出 `system_reset`，进程及 `instance_id` 保留、`boot_epoch` 增长；磁盘与 UEFI 变量保留，旧 frame 与租约失效，回到仅查看 |
+| **查看模式鼠标** | 首次连接、结束控制、失焦释放及重连后，将鼠标移入画面；覆盖普通窗口和全屏 | 本机指针可见，不发送客户机输入；接管后保留客户机光标行为 |
+| **持久停止后启动** | 正常关机后再次启动同一持久虚拟机 | 生成新 `instance_id`，持久磁盘文件与 UEFI 变量保留，旧 frame 失效 |
+| **电源键** | 在控制台、虚拟机列表和菜单点击关机，先取消再确认；使用忽略 ACPI 的一次性客户机验证 | 确认框显示虚拟机名称及未保存数据丢失、文件系统损坏风险；取消保留原运行实例；确认后不发送 ACPI 请求，强制停止并保留持久磁盘 |
 | **仅关闭窗口** | 关闭桌面端窗口并选择“仅关闭窗口” | `daemon` 与 VM 继续运行，MCP 仍可观察，重开 GUI 可见同一运行实例 |
 | **完全退出** | 关闭桌面端窗口并选择“完全退出” | 先正常关闭所有运行中 VM，再停止当前 `daemon`，确认进程退出后关闭窗口，持久数据保留 |
 | **退出异常保护** | 正常关机超时或后台断线时点击“完全退出” | 窗口保留并显示错误原因，支持重试、取消或改为“仅关闭窗口”，绝不静默强杀 |
@@ -228,3 +234,36 @@ uv run python scripts/check_docs.py
 npm --prefix desktop test
 npm --prefix desktop run test:e2e
 ```
+
+### 11.1 Windows QMP 再次启动验收
+
+运行 `uv run python -m pytest tests/unit/test_windows_unix.py tests/unit/test_guest_pipe_startup.py tests/qmp tests/integration/test_qmp_startup.py`，验证原生传输回归。其中包含旧版客户端抢先连接导致的 `ConnectNamedPipe` 竞态的确定性复现，不会阻塞测试进程。
+
+使用专用 Alpine 测试 ISO 及从该 ISO 提取的内核/initramfs，在 PowerShell 中配置：
+
+```powershell
+$env:PALETTE_QMP_QEMU = 'C:/Program Files/qemu/qemu-system-x86_64.exe'
+$env:PALETTE_QMP_ACCEL = 'whpx'
+$env:PALETTE_QMP_ALPINE_ISO = 'C:/test-media/alpine-virt-x86_64.iso'
+$env:PALETTE_QMP_KERNEL = 'C:/test-media/boot/vmlinuz-virt'
+$env:PALETTE_QMP_INITRD = 'C:/test-media/boot/initramfs-virt'
+$env:PALETTE_QMP_CYCLES = '20'
+uv run python -m pytest tests/e2e/test_qmp_restart.py -s -o junit_family=xunit1 --junitxml=.runtime/qmp-restart.xml
+```
+
+固件测试启用四条增强通道，并覆盖刻意不连接任何宿主对端的情况。持久客户机测试通过桌面后台的正常关机路径连续执行 20 轮，再覆盖客户机自主关机与显式强制停止；检查实例替换、私有端点清理、持久可写磁盘复用、跨启动磁盘数据模式及原 ISO 摘要不变。强制停止或 QMP `quit` 不计为正常关机。ISO 只读使用，测试在 pytest 临时目录内创建独立可写虚拟机。WHPX 是 Windows 主要验收环境，可设 `PALETTE_QMP_ACCEL=tcg` 补充验证。缺少环境变量时跳过硬件测试，不建立实机验收结论。
+
+### 11.2 2026-10-28 Windows QMP 关机后再次启动实测
+
+- **宿主与客户机**：Windows 11 build `26300`、Python `3.12.13`、QEMU `11.1.0`（`v11.1.0-12130-ge470268ff4`）；独立 Alpine `3.22.0` 客户机，`q35`、1 vCPU、512 MiB 内存、1 GiB 持久可写磁盘、离线网络，同时启用 QGA、tools、shares 和 session 四条通道。
+- **WHPX：通过**：20 轮正常 ACPI 关机后再次启动，随后验证客户机自主关机后启动及显式强制停止。每轮检查进程退出、新实例身份、持久磁盘复用与内容、端点删除和原 ISO 摘要不变，使用真实 Linux 客户机验证宿主 QMP/传输生命周期。
+- **TCG：通过**：一轮正常 ACPI 关机、自主关机及强制停止，同样通过磁盘与端点检查。
+- **传输与恢复：通过**：四条对端均已连接或刻意缺失时连续启动固件、真实 QEMU 中文及空格端点，以及注入启动失败后重新启动。原生 Win32 竞态测试确定性复现了旧管道抢先连接问题；套接字传输避开该问题。
+- **自动化后端回归**：979 项通过、12 项按平台条件跳过，零失败；Ruff 检查与格式、严格 mypy、中英文文档配对检查均通过。本地 JUnit 记录保存在 `.runtime/qmp-*.xml`。
+
+### 11.3 2026-10-28 Windows QMP 并发实测
+
+- **问题复现**：Windows 标准输入输出监视器在仅 8 个合法状态查询并发时，就出现无请求 ID 的 JSON 解析错误及 3 个命令超时。Windows QMP 现使用另一条仅当前用户可访问的 AF_UNIX 套接字；POSIX 保留子进程标准输入输出。命令超时和不重放策略不变。
+- **WHPX 与 TCG：通过**：500 批受租约约束的人工输入与 1600 次状态查询同时执行（查询并发数 32），没有协议错误，结束后无遗留按键。另行执行的 WHPX 8、32、128 并发状态查询也全部通过。
+- **生命周期与画面：通过**：AF_UNIX QMP 再次通过 20 轮正常 ACPI 关机后启动、自主关机、强制停止、失败重试、缺少增强对端、中文端点，以及已有的真实键盘/画面/VNC 和中文介质路径测试。
+- **后端回归**：984 项通过、12 项按平台条件跳过。原先仅向 stdout 注入断线的旧测试已改为向实际 QMP reader 注入，其整个生命周期回归模块复测通过；汇总报告保留该复测记录。证据：`.runtime/qmp-socket-backend-regression.xml`、`.runtime/qmp-concurrency-whpx.xml`、`.runtime/qmp-concurrency-tcg.xml`、`.runtime/qmp-socket-restart-whpx.xml`、`.runtime/qmp-socket-display-paths.xml`。

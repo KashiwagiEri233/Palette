@@ -131,6 +131,8 @@ class DriverManager:
             confirmed = (
                 controller is None or (await controller.emergency_release()).release_confirmed
             )
+            if instance.qemu_guest_agent is not None:
+                await instance.qemu_guest_agent.close_files()
             if confirmed or instance.process is None or instance.process.returncode is not None:
                 self.claims.pop(vm_id, None)
             return confirmed

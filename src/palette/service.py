@@ -185,7 +185,27 @@ class PaletteService:
         else:
             ledger = InputLedgerState(release_confirmed=False)
         guest = instance.guest_tools
+        from .enhancements import enhancement_status
+
         guest_status = await guest.capabilities() if guest is not None else None
+        enhancements = enhancement_status(instance)
+        enhancements["windows"] = {
+            "enabled": instance.profile.guest_tools.enabled,
+            "online": bool(guest_status and guest_status.usable),
+            "interactive_desktop_ready": guest_status.interactive_desktop_ready
+            if guest_status
+            else False,
+            "capabilities": list(guest_status.capabilities) if guest_status else [],
+            "detail": guest_status.detail if guest_status else "Windows guest worker unavailable",
+        }
+        standard_clipboard = instance.profile.guest_desktop.clipboard
+        clipboard_ready = enhancements["desktop"]["clipboard"] or bool(
+            standard_clipboard
+            and guest_status
+            and guest_status.supports("guest.clipboard")
+            and guest_status.interactive_desktop_ready is True
+        )
+        enhancements["desktop"]["clipboard"] = clipboard_ready
         status = VmStatus(
             **execution_info(instance.profile),
             vm_id=vm_id,
@@ -212,21 +232,43 @@ class PaletteService:
             input_ledger=ledger,
             guest_tools=(
                 GuestToolStatus(
-                    enabled=guest_status.enabled,
-                    transport_online=guest_status.transport_online,
-                    service_online=guest_status.service_online,
-                    interactive_desktop_ready=guest_status.interactive_desktop_ready,
+                    enabled=guest_status.enabled or standard_clipboard,
+                    transport_online=guest_status.transport_online
+                    or bool(
+                        standard_clipboard
+                        and instance.guest_desktop
+                        and instance.guest_desktop.connected
+                    ),
+                    service_online=guest_status.service_online or clipboard_ready,
+                    interactive_desktop_ready=(
+                        guest_status.interactive_desktop_ready or clipboard_ready
+                    )
+                    if standard_clipboard
+                    else guest_status.interactive_desktop_ready,
                     protocol_version=guest_status.protocol_version,
                     connection_generation=guest_status.connection_generation,
-                    capabilities=list(guest_status.capabilities),
-                    input_methods=list(guest_status.input_methods),
+                    capabilities=sorted(
+                        set(guest_status.capabilities)
+                        | ({"guest.input_text"} if clipboard_ready else set())
+                    ),
+                    input_methods=sorted(
+                        set(guest_status.input_methods)
+                        | ({"clipboard_paste"} if clipboard_ready else set())
+                    ),
                     allowed_apps=list(guest_status.apps),
-                    detail=guest_status.detail,
+                    detail=(
+                        "Guest clipboard available"
+                        if clipboard_ready
+                        else "Standard QEMU clipboard unavailable; basic visual input remains available"
+                    )
+                    if standard_clipboard
+                    else guest_status.detail,
                 )
                 if guest_status is not None
                 else GuestToolStatus()
             ),
             queued_actions=controller.queued_jobs if controller else 0,
+            enhancements=enhancements,
             controller_owned=True,
             control_owner="operator" if vm_id in self.control.leases else "agent",
             control_state=self.control.leases[vm_id].state
@@ -407,6 +449,34 @@ class PaletteService:
         self.control.require_agent(vm_id)
         instance = await self.manager.require_running(vm_id)
         self.require_instance_id(instance, instance_id)
+        self._require_boot_epoch(instance, boot_epoch)
+        if method == "clipboard_paste" and instance.profile.guest_desktop.clipboard:
+            from .agent_enhancements import execute, validate_parameters
+
+            if target != "focused" or frame_id is None or not text:
+                raise PaletteError(
+                    ErrorCode.INVALID_ARGUMENT,
+                    "clipboard paste requires text, a frame and focused target",
+                )
+            parameters = validate_parameters("clipboard.set", {"text": text})
+            controller = self.controller_for(instance)
+
+            async def paste(on_sending: Callable[[], None]) -> GuestToolOutcome:
+                result = await execute(instance, "clipboard.set", parameters, on_sending)
+                if not result.ok:
+                    return result
+                # One queued transaction: another writer cannot replace the clipboard
+                # between setting it and sending the paste chord.
+                await controller.paste_guest_clipboard()
+                return GuestToolOutcome(ok=True, method="clipboard_paste")
+
+            return await controller.run_guest_operation(
+                label="guest.input_text",
+                runner=paste,
+                request_id=request_id,
+                frame_id=frame_id,
+                parameters={"text": text, "method": method, "target": target},
+            )
         policy = instance.policy
         policy.require_capability("guest.input_text")
         self._require_boot_epoch(instance, boot_epoch)
@@ -478,6 +548,127 @@ class PaletteService:
                 "the guest rebooted after this request was prepared",
                 details={"expected_boot_epoch": instance.view.boot_epoch},
             )
+
+    async def guest_enhancement(
+        self,
+        vm_id: str,
+        *,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+        operation: str,
+        parameters: dict[str, Any],
+        frame_id: str | None = None,
+    ) -> tuple[GuestToolResult, bytes | None]:
+        """Agent authority never routes through an operator lease or host dialog."""
+        from .agent_enhancements import execute, validate_parameters
+
+        validate_identifier(request_id, what="request_id")
+        self.control.require_agent(vm_id)
+        instance = await self.manager.require_running(vm_id)
+        self.require_instance_id(instance, instance_id)
+        self._require_boot_epoch(instance, boot_epoch)
+        request = validate_parameters(operation, parameters)
+        controller = self.controller_for(instance)
+
+        if operation in {"multi_select", "multi_edit"}:
+            from .windows_enhancements import BatchParameters
+
+            if not isinstance(request, BatchParameters):  # pragma: no cover - closed registry
+                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "invalid batch parameters")
+            if frame_id is None:
+                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "batch operations require frame_id")
+            instance.policy.require_capability("guest.batch")
+            backend = instance.guest_tools
+            if operation == "multi_edit":
+                instance.policy.require_capability("guest.input_text")
+                for item in request.locs or request.labels or []:
+                    if len(item[-1]) > instance.profile.guest_tools.max_text_chars:
+                        raise PaletteError(
+                            ErrorCode.INVALID_ARGUMENT, "field text exceeds profile limit"
+                        )
+
+            def validate() -> None:
+                self.control.require_agent(vm_id)
+                self._require_boot_epoch(instance, boot_epoch)
+
+            async def prepare() -> None:
+                nonlocal backend
+                backend = instance.guest_tools
+                if backend is None:
+                    raise PaletteError(
+                        ErrorCode.GUEST_TOOL_UNAVAILABLE, "Windows guest worker unavailable"
+                    )
+                caps = await backend.capabilities()
+                if not caps.supports("guest.batch") or not caps.interactive_desktop_ready:
+                    raise PaletteError(
+                        ErrorCode.GUEST_TOOL_UNAVAILABLE, "Windows interactive worker unavailable"
+                    )
+                if operation == "multi_edit" and not caps.supports_method("native_text"):
+                    raise PaletteError(
+                        ErrorCode.INPUT_TARGET_UNSUPPORTED, "native text input is required"
+                    )
+
+            async def resolve(snapshot_id: str, labels: list[int]) -> list[list[int]]:
+                validate()
+                if backend is None:  # pragma: no cover - prepare establishes this
+                    raise PaletteError(
+                        ErrorCode.GUEST_TOOL_UNAVAILABLE, "Windows guest worker unavailable"
+                    )
+                result = await backend.execute_operation(
+                    operation="resolve_elements",
+                    parameters={"snapshot_id": snapshot_id, "labels": labels},
+                )
+                if not result.ok:
+                    raise result.error or PaletteError(
+                        ErrorCode.STALE_FRAME, "guest elements are no longer available"
+                    )
+                points = result.data.get("points")
+                if not isinstance(points, list) or any(
+                    not isinstance(point, list) for point in points
+                ):
+                    raise PaletteError(
+                        ErrorCode.INVALID_COORDINATES, "guest returned invalid element coordinates"
+                    )
+                return points
+
+            async def write_text(text: str, on_sending: Callable[[], None]) -> GuestToolOutcome:
+                validate()
+                if backend is None:  # pragma: no cover - prepare establishes this
+                    raise PaletteError(
+                        ErrorCode.GUEST_TOOL_UNAVAILABLE, "Windows guest worker unavailable"
+                    )
+                return await backend.input_text(
+                    text=text, method="native_text", on_sending=on_sending
+                )
+
+            return await controller.run_guest_batch(
+                operation=operation,
+                request_id=request_id,
+                frame_id=frame_id,
+                parameters=request.model_dump(exclude_none=True),
+                resolve=resolve,
+                write_text=write_text,
+                validate=validate,
+                prepare=prepare,
+            )
+
+        async def run(on_sending: Callable[[], None]) -> GuestToolOutcome:
+            self.control.require_agent(vm_id)
+            self._require_boot_epoch(instance, boot_epoch)
+            return await execute(instance, operation, request, on_sending)
+
+        result, image = await controller.run_guest_operation(
+            label="guest." + operation,
+            request_id=request_id,
+            frame_id=frame_id,
+            parameters=parameters,
+            runner=run,
+            capture_after=operation in {"display.resize", "app", "snapshot"},
+        )
+        if operation == "snapshot":
+            controller.remember_guest_snapshot(result)
+        return result, image
 
     # -- lifecycle --------------------------------------------------------------------
     async def start(

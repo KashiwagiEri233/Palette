@@ -1,0 +1,23 @@
+{
+  "version": "3-palette-1.1-setup-virtio-0.1.285",
+  "setup_drivers": {
+    "name": "virtio-win-0.1.285.iso",
+    "url": "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.285-1/virtio-win.iso",
+    "sha256": "e14cf2b94492c3e925f0070ba7fdfedeb2048c91eea9c5a5afb30232a3976331",
+    "size_bytes": 789645312
+  },
+  "payloads": [
+    {
+      "name": "virtio-win-guest-tools-0.1.285.exe",
+      "url": "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.285-1/virtio-win-guest-tools.exe",
+      "sha256": "c8b4a9fe87e1fc5d8e843495e082dea53420587fe04740b1084d85089343f04d",
+      "size_bytes": 30769857
+    },
+    {
+      "name": "spice-webdavd-x64-2.4.msi",
+      "url": "https://www.spice-space.org/download/windows/spice-webdavd/spice-webdavd-x64-2.4.msi",
+      "sha256": "f278c17fca6b129eb5c9a46b8634af2ecfaf3bca8903eb9a5c7874f0e45f82b9",
+      "size_bytes": 12472832
+    }
+  ]
+}

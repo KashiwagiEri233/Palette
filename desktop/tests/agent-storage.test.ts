@@ -15,6 +15,11 @@ it('persists only encrypted credentials and serializes concurrent modifications'
     expect(await store.list()).toHaveLength(2)
     expect(await new AgentCredentials(join(root, 'keys.json'), encryption).read('a')).toEqual({ type: 'api_key', key: 'secret-a' })
     expect(await store.redact('secret-a and secret-b')).toBe('[redacted] and [redacted]')
+    const escapedKey = 'key-with-"quote\\slash'
+    await store.modify('escaped', async () => ({ type: 'api_key', key: escapedKey }))
+    const report = await store.redactJson({ error: escapedKey, nested: [escapedKey], modelId: 'fixture' })
+    expect(report).toEqual({ error: '[redacted]', nested: ['[redacted]'], modelId: 'fixture' })
+    expect(JSON.parse(JSON.stringify(report))).toEqual(report)
     await store.delete('a')
     expect(await store.read('a')).toBeUndefined()
   } finally { await rm(root, { recursive: true, force: true }) }

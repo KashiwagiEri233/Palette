@@ -78,6 +78,18 @@ class AgentService(Protocol):
         options: dict[str, Any],
     ) -> tuple[GuestToolResult, bytes | None]: ...
 
+    async def guest_enhancement(
+        self,
+        vm_id: str,
+        *,
+        instance_id: str,
+        boot_epoch: int,
+        request_id: str,
+        operation: str,
+        parameters: dict[str, Any],
+        frame_id: str | None = None,
+    ) -> tuple[GuestToolResult, bytes | None]: ...
+
     async def start(
         self,
         vm_id: str,

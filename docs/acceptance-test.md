@@ -148,6 +148,9 @@ The script writes `report.json`, `02-before.png`, `03-click.png`, and (after a d
 3. Hold a key, drag, and scroll inside the Console canvas; verify via `vm_status` from another client that held inputs are tracked while pressed.
 4. Click **Return to Agent** or press **`Ctrl+Alt+G`**: confirm that a fresh `vm_observe` + `vm_act` succeeds, while attempting `vm_act` with a pre-takeover `frame_id` fails with `STALE_FRAME`.
 5. Verify that losing window focus, switching tabs, hiding the window, disconnecting RFB, or pausing heartbeats for **3 seconds** automatically expires the lease and releases all held inputs.
+6. Drag beyond each canvas edge and release: the pointer clamps to the edge, and no button remains held. Try tiny touchpad deltas, horizontal/diagonal scrolling, double clicks and modifier chords; small deltas accumulate rather than becoming a full wheel step each.
+7. Resize repeatedly with automatic resolution enabled: synchronization does not overlap, the old drag is cancelled and stale coordinates are never replayed. Confirm that an idle takeover remains usable after more than two seconds, and that an input-channel disconnect releases held input without replaying it.
+8. Run the same interactions while a second client repeatedly observes. Collect the separate input/ACK/visible-response and frame-interval metrics described in [Benchmarks](benchmarks.md), then run the 30-minute endurance check on a real guest. Simulated tests do not establish hardware performance acceptance.
 
 ## 8. Regression & Shutdown Matrix
 
@@ -157,7 +160,10 @@ The script writes `report.json`, `02-before.png`, `03-click.png`, and (after a d
 | **Idempotent retry** | Resend identical `request_id` and parameters | Returns cached receipt (`deduplicated = true`) without clicking twice; altered parameters return `REQUEST_ID_CONFLICT` |
 | **Scale mapping** | Click the same target under fit-to-window, 1:1, and high-DPI scaling | Lands on the exact target in both MCP (image pixels) and GUI (mapped coordinates) |
 | **Fullscreen** | Enter and exit Console fullscreen | Stream remains intact; exiting fullscreen releases human control |
-| **Persistent restart** | Shut down gracefully and start the VM again | New `instance_id`; persistent disk and UEFI vars preserved; prior frames retired |
+| **Hardware restart** | Click Restart in the console, list and menu while the guest ignores ACPI | No confirmation or shutdown wait; only `system_reset`; process and `instance_id` unchanged, `boot_epoch` advances; disks and UEFI vars preserved; old frames and leases retired; view-only mode restored |
+| **View-only pointer** | Hover the display after initial connection, ending control, focus loss and reconnect; cover windowed and fullscreen modes | Host pointer stays visible and no guest input is sent; takeover retains guest cursor behavior |
+| **Persistent stop/start** | Shut down gracefully and start the VM again | New `instance_id`; persistent disk and UEFI vars preserved; prior frames retired |
+| **Power button** | Click Shut Down in the console, VM list, and VM menu; cancel once, then confirm using a disposable guest that ignores ACPI | Confirmation names the VM and warns about unsaved data and filesystem corruption; cancel preserves the running instance; confirm force stops it without an ACPI request and retains persistent disks |
 | **Close Window Only** | Close the GUI window and choose **Close Window Only** | `daemon` and VM stay running; MCP continues observing; reopening GUI reconnects to the same instance |
 | **Quit Completely** | Close the GUI window and choose **Quit Completely** | Gracefully shuts down running VMs, stops `daemon`, verifies process exit, and closes the window while preserving persistent disks |
 | **Shutdown failure** | Trigger **Quit Completely** when ACPI shutdown times out | Window remains open displaying the error with options to retry, cancel, or close window only |
@@ -228,3 +234,36 @@ uv run python scripts/check_docs.py
 npm --prefix desktop test
 npm --prefix desktop run test:e2e
 ```
+
+### 11.1 Windows QMP restart acceptance
+
+Run the native transport regression with `uv run python -m pytest tests/unit/test_windows_unix.py tests/unit/test_guest_pipe_startup.py tests/qmp tests/integration/test_qmp_startup.py`. It includes a deterministic reproduction of the old early-client `ConnectNamedPipe` race without blocking the test process.
+
+For real QEMU, configure the following in PowerShell using a dedicated Alpine test ISO and its extracted kernel/initramfs:
+
+```powershell
+$env:PALETTE_QMP_QEMU = 'C:/Program Files/qemu/qemu-system-x86_64.exe'
+$env:PALETTE_QMP_ACCEL = 'whpx'
+$env:PALETTE_QMP_ALPINE_ISO = 'C:/test-media/alpine-virt-x86_64.iso'
+$env:PALETTE_QMP_KERNEL = 'C:/test-media/boot/vmlinuz-virt'
+$env:PALETTE_QMP_INITRD = 'C:/test-media/boot/initramfs-virt'
+$env:PALETTE_QMP_CYCLES = '20'
+uv run python -m pytest tests/e2e/test_qmp_restart.py -s -o junit_family=xunit1 --junitxml=.runtime/qmp-restart.xml
+```
+
+The firmware checks start QEMU with four enhancement channels, including a run with every host peer deliberately absent. The persistent-guest check uses the desktop backend's normal shutdown path for 20 cycles, then guest-initiated poweroff and explicit force stop. It verifies instance replacement, private endpoint cleanup, reuse of the persistent writable disk, a disk pattern across starts and the unchanged source ISO. A force stop or QMP `quit` does not count as normal shutdown. The ISO is only read; the test creates its own writable VM in pytest's temporary directory. WHPX is the primary Windows gate; repeat with `PALETTE_QMP_ACCEL=tcg` for supplementary coverage. Missing environment variables skip hardware tests and establish no physical acceptance.
+
+### 11.2 2026-10-28 Windows QMP shutdown/restart record
+
+- **Host and guest**: Windows 11 build `26300`, Python `3.12.13`, QEMU `11.1.0` (`v11.1.0-12130-ge470268ff4`); disposable Alpine `3.22.0` guest, `q35`, 1 vCPU, 512 MiB RAM, 1 GiB persistent writable disk, offline network. QGA, tools, shares and session channels were all enabled.
+- **WHPX: PASS**: 20 normal ACPI shutdown/start cycles, followed by guest-initiated poweroff/start and explicit force stop. Every cycle verified process exit, new instance identity, reuse and contents of the writable disk, endpoint removal and an unchanged source ISO. This validates the host QMP/transport lifecycle with a real Linux guest.
+- **TCG: PASS**: one normal ACPI shutdown cycle plus guest-initiated poweroff and force stop; the same disk and endpoint checks passed.
+- **Transport/recovery: PASS**: repeated firmware starts with all four peers attached or deliberately absent, real QEMU Unicode/space endpoints, and injected startup failure followed by a successful fresh start. The native Win32 early-client pipe race was reproduced deterministically; the socket transport avoided it.
+- **Automated backend regression**: 979 passed, 12 platform-dependent skips, no failures. Ruff lint/format, strict mypy and paired documentation checks passed. Local JUnit artifacts are retained under `.runtime/qmp-*.xml`.
+
+### 11.3 2026-10-28 Windows QMP concurrency record
+
+- **Reproduction**: the Windows stdio monitor produced uncorrelated JSON parse errors and 3 command timeouts with only 8 concurrent valid status queries. The Windows QMP transport now uses a separate current-user-only AF_UNIX socket; POSIX keeps child stdio. The command timeout and no-replay policy are unchanged.
+- **WHPX and TCG: PASS**: 500 lease-bound input batches alongside 1600 status queries (32 queries in flight), with no protocol errors or held inputs afterward. Separate WHPX probes at 8, 32 and 128 concurrent status queries also completed without errors.
+- **Lifecycle/display: PASS**: the AF_UNIX QMP transport passed another 20 normal ACPI shutdown/start cycles, guest poweroff, force stop, failure/retry, absent guest peers, Unicode endpoints, and the existing real keyboard/framebuffer/VNC and Chinese media-path tests.
+- **Backend regression**: 984 passed, 12 platform-dependent skips. The old stdout-specific disconnect injection was updated to target the actual QMP reader and its entire lifecycle regression module passed again. The aggregated report records that rerun. Evidence: `.runtime/qmp-socket-backend-regression.xml`, `.runtime/qmp-concurrency-whpx.xml`, `.runtime/qmp-concurrency-tcg.xml`, `.runtime/qmp-socket-restart-whpx.xml` and `.runtime/qmp-socket-display-paths.xml`.

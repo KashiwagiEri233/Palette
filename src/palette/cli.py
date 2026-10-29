@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import ctypes
 import json
 import logging
@@ -464,6 +465,15 @@ def build_doctor_report(
         check("target_compatibility", True, execution_info(profile))
     except PaletteError as exc:
         check("target_compatibility", False, exc.message)
+    if IS_WINDOWS:
+        from .windows_unix import endpoint_directory, require_support
+
+        try:
+            require_support()
+            endpoint_directory()
+            check("qmp_socket_host", True, "private Windows AF_UNIX sockets available")
+        except PaletteError as exc:
+            check("qmp_socket_host", False, exc.message)
     try:
         binary = locate_binary(profile, config.host)
     except PaletteError as exc:
@@ -483,6 +493,31 @@ def build_doctor_report(
     except PaletteError as exc:
         check("firmware", False, exc.message)
     report["qemu"] = probe.as_dict()
+    if (
+        profile.guest_agent.enabled
+        or profile.guest_desktop.clipboard
+        or profile.guest_desktop.shared_folders
+        or profile.guest_desktop.resize
+    ):
+        check(
+            "guest_serial_host",
+            probe.supports_device("virtio-serial-pci") and probe.supports_device("virtserialport"),
+            "optional guest services require virtio serial; guest readiness is detected after boot",
+            blocking=False,
+        )
+    if profile.guest_desktop.clipboard:
+        available = False
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            result = run_sync([binary, *profile.qemu.argv_prefix, "-chardev", "help"], timeout=5)
+            available = result.returncode == 0 and "qemu-vdagent" in result.stdout.split()
+        check(
+            "clipboard_host",
+            available,
+            "qemu-vdagent available"
+            if available
+            else "clipboard unavailable; basic input remains available",
+            blocking=False,
+        )
     check("qemu_version", probe.found, probe.version or probe.error)
     if profile.qemu.version_pin and probe.version:
         check(

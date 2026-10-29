@@ -1,0 +1,4 @@
+[autorun]
+label=Palette Windows Guest Tools
+open=Install.cmd
+action=Install Palette guest tools and drivers

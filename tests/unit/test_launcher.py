@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from palette.config import FirmwareConfig, HostConfig, NetworkConfig, QemuConfig
 from palette.errors import ErrorCode, PaletteError
+from palette.vm import launcher
 from palette.vm.launcher import (
     ENV_WHITELIST,
     ExtraVolume,
@@ -36,6 +37,155 @@ def plan_for(profile, *, overlay: Path, workdir: Path, **kwargs):
 
 
 class TestArgumentVector:
+    def test_windows_enhancements_use_private_nonblocking_sockets(
+        self, profile, tmp_path, monkeypatch
+    ):
+        from palette import windows_unix
+
+        monkeypatch.setattr(launcher, "IS_WINDOWS", True)
+        monkeypatch.setattr(windows_unix, "endpoint_directory", lambda: tmp_path)
+        monkeypatch.setattr(windows_unix, "validate_endpoint", lambda value: value.encode())
+        profile = profile.model_copy(
+            update={
+                "guest_agent": profile.guest_agent.model_copy(update={"enabled": True}),
+                "guest_tools": profile.guest_tools.model_copy(update={"enabled": True}),
+                "guest_desktop": profile.guest_desktop.model_copy(
+                    update={"resize": True, "shared_folders": True}
+                ),
+            }
+        )
+        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
+        endpoints = [
+            plan.guest_agent_endpoint,
+            plan.guest_tools_endpoint,
+            plan.webdav_endpoint,
+            plan.session_endpoint,
+        ]
+        assert all(Path(endpoint).parent == tmp_path for endpoint in endpoints)
+        assert plan.guest_ipc_directory == tmp_path
+        backends = [arg for arg in plan.argv if arg.startswith("socket,id=palette-")]
+        assert len(backends) == 4
+        assert all("server=on,wait=off" in arg for arg in backends)
+        assert not any(arg.startswith("pipe,") for arg in plan.argv)
+        assert plan.qmp_endpoint == str(tmp_path / "qmp.sock")
+        assert any(arg.startswith("socket,id=qmp,") for arg in plan.argv)
+
+    def test_managed_console_uses_an_os_selected_port(self, profile, tmp_path, monkeypatch):
+        monkeypatch.setattr(launcher, "_available_console_port", lambda: 45106)
+        plan = plan_for(
+            profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path, managed_console=True
+        )
+        assert plan.argv[plan.argv.index("-vnc") + 1] == (
+            "127.0.0.1:39206,to=39305,password=on,share=force-shared"
+        )
+
+    def test_console_port_range_cannot_overflow_tcp(self, profile, tmp_path, monkeypatch):
+        monkeypatch.setattr(launcher, "_available_console_port", lambda: 65500)
+        plan = plan_for(
+            profile,
+            overlay=tmp_path / "o.qcow2",
+            workdir=tmp_path,
+            managed_console=True,
+        )
+        assert plan.argv[plan.argv.index("-vnc") + 1] == (
+            "127.0.0.1:59600,to=59635,password=on,share=force-shared"
+        )
+
+    @pytest.mark.parametrize("port", [5899, 65536])
+    def test_invalid_console_port_is_rejected(self, profile, tmp_path, port, monkeypatch):
+        monkeypatch.setattr(launcher, "_available_console_port", lambda: port)
+        with pytest.raises(PaletteError, match="invalid local display port"):
+            plan_for(
+                profile,
+                overlay=tmp_path / "o.qcow2",
+                workdir=tmp_path,
+                managed_console=True,
+            )
+
+    def test_headless_plan_never_allocates_a_console_port(self, profile, tmp_path, monkeypatch):
+        def unexpected():
+            pytest.fail("headless QEMU should not allocate a VNC port")
+
+        monkeypatch.setattr(launcher, "_available_console_port", unexpected)
+        plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
+
+    def test_console_probe_uses_ipv4_loopback_and_releases_socket(self, monkeypatch):
+        class Probe:
+            address = None
+            closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                self.closed = True
+
+            def bind(self, address):
+                self.address = address
+
+            def getsockname(self):
+                return ("127.0.0.1", 45106)
+
+        probe = Probe()
+        monkeypatch.setattr(launcher.socket, "socket", lambda *_args: probe)
+        assert launcher._available_console_port() == 45106
+        assert probe.address == ("127.0.0.1", 0)
+        assert probe.closed
+
+    def test_console_probe_reports_loopback_permission_failure(self, monkeypatch):
+        def unavailable(*_args):
+            raise OSError(10013, "access denied")
+
+        monkeypatch.setattr(launcher.socket, "socket", unavailable)
+        with pytest.raises(PaletteError, match="check loopback socket permissions") as failure:
+            launcher._available_console_port()
+        assert failure.value.code == ErrorCode.STARTUP_FAILED
+
+    def test_console_probe_recovers_from_an_unusually_low_ephemeral_port(self, monkeypatch):
+        bound = []
+
+        class Probe:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return None
+
+            def bind(self, address):
+                bound.append(address)
+
+            def getsockname(self):
+                return ("127.0.0.1", 4200)
+
+        monkeypatch.setattr(launcher.socket, "socket", lambda *_args: Probe())
+        monkeypatch.setattr(launcher.secrets, "randbelow", lambda _max: 123)
+        assert launcher._available_console_port() == 49275
+        assert bound == [("127.0.0.1", 0), ("127.0.0.1", 49275)]
+
+    def test_tools_optical_drive_is_separate_read_only_and_has_no_boot_priority(
+        self, profile, tmp_path
+    ):
+        tools = tmp_path / "tools, media.iso"
+        installer = tmp_path / "windows.iso"
+        plan = plan_for(
+            profile,
+            overlay=tmp_path / "o.qcow2",
+            workdir=tmp_path,
+            tools_iso=tools,
+            extra_volumes=[ExtraVolume(path=str(installer), media="cdrom", boot_index=0)],
+        )
+        drive = plan.argv[plan.argv.index("-drive") + 1]
+        assert "id=palette-tools" in drive and "readonly=on" in drive
+        assert "tools,, media.iso" in drive
+        assert "usb-bot,id=palette-tools-usb,bus=xhci.0" in plan.argv
+        device = next(arg for arg in plan.argv if arg.startswith("scsi-cd,id=palette-tools-cd,"))
+        assert "bus=palette-tools-usb.0" in device and "bootindex" not in device
+        assert any(arg.startswith("scsi-cd,") and "bootindex=0" in arg for arg in plan.argv)
+
+    def test_tools_drive_is_not_added_until_media_is_selected(self, profile, tmp_path):
+        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
+        assert not any("palette-tools" in arg for arg in plan.argv)
+
     def test_no_shell_is_involved(self, profile, tmp_path: Path) -> None:
         plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
         assert isinstance(plan.argv, list)
@@ -85,11 +235,15 @@ class TestArgumentVector:
         assert plan.argv[plan.argv.index("-nic") + 1] == "none"
         assert "-nodefaults" in plan.argv
         # No second, unauthenticated input channel.
-        assert not any("vnc" in argument.lower() for argument in plan.argv)
+        assert "-vnc" not in plan.argv
 
-    def test_qmp_is_on_the_child_own_stdio(self, profile, tmp_path: Path) -> None:
+    def test_qmp_is_on_a_private_instance_transport(self, profile, tmp_path: Path) -> None:
         plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
-        assert "stdio,id=qmp,signal=off" in plan.argv
+        if launcher.IS_WINDOWS:
+            assert plan.qmp_endpoint
+            assert any(arg.startswith("socket,id=qmp,") for arg in plan.argv)
+        else:
+            assert "stdio,id=qmp,signal=off" in plan.argv
         assert plan.argv[plan.argv.index("-mon") + 1] == "chardev=qmp,mode=control"
         assert not any(argument.startswith("tcp:") for argument in plan.argv)
 

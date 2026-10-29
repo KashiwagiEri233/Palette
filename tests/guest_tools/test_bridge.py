@@ -14,7 +14,11 @@ import pytest
 
 from palette.config import GuestToolsConfig
 from palette.errors import ErrorCode, PaletteError
-from palette.guest_tools.base import DisabledGuestToolBackend, MockGuestToolBackend
+from palette.guest_tools.base import (
+    ConnectingGuestToolBackend,
+    DisabledGuestToolBackend,
+    MockGuestToolBackend,
+)
 from palette.guest_tools.bridge import (
     BridgeGuestToolBackend,
     MemoryGuestToolTransport,
@@ -416,6 +420,25 @@ class TestOtherBackends:
         assert info.value.code is ErrorCode.GUEST_TOOL_UNAVAILABLE
         with pytest.raises(PaletteError):
             await backend.launch_app(app_id="text-editor", options={})
+
+    async def test_connecting_backend_reports_connection_not_disabled(self) -> None:
+        backend = ConnectingGuestToolBackend()
+        caps = await backend.capabilities()
+        assert caps.enabled is True
+        assert caps.usable is False
+        sent = []
+        operations = (
+            backend.input_text(text="hi", method="native_text", on_sending=lambda: sent.append(1)),
+            backend.launch_app(app_id="text-editor", options={}, on_sending=lambda: sent.append(1)),
+            backend.execute_operation("snapshot", {}, on_sending=lambda: sent.append(1)),
+        )
+        for operation in operations:
+            with pytest.raises(PaletteError) as info:
+                await operation
+            assert info.value.code is ErrorCode.GUEST_TOOL_UNAVAILABLE
+            assert info.value.message == "guest enhancement tools are connecting"
+            assert info.value.retryable is False
+        assert sent == []
 
     async def test_the_mock_backend_refuses_an_unadvertised_method(self) -> None:
         backend = MockGuestToolBackend(input_methods=("native_text",))

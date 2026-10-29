@@ -140,8 +140,8 @@ operator_only_tools = true
 # and service online as separate facts. A call against a guest with no service fails as
 # unavailable rather than quietly becoming simulated keystrokes.
 enabled = true
-protocol_version = "1.0"
-capabilities = ["guest.input_text", "guest.launch_app"]
+protocol_version = "1.1"
+capabilities = ["guest.input_text", "guest.launch_app", "guest.filesystem", "guest.powershell", "guest.process", "guest.registry", "guest.app", "guest.snapshot", "guest.batch", "guest.clipboard"]
 # native_text writes through the guest platform's own API. clipboard_paste sets the
 # *guest's* clipboard, never the host's. No automatic downgrade between them.
 input_methods = ["native_text"]
@@ -149,8 +149,8 @@ max_text_chars = 4096
 request_timeout_seconds = 20.0
 target_session = "interactive"
 
-# An app_id resolves to a fixed executable with a bounded set of options. Palette never
-# accepts a free-form command line, a path or an argv array, and never uses a shell.
+# Legacy app_id launching remains restricted to this registry. The separate Windows
+# guest.app / guest.powershell capabilities support executable argv and guest commands.
 [guest_tools.allowed_apps.text-editor]
 executable = "/usr/bin/mousepad"
 allowed_options = ["file"]
@@ -167,3 +167,12 @@ max_overlays = 8
 persist_screenshots = false
 audit_max_bytes = 8388608
 audit_max_files = 5
+
+# Optional upstream tools: missing guest services preserve basic VM operation.
+[guest_agent]
+enabled = true
+
+[guest_desktop]
+clipboard = true
+resize = true
+shared_folders = true

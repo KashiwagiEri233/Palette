@@ -67,6 +67,6 @@ uv run palette vm start --vm-id x86-desktop --profile tcg-x86_64     --image /ab
 | **孤儿进程回收** | 将 QEMU 绑定至开启 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Windows **Job Object**；服务进程退出或被强杀时由内核立即终止 QEMU | 启动独立的 **POSIX Supervisor** 守护进程持有 QEMU 进程组，并监听私有 liveness 管道；服务退出或被 `SIGKILL` 时管道关闭，立即清理整个进程组 |
 | **宿主内存上限 (`process_memory_limit_mib`)** | 通过 Windows Job Object 内核硬上限强制执行 | 由 `psutil` 每 **250 ms** 采样 QEMU 及其所有子孙进程的 RSS 总和；一旦超出预算即终止进程组（采样式限制允许极短暂超调） |
 | **最长运行时间 (`process_max_runtime_seconds`)** | 由服务与进程监管器共同强制执行 | 由独立 Supervisor 脱离主事件循环计时并强制终止超时进程组 |
-| **QMP 传输隔离** | 匿名私有管道直连，服务重启后不可重新接管旧进程，需清理并创建新实例 | 匿名私有管道直连（Supervisor 不解析、不代理 QMP 流量），服务重启后创建新实例 |
+| **QMP 传输隔离** | 仅当前用户可访问的 AF_UNIX 套接字，服务重启后不可重新接管旧进程，需清理并创建新实例 | 匿名私有管道直连（Supervisor 不解析、不代理 QMP 流量），服务重启后创建新实例 |
 
 `palette doctor`、`vm_status` 以及每个实例的 `manifest.json` 均会明确记录当前的宿主架构、客户机架构、所选加速器、是否跨架构运行以及内存限制执行方式。

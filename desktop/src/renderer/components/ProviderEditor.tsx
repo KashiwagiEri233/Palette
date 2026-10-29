@@ -9,6 +9,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import type { AgentModelDefinition, AgentProviderView, AgentSettings, CustomAgentApiKind, CustomAgentProvider } from '../../shared/agent'
+import { CopyDebugInfoButton } from './CopyDebugInfoButton'
 
 const newModel = (): AgentModelDefinition => ({ id: '', name: '', contextWindow: 128000, maxTokens: 8192, vision: false, reasoning: false })
 
@@ -99,7 +100,7 @@ export function ProviderEditor({ provider, settings, onCancel, onSaved, onError 
           </div>
         </details>)}
       </section>}
-      {error && <p role="alert" className="agent-provider-error">{error}</p>}
+      {error && <div role="alert" className="agent-provider-error"><span>{error}</span><CopyDebugInfoButton source="provider" error={error} /></div>}
       <div className="agent-settings-actions"><Button variant="outline" onClick={onCancel}>取消</Button><Button disabled={kind === 'custom' ? !form.name.trim() || !form.baseUrl.trim() || !validModels : !key.trim() && !configured} onClick={() => void save()}>保存提供商</Button></div>
     </fieldset>
     <Dialog open={candidates !== null} onOpenChange={open => { if (!open) setCandidates(null) }}><DialogContent className="agent-model-discovery"><DialogTitle>选择要添加的模型</DialogTitle><DialogDescription>仅将勾选的模型加入提供商，已保存的模型和能力参数会保留。</DialogDescription>

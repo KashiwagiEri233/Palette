@@ -76,7 +76,9 @@ async def test_missing_devices_and_audio_are_explained(
         await validate_hardware(probe, profile, enabled, settings)
 
 
-@pytest.mark.parametrize("arch,model", [("x86_64", "VGA"), ("aarch64", "virtio-gpu-pci")])
+@pytest.mark.parametrize(
+    "arch,model", [("x86_64", "VGA"), ("x86_64", "virtio-vga"), ("aarch64", "virtio-gpu-pci")]
+)
 def test_resolution_and_output_only_audio_arguments(
     profile: Profile, tmp_path: Path, arch: str, model: str
 ) -> None:
@@ -127,3 +129,40 @@ def test_linux_audio_environment_does_not_inherit_credentials(
         workdir=tmp_path,
     )
     assert "XDG_RUNTIME_DIR" not in no_audio.env
+
+
+@pytest.mark.parametrize(
+    "arch,advertised,properties,expected",
+    [
+        ("x86_64", True, "xres=<uint32>\nyres=<uint32>", True),
+        ("x86_64", True, "xres=<uint32>", False),
+        ("x86_64", False, "", None),
+        ("aarch64", True, "xres=<uint32>\nyres=<uint32>", None),
+    ],
+)
+async def test_virtio_vga_requires_x86_device_support_and_probes_resolution(
+    profile, monkeypatch, arch, advertised, properties, expected
+):
+    candidate = profile.model_copy(
+        update={
+            "qemu": profile.qemu.model_copy(update={"arch": arch}),
+            "devices": profile.devices.model_copy(update={"display_model": "virtio-vga"}),
+        }
+    )
+
+    async def run(argv, *, timeout):
+        if argv[-2:] == ["-device", "help"]:
+            return (
+                0,
+                'name "VGA"\nname "virtio-gpu-pci"\nname "ramfb"\n'
+                + ('name "virtio-vga"' if advertised else ""),
+                "",
+            )
+        if argv[-1] == "virtio-vga,help":
+            return 0, properties, ""
+        return 0, "", ""
+
+    monkeypatch.setattr("palette.vm_settings.run_tool", run)
+    caps = await CapabilityProbe(HostConfig())._probe(candidate, "qemu")
+    found = next((item for item in caps["displays"] if item["model"] == "virtio-vga"), None)
+    assert (found["resolution"] if found else None) is expected

@@ -175,6 +175,8 @@ body:has(.console-panel:fullscreen) .window-drag-region { display: none; }
 body:has(.console-panel:fullscreen) .workspace-topbar { -webkit-app-region: no-drag; }
 .console-panel:fullscreen { -webkit-app-region: no-drag; }
 .rfb-mount { width: 100%; height: 100%; }
+.console-surface:not(.captured) .rfb-mount,
+.console-surface:not(.captured) .rfb-mount * { cursor: default !important; }
 .console-placeholder { position: absolute; inset: 0; display: grid; place-items: center; padding: 32px; color: #aaa; text-align: center; pointer-events: none; }
 .sidebar-collapsed { --sidebar-width: 0px; }
 .sidebar-collapsed .app-shell .app-sidebar { display: none; }
@@ -216,7 +218,14 @@ body:has(.console-panel:fullscreen) .workspace-topbar { -webkit-app-region: no-d
 .vm-settings-layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); min-height: min(420px, calc(100vh - 260px)); overflow: hidden; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
 .vm-settings-navigation { padding: 20px 16px 20px 0; border-right: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
 .vm-settings-navigation button { justify-content: flex-start; }
-.vm-settings-navigation button[aria-pressed="true"], .hardware-tabs button[aria-pressed="true"] { background: var(--muted); color: var(--foreground); }
+.settings-nav-row { display: flex; align-items: center; gap: 2px; min-width: 0; border-radius: 999px; transition: background-color 150ms ease-out; }
+.settings-nav-row:hover, .settings-nav-row:has(> .settings-nav-actions[aria-expanded="true"]) { background: var(--accent); }
+.settings-nav-row:has(> button[aria-pressed="true"]) { background: var(--muted); }
+.settings-nav-row > .settings-nav-select { flex: 1; min-width: 0; background: transparent; }
+.settings-nav-row > .settings-nav-actions { flex: 0 0 28px; width: 28px; height: 28px; margin-right: 4px; padding: 0; justify-content: center; border-radius: 50%; }
+.settings-nav-actions[aria-expanded="true"] { background: var(--accent); color: var(--foreground); }
+.settings-nav-group > button[aria-pressed="true"], .hardware-tabs button[aria-pressed="true"] { background: var(--muted); color: var(--foreground); }
+.settings-nav-row:has(> button[aria-pressed="true"]) > button { color: var(--foreground); }
 .vm-settings-summary { margin-top: auto; padding: 24px 12px 0; display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted-foreground); overflow-wrap: anywhere; }
 .vm-settings-summary strong { color: var(--foreground); font-weight: 500; }
 .vm-settings-body { padding: 24px; overflow-y: auto; min-height: 0; max-height: calc(100vh - 270px); }
@@ -227,9 +236,20 @@ body:has(.console-panel:fullscreen) .workspace-topbar { -webkit-app-region: no-d
 .forward-row { display: grid; grid-template-columns: 120px minmax(0, 1fr) minmax(0, 1fr) auto; gap: 10px; align-items: end; }
 .settings-disk-section { display: grid; justify-items: start; gap: 16px; margin-bottom: 24px; padding-bottom: 24px; border-bottom: 1px solid var(--border); }
 .settings-disk-section .configuration-grid { width: 100%; }
+.settings-nav-group { display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; }
+.settings-nav-group + .settings-nav-group { margin-top: 12px; }
+.settings-nav-heading, .settings-nav-limit { padding: 4px 12px; font-size: 11px; color: var(--muted-foreground); }
+.settings-nav-heading { font-weight: 600; }
+.settings-nav-group > button, .settings-nav-row > .settings-nav-select { width: 100%; gap: 10px; min-height: 36px; height: auto; padding: 8px 12px; text-align: left; }
+.settings-nav-group > button > svg, .settings-nav-row > button > svg { flex-shrink: 0; }
+.settings-nav-drive { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 2px; }
+.settings-nav-drive > span, .settings-nav-drive > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-nav-drive > small { font-size: 10px; color: var(--muted-foreground); font-weight: 400; }
+.drive-remove { display: grid; justify-items: start; gap: 12px; margin-top: 12px; padding-top: 24px; border-top: 1px solid var(--border); }
 .settings-preserved { padding-top: 20px; margin-top: 20px; border-top: 1px solid var(--border); }
 .settings-error { margin-top: 20px; font-size: 13px; line-height: 1.6; }
 .settings-notice, .settings-upgrade { padding: 12px 16px; background: var(--muted); border-radius: var(--radius-xl); font-size: 13px; line-height: 1.6; margin-bottom: 16px; }
+.desktop-shutdown-status { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 16px; background: var(--muted); border-bottom: 1px solid var(--border); font-size: 13px; }
 .hardware-tabs { display: flex; gap: 4px; margin-bottom: 20px; flex-wrap: wrap; }
 .create-advanced { border-top: 1px solid var(--border); padding-top: 12px; }
 .create-advanced > button { margin-bottom: 12px; }
@@ -296,3 +316,10 @@ body:has(.console-panel:fullscreen) .sidebar-brand { -webkit-app-region: no-drag
   .vm-settings-dialog { padding: 16px; }
   .vm-settings-navigation { flex-shrink: 0; }
 }
+
+.os-preset-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.os-preset-option { height: auto; min-height: 92px; flex-direction: column; align-items: flex-start; gap: 10px; padding: 16px; white-space: normal; text-align: left; }
+.os-preset-option > span { font-size: 11px; font-weight: 400; }
+.create-emulation { display: flex !important; align-items: center; gap: 8px; }
+
+.create-dialog .resource-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }

@@ -27,8 +27,8 @@ def set_retention(service: PaletteService, *, keep: bool, count: int = 1) -> Non
 
 async def test_failed_channel_replacement_reaps_the_old_process(service: PaletteService) -> None:
     old = await service.manager.start("desktop")
-    assert old.process is not None and old.process.stdout is not None
-    old.process.stdout.set_exception(ConnectionResetError("injected disconnect"))
+    assert old.process is not None and old.transport is not None
+    old.transport.reader.set_exception(ConnectionResetError("injected disconnect"))
     for _ in range(100):
         if old.state is VmState.FAILED:
             break

@@ -210,6 +210,25 @@ class AudioConfig(_Strict):
     backend: Literal["coreaudio", "dsound", "pipewire", "pa", "alsa"] | None = None
 
 
+class QemuGuestAgentConfig(_Strict):
+    enabled: bool = False
+    request_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    max_file_bytes: int = Field(default=16 * 1024 * 1024, ge=1, le=64 * 1024 * 1024)
+
+
+class GuestDesktopConfig(_Strict):
+    clipboard: bool = False
+    resize: bool = False
+    shared_folders: bool = False
+    max_clipboard_bytes: int = Field(default=48 * 1024, ge=1, le=48 * 1024)
+
+
+class SharedFolderConfig(_Strict):
+    tag: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_-]{0,30}$")
+    path: str = Field(min_length=1, max_length=4096)
+    read_only: bool = True
+
+
 class TextConfig(_Strict):
     mode: Literal["keyboard"] = "keyboard"
     max_chars: int = Field(default=256, ge=1, le=4096)
@@ -260,16 +279,27 @@ class LifecyclePolicy(_Strict):
 class GuestToolsConfig(_Strict):
     """The in-guest enhancement channel.
 
-    Enabled by default, with both registered capabilities granted, because the point of the
+    Enabled by default, with registered capabilities granted, because the point of the
     channel is to be usable. It still delivers nothing until a guest-side service answers
     the handshake: `vm_status` reports the two online states separately, and a call against
     a guest with no service fails as unavailable rather than falling back to keystrokes.
     """
 
     enabled: bool = True
-    protocol_version: str = "1.0"
+    protocol_version: str = "1.1"
     capabilities: list[str] = Field(
-        default_factory=lambda: ["guest.input_text", "guest.launch_app"],
+        default_factory=lambda: [
+            "guest.input_text",
+            "guest.launch_app",
+            "guest.filesystem",
+            "guest.powershell",
+            "guest.process",
+            "guest.registry",
+            "guest.app",
+            "guest.snapshot",
+            "guest.batch",
+            "guest.clipboard",
+        ],
         description="Registered capabilities to request; the guest must also offer them",
     )
     input_methods: list[str] = Field(
@@ -286,9 +316,13 @@ class GuestToolsConfig(_Strict):
     def _consistency(self) -> GuestToolsConfig:
         if self.enabled and not self.capabilities:
             raise ValueError("seeding guest_tools without a capability list is meaningless")
-        unknown = set(self.capabilities) - {"guest.input_text", "guest.launch_app"}
+        from .guest_tools.protocol import SUPPORTED_VERSIONS, Capability
+
+        unknown = set(self.capabilities) - set(Capability)
         if unknown:
             raise ValueError(f"unregistered guest capability: {sorted(unknown)}")
+        if self.protocol_version not in SUPPORTED_VERSIONS:
+            raise ValueError(f"unsupported guest protocol version: {self.protocol_version}")
         return self
 
 
@@ -320,12 +354,22 @@ class Profile(_Strict):
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
+    guest_agent: QemuGuestAgentConfig = Field(default_factory=QemuGuestAgentConfig)
+    guest_desktop: GuestDesktopConfig = Field(default_factory=GuestDesktopConfig)
+    shared_folders: list[SharedFolderConfig] = Field(default_factory=list, max_length=16)
     text: TextConfig = Field(default_factory=TextConfig)
     timeouts: TimeoutConfig = Field(default_factory=TimeoutConfig)
     lifecycle: LifecyclePolicy = Field(default_factory=LifecyclePolicy)
     guest_tools: GuestToolsConfig = Field(default_factory=GuestToolsConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     frame_ttl_seconds: float = Field(default=30.0, gt=0, le=600)
+
+    @model_validator(mode="after")
+    def _shared_tags(self) -> Profile:
+        tags = [folder.tag for folder in self.shared_folders]
+        if len(tags) != len(set(tags)):
+            raise ValueError("shared folder tags must be unique")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -466,6 +510,10 @@ def load_config(root: Path | None = None, *, profiles_dir: Path | None = None) -
                 update={
                     "images": image,
                     "qemu": profile.qemu.model_copy(update={"firmware": firmware}),
+                    "shared_folders": [
+                        folder.model_copy(update={"path": _trusted_path(folder.path, config_root)})
+                        for folder in profile.shared_folders
+                    ],
                 }
             )
             profiles[profile.profile_id] = profile

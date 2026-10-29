@@ -162,14 +162,28 @@ test('workspace navigation, persisted drafts, responsive panels, settings and co
         const actions = element.querySelector('.vm-group-quick')!
         const row = element.getBoundingClientRect()
         const quick = actions.getBoundingClientRect()
-        return { rowColor: getComputedStyle(element).backgroundColor, triggerColor: getComputedStyle(trigger).backgroundColor, actionsColor: getComputedStyle(actions).backgroundColor, rowRadius: getComputedStyle(element).borderRadius, triggerRadius: getComputedStyle(trigger).borderRadius, contained: quick.left >= row.left && quick.right <= row.right && quick.top >= row.top && quick.bottom <= row.bottom }
+        const buttons = [...actions.querySelectorAll('button')].map(button => button.getBoundingClientRect())
+        return {
+          rowColor: getComputedStyle(element).backgroundColor,
+          triggerColor: getComputedStyle(trigger).backgroundColor,
+          actionsColor: getComputedStyle(actions).backgroundColor,
+          rowRadius: getComputedStyle(element).borderRadius,
+          triggerRadius: getComputedStyle(trigger).borderRadius,
+          contained: quick.left >= row.left && quick.right <= row.right && quick.top >= row.top && quick.bottom <= row.bottom,
+          buttonsContained: buttons.every(button => button.left >= row.left && button.right <= row.right && button.top >= row.top && button.bottom <= row.bottom),
+          buttonsSeparate: buttons.every((button, index) => index === 0 || button.left >= buttons[index - 1].right),
+        }
       })
       expect(geometry.rowColor).not.toBe('rgba(0, 0, 0, 0)')
       expect(geometry.triggerColor).toBe('rgba(0, 0, 0, 0)')
       expect(geometry.actionsColor).toBe('rgba(0, 0, 0, 0)')
       expect(geometry.triggerRadius).toBe(geometry.rowRadius)
       expect(geometry.contained).toBe(true)
+      expect(geometry.buttonsContained).toBe(true)
+      expect(geometry.buttonsSeparate).toBe(true)
     }
+    await verifyVmHeading()
+    await vmHeading.getByRole('button', { name: '工作区测试 的操作' }).hover()
     await verifyVmHeading()
     await page.screenshot({ path: 'test-results/navigation-row-hover.png' })
     await vmHeading.getByRole('button', { name: '工作区测试 的操作' }).click()
@@ -332,6 +346,7 @@ test('workspace navigation, persisted drafts, responsive panels, settings and co
       return status?.state === 'RUNNING' && status.instance_id !== startedInstance
     }, { timeout: 20_000 }).toBe(true)
     await managementRow.getByRole('button', { name: '关机', exact: true }).click()
+    await page.getByRole('dialog', { name: '强制停止虚拟机', exact: true }).getByRole('button', { name: '确认', exact: true }).click()
     await expect.poll(async () => (await readVmStatus())?.state, { timeout: 10_000 }).toBe('STOPPED')
     await verifyManagementActions(false)
     await page.locator('tbody').getByRole('button', { name: '工作区测试', exact: true }).click()
@@ -416,6 +431,7 @@ test('workspace navigation, persisted drafts, responsive panels, settings and co
     await captureAppearance('light')
     await page.getByRole('button', { name: '虚拟机管理', exact: true }).click()
     await managementRow.getByRole('button', { name: '关机', exact: true }).click()
+    await page.getByRole('dialog', { name: '强制停止虚拟机', exact: true }).getByRole('button', { name: '确认', exact: true }).click()
     await expect.poll(async () => (await readVmStatus())?.state, { timeout: 10_000 }).toBe('STOPPED')
     await managementRow.getByRole('button', { name: '删除虚拟机', exact: true }).click()
     await expect(deleteConfirmation).toBeVisible()

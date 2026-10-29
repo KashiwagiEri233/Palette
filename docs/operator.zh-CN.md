@@ -127,6 +127,8 @@ uv run palette vm start --vm-id scratch     --image D:/images/debian-testing.qco
 * **`reset`**：撤销控制权、取消排队动作、释放按住的输入、停止进程，按保留策略处理旧可写层，然后从只读基础镜像重建全新 `overlay.qcow2` 并以新的 `instance_id` 和递增的 `boot_epoch` 启动。基础镜像永不被修改，也绝不执行 `qemu-img commit`。
 * **`list`**：离线读取磁盘上的实例目录、manifest 与占用字节数（无需后台在线）。
 
+桌面端的**重启**按钮直接执行 QEMU 硬件复位，不弹确认或等待正常关机；进程与持久磁盘保留，未保存的内存内容会丢失。复位会结束人工控制，使旧画面和输入凭证失效；仅查看时鼠标始终可见。
+
 ### 紧急停止（Emergency Stop）
 
 ```bash
@@ -176,13 +178,23 @@ uv run palette vm take-control --vm-id desktop --reason "human debugging"
 
 ## 7. 常见故障排查与恢复
 
+桌面端的任务失败、全局错误和提供商配置错误旁提供“复制调试信息”按钮。点击后会复制 JSON 报告，包含版本、平台、错误原因、可用的堆栈及后台错误详情（如 QEMU stderr）；任务错误还包含模型协议、端点、运行状态及虚拟机/对话标识。报告不收集聊天正文、截图或工具请求正文，并会隐藏已保存的 API Key、认证信息和 URL 查询参数。复制成功显示“已复制”；剪贴板写入失败时可重试。
+
 | 症状或错误码 | 原因说明 | 恢复操作 |
 | --- | --- | --- |
-| `state: FAILED` | QEMU 意外退出或私有 QMP 管理管道断开 | 运行 `palette vm status` 查看具体错误，随后执行 `palette vm reset` |
-| `QMP_UNAVAILABLE` | 私有 QMP 管道已断开 | 当前实例已不可恢复；执行 `palette vm stop --force` 后重新 `start` |
+| `state: FAILED` | QEMU 意外退出或私有 QMP 管理通道断开 | 运行 `palette vm status` 查看具体错误，随后执行 `palette vm reset` |
+| `QMP_UNAVAILABLE` | 私有 QMP 通道已断开 | 当前实例已不可恢复；执行 `palette vm stop --force` 后重新 `start` |
+| `input-send-event` 出现 `TIMEOUT`，同时有不带 ID 的 JSON 解析错误 | Windows QEMU 标准输入输出在监视器暂时无法接收数据时可能丢失输入字节，无 ID 的错误无法匹配待处理命令 | 更新并重启后台和虚拟机。Windows QMP 现使用具备反压的私有 AF_UNIX 套接字，超时详情包含传输类型、请求 ID 和有界协议错误记录。不重放结果未知的输入，应检查客户机状态后重新接管。 |
+| `STARTUP_FAILED`，详情为 `QEMU did not send a QMP greeting in time` | 旧版 Windows 增强管道可能在创建后、`ConnectNamedPipe` 前被客户端抢先连接，导致客户端已显示连接而 QEMU 始终未进入监视器 | 更新后关闭虚拟机并重启后台。增强通道现使用 `wait=off` 的私有 AF_UNIX 套接字，在 QMP 协商与恢复运行后连接。错误详情包含 `phase`、`qmp`、`guest_channels`、`qemu_pid`、`returncode` 和 stderr；`guest_pipes` 保留为兼容别名。仅出现 `-mon` 弃用警告不能说明退出，也不能解释超时。 |
+| 增强端点设置期间出现 `UNSUPPORTED_CAPABILITY` / `PRECONDITION_FAILED` | Windows 不支持 AF_UNIX，或端点路径过长 | 运行 `palette doctor`，使用支持 AF_UNIX 的 Windows/QEMU，并缩短当前用户的 `TEMP` 路径。私有端点目录位于 `%TEMP%\Palette\ipc`，编码后的路径必须少于 108 字节，不回退到 TCP 或旧 QEMU 管道。 |
+| `QMP_UNAVAILABLE`，且 stderr 包含 `-vnc ... Failed to bind socket` | QEMU 无法绑定本地显示端口，在 QMP 握手前退出 | 更新 Palette 后重启后台再试；若仍失败，检查回环网络权限和端口占用。Windows 可运行 `netsh interface ipv4 show excludedportrange protocol=tcp` 查看保留端口。停止 daemon 也会停止其管理的虚拟机。 |
+| 模型请求报错 `Invalid schema for function` | 工具定义与端点要求的 Schema 格式不兼容 | 更新或重新构建并打开 Palette 桌面端。发送前会转换工具 Schema，本地仍严格校验元组参数；错误提示会保留脱敏后的具体原因，不再将所有失败归因于端点或密钥配置。 |
 | `screen_ready: false` | 尚未采集到有效显示缓冲区 | 客户机可能仍在早期引导阶段；若长时间不就绪，检查固件/显卡配置并重启实例 |
 | `desktop_ready: null` | 未经客户机内服务握手确认桌面就绪 | 属于正常预期：服务不猜测桌面登录状态，请通过 `vm_observe` 或桌面端控制台查看画面 |
+| 输入返回 `VM_NOT_RUNNING` | 客户机已暂停、正在关机或已停止，QEMU 在这些状态下不接受输入 | 本批输入未发送。等客户机恢复运行后重新接管即可；桌面端会结束该租约并给出提示，而不是报错。 |
 | 按键或鼠标卡住 | 动作取消或异常后按键未释放 | 调用 `vm_release_inputs`；若管理通道已失联则执行 `palette vm emergency-stop` |
+| 人工输入连接中断（`EPIPE` / `ACTION_OUTCOME_UNKNOWN`） | 输入管道关闭，本批输入可能已生效 | 桌面端立即结束该租约的人工控制并尝试释放按住状态；先检查画面，再重新接管。失败输入不会自动重发；“复制调试信息”保留底层管道错误和失败阶段。 |
+| 重连显示后人工控制意外结束 | 旧显示连接的延迟清理可能误撤销新的控制租约 | 更新桌面端与后台。关闭虚拟机后重启后台，再重新打开桌面端；新版本会将显示清理绑定到原控制租约。 |
 | CLI 报错 `PRECONDITION_FAILED` | 当前 `runtime_root` 没有在线的后台 owner | 先运行 `uv run palette daemon start`（确保 `--root` 一致）；离线查看实例可用 `palette vm list` |
 | 启动 `serve` 报错 `STATE_CONFLICT` | 另一个独立服务已持有当前 `runtime_root` 锁 | 连接到已有服务（去掉 `--standalone`），或指定独立的 `runtime_root` |
 | CLI 报错 `ACTION_OUTCOME_UNKNOWN` | 命令发出后本地 IPC 连接中断 | 先运行 `palette vm status` 检查状态，切勿盲目重复执行破坏性命令 |

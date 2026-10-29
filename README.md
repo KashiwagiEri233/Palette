@@ -14,9 +14,11 @@ Instead of operating the host desktop, agents connect over the Model Context Pro
 * **Palette Desktop Workbench**: Built with Electron, React 19, TypeScript, Tailwind CSS v4, and noVNC. Create persistent VMs from read-only `qcow2`/`raw` base images or installer ISOs, configure hardware offline (1–64 vCPUs, 256–1,048,576 MiB RAM, safe offline disk expansion up to 4096 GiB, boot order, GPU & default resolution, network modes & localhost port forwarding, Intel HDA audio), or restore any VM to its initial state in one click.
 * **Shared Runtime & Multi-Client Coexistence**: A single `RuntimeOwner` (`palette daemon` or managed `palette serve`) owns the VMs and serves Palette Desktop, the Operator CLI, and multiple MCP sessions (`palette serve --connect-only`) concurrently.
 * **Exclusive Human-Agent Control Lease**: A single-writer input controller arbitrates desktop input. Operators can take over control from the Desktop console (backed by a 3-second heartbeat lease and automatic release on `Ctrl+Alt+G`, blur, or disconnect) or via `palette vm take-control`, immediately incrementing `controller_epoch` and retiring stale agent frames while still allowing agents to observe.
-* **Read-Only Display Gateway & Strict Host Boundaries**: Palette never exposes raw QMP, HMP, or a general guest shell to the agent. QMP runs strictly over private child-process pipes (never TCP). Live desktop viewing uses a localhost WebSocket RFB gateway gated by one-time tickets and protocol-level write filtering. All managed overlays, scratch frames, and logs are confined to `.runtime/` via `PathGuard`.
-* **Optional In-Guest Enhancement Channel**: Alongside the visual baseline, `Guest Tool Bridge` exposes `vm_guest_input_text` (native Unicode/CJK text injection) and `vm_guest_launch_app` (launching allowlisted `app_id` entries) under the exact same policy, scheduling, and audit boundary — failing cleanly as `GUEST_TOOL_UNAVAILABLE` rather than silently downgrading to simulated keystrokes when no guest service is present.
+* **Read-Only Display Gateway & Strict Host Boundaries**: Palette never exposes raw QMP, HMP or a host shell to the agent. Optional Windows PowerShell runs inside the guest under its logged-in user's rights. QMP uses private child-process pipes on POSIX and current-user-only AF_UNIX sockets on Windows (never TCP). Live desktop viewing uses a localhost WebSocket RFB gateway gated by one-time tickets and protocol-level write filtering. All managed overlays, scratch frames, and logs are confined to `.runtime/` via `PathGuard`.
+* **Optional Agent Guest Enhancements**: Agents directly input Unicode/CJK text, read/write the guest clipboard, and transfer binary files through standard QEMU/SPICE and QGA services without operator clicks. See the [guest enhancement guide](docs/guest-enhancements.md). The separate custom service supports native text/app APIs: Alongside the visual baseline, `Guest Tool Bridge` exposes `vm_guest_input_text` (native Unicode/CJK text injection) and `vm_guest_launch_app` (launching allowlisted `app_id` entries) under the exact same policy, scheduling, and audit boundary — failing cleanly as `GUEST_TOOL_UNAVAILABLE` rather than silently downgrading to simulated keystrokes when no guest service is present.
 * **Cross-Platform Hardware Acceleration & Explicit TCG**: Native profiles support Windows (`WHPX`), macOS Apple Silicon / Intel (`HVF`), and Linux x86_64 / aarch64 (`KVM`), plus explicit software emulation profiles (`tcg-x86_64`, `tcg-aarch64` — e.g., running an x86_64 guest on Apple Silicon without Rosetta). Missing hardware acceleration fails loudly and never falls back to TCG silently.
+
+The Windows enhancement layer additionally provides file management, guest PowerShell, process/registry tools, App/window control, UIA snapshots and coordinate/label batches to both external MCP clients and the built-in Agent. The [enhancement guide](docs/guest-enhancements.md) describes installation and live capability checks.
 
 ## Architecture
 
@@ -162,7 +164,10 @@ Example MCP client configuration:
 | **Lifecycle** | `vm_start` | Boot a VM instance from an allowed profile; optional `image`, `iso`, `extra_disks`, and `qemu_args` require individual profile switches |
 | **Lifecycle** | `vm_stop` | Request guest shutdown and stop QEMU within the timeout budget (`allow_agent_stop`; `force=true` requires `allow_agent_force_stop`) |
 | **Lifecycle** | `vm_reset` | Discard the writable overlay and rebuild a fresh instance from the read-only base image (`allow_agent_reset`) |
-| **Guest Enhancement** | `vm_guest_input_text` | Send Unicode/multi-language text to the in-guest service (`native_text` / `clipboard_paste`); registered only when enabled |
+| **Guest Enhancement** | `vm_guest_input_text` | Direct Unicode/CJK input through standard clipboard_paste; native_text needs the custom service |
+| **Guest Clipboard** | `vm_guest_clipboard_get` / `vm_guest_clipboard_set` | Direct guest text clipboard access, with no host clipboard or human lease |
+| **Guest File Transfer** | `vm_guest_file_open` / `vm_guest_file_read` / `vm_guest_file_write` / `vm_guest_file_close` | QGA binary upload/download in bounded base64 chunks, no host file picker |
+| **Guest Management** | `vm_guest_resize` / `vm_guest_sync_time` | Request guest resolution or synchronize time when supported |
 | **Guest Enhancement** | `vm_guest_launch_app` | Launch an application by its registered `app_id` from the profile's allowlist; never accepts free-form commands or shells |
 
 ### Operator CLI Commands
@@ -187,7 +192,7 @@ Example MCP client configuration:
 | **Host material: image** | `allow_agent_images = true` | Allows a caller to specify the base image path, bypassing the profile's pinned path and SHA-256 digest |
 | **Host material: ISO / extra disk** | `allow_agent_iso = true` | Allows a caller to attach read-only CD-ROMs or extra disks from any host path |
 | **Host material: QEMU arguments** | `allow_agent_qemu_args = true` | Allows a caller to append raw QEMU arguments, which **removes the host boundary entirely**: `-chardev`, `-device`, and `-blockdev` can read/write host files, and `-mon`/`-vnc` add a second control channel. Set to `false` in strict deployments |
-| **QMP transport** | Private child-process pipes, never TCP | Unchanged by the switches above; QMP/HMP are never exposed over network sockets |
+| **QMP transport** | Private child stdio on POSIX; private AF_UNIX on Windows; never TCP | Unchanged by the switches above; QMP/HMP are never exposed over network ports |
 | **Palette's own paths** | Generated under `.runtime/`, never caller-supplied | Unchanged: cleanup only touches paths recorded in the instance `manifest.json` inside `runtime_root` and never deletes external base images |
 | **Guest enhancement tools** | `enabled = true` | No-op until a guest-side service completes the handshake; calls against a guest without the service fail as `GUEST_TOOL_UNAVAILABLE` rather than becoming simulated keystrokes |
 | **Agent lifecycle** | `start` only | `allow_agent_start = true`; `stop`, `force_stop`, and `reset` remain operator-only by default |
@@ -274,3 +279,7 @@ uv run python scripts/p0_probe.py          # measure cold boot, capture latency,
 ## License
 
 Licensed under the [Apache-2.0 License](LICENSE).
+
+## Optional Guest Enhancements
+
+See the [guest enhancement guide](docs/guest-enhancements.md) for guest installation, automatic capability detection and degradation, Unicode clipboard, automatic resolution, QGA management, file transfer, and private WebDAV shared directories. Missing tools preserve the basic VM console.

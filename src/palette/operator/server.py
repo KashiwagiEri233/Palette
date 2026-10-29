@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import secrets
@@ -80,6 +81,8 @@ class OperatorServer:
         self.listener = LocalListener(self.paths, self.endpoint, self._handle)
         self.requests = RequestRegistry[Response](pending_limit=MAX_CLIENTS, retained_limit=128)
         self.desktop_route: Callable[[DesktopCommand], Awaitable[dict[str, Any]]] | None = None
+        # Leave six of the listener's eight slots available to short control requests.
+        self._input_streams: set[tuple[str, str]] = set()
 
     def acquire(self) -> None:
         """Acquire before service startup; retain until service shutdown has completed."""
@@ -94,12 +97,61 @@ class OperatorServer:
             raise
 
     async def _handle(self, channel: Channel) -> None:
+        binding: tuple[str, str] | None = None
+        lease = None
         try:
             request = Request.model_validate(decode_json(await receive_frame(channel, timeout=2.0)))
             if not secrets.compare_digest(request.token, self.endpoint.token):
                 return
             if request.generation != self.endpoint.generation:
                 return
+            command = request.command
+            if isinstance(command, DesktopCommand) and command.method == "control.stream.open":
+                token = command.payload.get("lease_id")
+                if not command.vm_id or not isinstance(token, str):
+                    raise PaletteError(ErrorCode.INVALID_ARGUMENT, "invalid input stream lease")
+                lease = self.service.control.validate(command.vm_id, token)
+                candidate = (command.vm_id, token)
+                if len(self._input_streams) >= 2 or candidate in self._input_streams:
+                    await send_frame(
+                        channel,
+                        self._failure(
+                            request.request_id,
+                            PaletteError(ErrorCode.BUSY, "input stream capacity reached"),
+                        ),
+                    )
+                    lease = None
+                    return
+                binding = candidate
+                self._input_streams.add(binding)
+                await send_frame(
+                    channel,
+                    Response(
+                        generation=self.endpoint.generation,
+                        request_id=request.request_id,
+                        ok=True,
+                        result={"stream": "operator-input-stream-v1"},
+                    ),
+                )
+                while True:
+                    request = Request.model_validate(
+                        decode_json(await self._receive_input_frame(channel, *binding))
+                    )
+                    command = request.command
+                    if (
+                        not secrets.compare_digest(request.token, self.endpoint.token)
+                        or request.generation != self.endpoint.generation
+                        or not isinstance(command, DesktopCommand)
+                        or command.method != "control.input"
+                        or command.vm_id != binding[0]
+                        or command.payload.get("lease_id") != binding[1]
+                    ):
+                        return
+                    self.service.control.validate(*binding)
+                    response = await self._execute_once(request)
+                    await send_frame(channel, response)
+                    if not response.ok:
+                        return
             response = await self._execute_once(request)
             await send_frame(channel, response)
         except (
@@ -113,7 +165,31 @@ class OperatorServer:
             # In particular, never log a failed authentication frame or validation payload.
             pass
         finally:
-            await channel.close()
+            try:
+                await channel.close()
+            finally:
+                if binding is not None:
+                    self._input_streams.discard(binding)
+                    if lease is not None:
+                        with contextlib.suppress(PaletteError):
+                            await self.service.control.revoke(binding[0], expected_lease=lease)
+
+    async def _receive_input_frame(self, channel: Channel, vm_id: str, token: str) -> bytes:
+        # An idle authenticated stream may live for the lease's lifetime. Once a peer
+        # starts a frame, the existing header+body deadline still protects against trickling.
+        first = asyncio.create_task(channel.readexactly(1))
+        try:
+            while not first.done():
+                self.service.control.validate(vm_id, token)
+                await asyncio.wait({first}, timeout=0.25)
+            prefix = first.result()
+            self.service.control.validate(vm_id, token)
+            return await receive_frame(channel, timeout=2.0, first_byte=prefix)
+        finally:
+            if not first.done():
+                first.cancel()
+            with contextlib.suppress(asyncio.CancelledError, OSError, EOFError):
+                await first
 
     async def _execute_once(self, request: Request) -> Response:
         try:

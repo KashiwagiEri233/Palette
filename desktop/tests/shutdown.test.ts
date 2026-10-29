@@ -5,7 +5,7 @@ import { BackendError } from '../src/main/ipc'
 const owner = { pid: 12345, generation: 'a'.repeat(32), owner_kind: 'daemon', features: ['runtime-stop', 'vm-stop-identity'] }
 
 function fixture(options: { owner?: Record<string, unknown>; vms?: { vm_id: string; status: { state: string } }[]; alive?: () => boolean } = {}) {
-  const backend = vi.fn(async (_root: string, method: string): Promise<Record<string, unknown>> => {
+  const backend = vi.fn(async (_root: string, method: string, _vmId?: string, _payload?: Record<string, unknown>, _generation?: string): Promise<Record<string, unknown>> => {
     if (method === 'hello') return options.owner ?? owner
     if (method === 'vms.list') return { vms: options.vms ?? [] }
     return { stopping: true }
@@ -45,6 +45,43 @@ describe('complete runtime exit', () => {
     const { shutdown, backend } = fixture({ vms: [{ vm_id: 'running', status: { state: 'RUNNING' } }, { vm_id: 'stopped', status: { state: 'STOPPED' } }, { vm_id: 'paused', status: { state: 'PAUSED' } }] })
     await shutdown.stop('root')
     expect(backend.mock.calls.map(call => call[1])).toEqual(['hello', 'vms.list', 'vms.stop', 'vms.stop', 'hello', 'runtime.stop'])
+  })
+
+  it('does not skip a failed VM whose QEMU process is still alive', async () => {
+    const { shutdown, backend } = fixture()
+    backend.mockResolvedValueOnce(owner).mockResolvedValueOnce({ vms: [
+      { vm_id: 'failed-live', status: { state: 'FAILED', process_running: true, instance_id: 'inst_alive' } },
+      { vm_id: 'failed-exited', status: { state: 'FAILED', process_running: false } }
+    ] }).mockResolvedValueOnce({ state: 'STOPPED' }).mockResolvedValueOnce(owner).mockResolvedValueOnce({ stopping: true })
+    await shutdown.stop('root')
+    expect(backend).toHaveBeenCalledWith('root', 'vms.stop', 'failed-live', { expected_instance_id: 'inst_alive' }, owner.generation)
+    expect(backend.mock.calls.filter(call => call[1] === 'vms.stop')).toHaveLength(1)
+  })
+
+  it('still requests shutdown for other VMs when one guest refuses to stop', async () => {
+    const { shutdown, backend } = fixture()
+    backend.mockImplementation(async (_root, method, vmId) => {
+      if (method === 'hello') return owner
+      if (method === 'vms.list') return { vms: [
+        { vm_id: 'blocked', status: { state: 'RUNNING', instance_id: 'old' } },
+        { vm_id: 'healthy', status: { state: 'RUNNING', instance_id: 'other' } }
+      ] }
+      if (method === 'vms.stop' && vmId === 'blocked') throw new BackendError('TIMEOUT', 'timeout', { operation: 'guest-shutdown', vm_id: 'blocked', instance_id: 'old' })
+      return { stopping: true }
+    })
+    await expect(shutdown.stop('root')).rejects.toBeInstanceOf(VmShutdownTimeout)
+    expect(backend).toHaveBeenCalledWith('root', 'vms.stop', 'healthy', { expected_instance_id: 'other' }, owner.generation)
+    expect(backend.mock.calls.some(call => call[1] === 'runtime.stop')).toBe(false)
+  })
+
+  it.each(['QMP_UNAVAILABLE', 'QMP_COMMAND_FAILED', 'ACTION_OUTCOME_UNKNOWN'])('offers explicit force recovery for a fenced shutdown failure (%s)', async code => {
+    const { shutdown, backend } = fixture()
+    const vm = { vm_id: 'broken', name: 'Guest', status: { state: 'FAILED', process_running: true, instance_id: 'inst_alive' } }
+    backend.mockResolvedValueOnce(owner).mockResolvedValueOnce({ vms: [vm] }).mockRejectedValueOnce(new BackendError(code, 'channel unavailable', { operation: 'guest-shutdown', vm_id: vm.vm_id, instance_id: vm.status.instance_id }))
+    const failure = await shutdown.stop('root').catch(error => error)
+    expect(failure).toBeInstanceOf(VmShutdownTimeout)
+    expect(failure.target.instance_id).toBe('inst_alive')
+    expect(backend.mock.calls.some(call => call[1] === 'runtime.stop')).toBe(false)
   })
 
   it('returns the exact timed-out instance for an explicit force confirmation', async () => {

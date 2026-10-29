@@ -127,6 +127,8 @@ uv run palette vm start --vm-id scratch     --image D:/images/debian-testing.qco
 * **`reset`**: Revokes control leases, cancels in-flight actions, releases held inputs, stops QEMU, applies overlay retention, and boots a brand-new `overlay.qcow2` with a new `instance_id` and incremented `boot_epoch`. The base image is never modified and `qemu-img commit` is never used.
 * **`list`**: Reads instance manifests and disk usage directly from `.runtime/` offline (no running owner required).
 
+The desktop **Restart** button immediately resets QEMU hardware without confirmation or waiting for graceful shutdown. The process and persistent disks remain, but unsaved memory contents are lost. Reset ends human control and invalidates old frames and input credentials. The host pointer stays visible in view-only mode.
+
 ### Emergency Stop
 
 ```bash
@@ -176,13 +178,23 @@ Releases held inputs, increments `controller_epoch`, and retires every active `f
 
 ## 7. Fault Recovery Playbook
 
+Desktop task failures, application errors, and provider configuration errors offer a **Copy debug information** button (Chinese UI: “复制调试信息”). It copies a JSON report with version, platform, cause, available stack traces, and backend details such as QEMU stderr. Task reports also include the model protocol, endpoint, run state, and VM/conversation identifiers. Reports do not collect chat content, screenshots, or tool request bodies; saved API keys, authentication information, and URL query parameters are redacted. The button confirms success and offers a retry if writing to the clipboard fails.
+
 | Symptom / Error Code | Meaning | Recovery Action |
 | --- | --- | --- |
-| `state: FAILED` | QEMU exited unexpectedly or the QMP pipe broke | Inspect with `palette vm status`, then run `palette vm reset` |
-| `QMP_UNAVAILABLE` | Private QMP pipe is closed | Run `palette vm stop --force` followed by `palette vm start` |
+| `state: FAILED` | QEMU exited unexpectedly or the private QMP channel broke | Inspect with `palette vm status`, then run `palette vm reset` |
+| `QMP_UNAVAILABLE` | Private QMP channel is closed | Run `palette vm stop --force` followed by `palette vm start` |
+| `TIMEOUT` for `input-send-event`, with uncorrelated JSON parse errors | Windows QEMU stdio can drop input bytes when its monitor cannot accept more data; responses without IDs cannot be matched to pending commands | Update and restart the backend and VM. Windows QMP now uses a private AF_UNIX socket with backpressure. Timeouts include transport, request ID and bounded protocol-error details. An uncertain input is never replayed; inspect guest state and reacquire control. |
+| `STARTUP_FAILED` with `QEMU did not send a QMP greeting in time` | Older Windows enhancement pipe chardevs could deadlock when a client connected between pipe creation and `ConnectNamedPipe`; the client could already report connected while QEMU never reached its monitor | Update, shut down VMs and restart the backend. Enhancement channels now use private AF_UNIX sockets with `wait=off` and connect after QMP negotiation and resume. Failure details include `phase`, `qmp`, `guest_channels`, `qemu_pid`, `returncode` and stderr; `guest_pipes` remains a compatibility alias. A `-mon` deprecation warning alone does not establish an exit or explain a timeout. |
+| `UNSUPPORTED_CAPABILITY` / `PRECONDITION_FAILED` during guest endpoint setup | Windows lacks AF_UNIX support, or the endpoint path is too long | Run `palette doctor`; use a Windows/QEMU build with AF_UNIX support and a shorter per-user `TEMP` path. Private endpoint directories are under `%TEMP%\Palette\ipc`; encoded paths must be shorter than 108 bytes. No TCP or legacy QEMU pipe fallback is used. |
+| `QMP_UNAVAILABLE` with `-vnc ... Failed to bind socket` | QEMU could not bind its local display port and exited before QMP negotiation | Restart the backend after updating Palette, then retry. If it persists, check loopback permissions and port availability; on Windows inspect `netsh interface ipv4 show excludedportrange protocol=tcp`. Stopping the daemon also stops its managed VMs. |
+| Model request rejected with `Invalid schema for function` | A tool declaration is incompatible with the endpoint's schema format | Update/rebuild and reopen Palette Desktop. Tool schemas are normalized before sending, while local tuple validation stays strict; the request error preserves the credential-redacted cause instead of attributing all failures to endpoint or key configuration. |
 | `screen_ready: false` | No valid framebuffer captured yet | Guest may still be booting; if persistent, check firmware/display config and restart |
 | `desktop_ready: null` | In-guest service has not verified desktop login | Expected for visual baseline: inspect a screenshot via `vm_observe` or Palette Desktop |
+| Input refused with `VM_NOT_RUNNING` | The guest was paused, shutting down or already stopped, and QEMU accepts no input in that state | Nothing was sent. Wait until the guest runs again and take control once more; Desktop ends that lease with an informational notice instead of an error. |
 | Stuck key or button | Input chord interrupted before release | Call `vm_release_inputs`, or `palette vm emergency-stop` if QMP is unhealthy |
+| Manual input connection interrupted (`EPIPE` / `ACTION_OUTCOME_UNKNOWN`) | The input pipe closed; the batch may have taken effect | Desktop ends control for that lease and attempts to release held inputs. Inspect the screen before taking control again. Failed input is never replayed automatically; Copy debug information retains the underlying pipe error and failure phase. |
+| Manual control ends unexpectedly after reconnecting the display | Delayed cleanup of an old display connection could revoke a newer control lease | Update desktop and backend. Shut down VMs before restarting the backend, then reopen desktop. The updated display cleanup is bound to the original control lease. |
 | CLI returns `PRECONDITION_FAILED` | No running owner for this `runtime_root` | Start `uv run palette daemon start` with the same `--root` (`vm list` works offline) |
 | `serve` returns `STATE_CONFLICT` | Another standalone owner holds `runtime_root` | Connect to the existing owner (omit `--standalone`) or use a separate `runtime_root` |
 | CLI returns `ACTION_OUTCOME_UNKNOWN` | Local IPC disconnected after sending command | Check `palette vm status` before deciding whether to retry |

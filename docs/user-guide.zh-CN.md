@@ -2,7 +2,7 @@
 
 [English](user-guide.md) | **简体中文**
 
-**Palette** 为视觉 Agent 提供一台可观察、可操作、可重置的 QEMU 虚拟桌面。你通过 MCP 调用工具，Palette 驱动独立的客户机并向你返回 PNG 截图与结构化回执——它从不触碰宿主机桌面，也不向 Agent 暴露任何底层管理接口或客户机 Shell。
+**Palette** 为视觉 Agent 提供一台可观察、可操作、可重置的 QEMU 虚拟桌面。你通过 MCP 调用工具，Palette 驱动客户机并返回 PNG 截图与结构化回执，不触碰宿主机桌面，也不暴露原始 QMP/HMP。可选 Windows 增强工具包含仅以客户机登录用户权限执行的 PowerShell，见[增强工具指南](guest-enhancements.zh-CN.md)。
 
 ## 1. 标准视觉工作循环
 

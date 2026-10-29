@@ -11,6 +11,7 @@ from . import __version__
 from .cleanup import close_all, join_cleanup
 from .desktop import DesktopManager
 from .display import DisplayGateway
+from .enhancements import EnhancementRoutes
 from .errors import ErrorCode, PaletteError
 from .operator.protocol import DesktopCommand
 from .operator.server import OperatorServer
@@ -27,6 +28,7 @@ class RuntimeOwner:
         self.operator = OperatorServer(service)
         self.desktop = DesktopManager(service)
         self.display = DisplayGateway(service)
+        self.enhancements = EnhancementRoutes(service)
         self.stopping = asyncio.Event()
         self.operator.desktop_route = self.route
         self.agent: AgentServer | None = None
@@ -79,10 +81,16 @@ class RuntimeOwner:
                 "desktop_protocol": 1,
                 "features": [
                     "vm-settings-v2",
+                    "vm-drives-v1",
+                    "os-presets-v1",
                     "disk-resize",
                     "runtime-stop",
                     "vm-stop-identity",
+                    "vm-reboot-v1",
+                    "vm-shutdown-v2",
                     "driver-claim-v1",
+                    "guest-enhancements-v1",
+                    "operator-input-stream-v1",
                 ],
                 "owner_kind": self.kind,
                 "pid": os.getpid(),
@@ -91,6 +99,10 @@ class RuntimeOwner:
                 "config_root": str(self.service.config.config_root),
                 "agent_endpoint": self.agent.endpoint.model_dump(mode="json"),
             }
+        if method == "os_presets.list":
+            from .os_presets import list_os_presets
+
+            return await list_os_presets(self.service.config, self.desktop.probe)
         if method == "profiles":
             from .platforms import native_profile_id
 
@@ -103,6 +115,12 @@ class RuntimeOwner:
                     for profile in self.service.config.profiles.values()
                 ],
             }
+        if method.startswith("guest.") or method in {
+            "control.clipboard.get",
+            "control.clipboard.set",
+            "control.display.resize",
+        }:
+            return await self.enhancements.route(vm_id, method, payload)
         if method == "doctor":
             from .cli import build_doctor_report
 
@@ -120,12 +138,22 @@ class RuntimeOwner:
             return {"vms": await self.desktop.list()}
         if method == "vms.create":
             return await self.desktop.create(payload)
+        if method in {"vms.tools.mount", "vms.tools.eject"}:
+            from .tools_media import change_tools_media
+
+            return await change_tools_media(
+                self.desktop, vm_id, payload, mount=method.endswith("mount")
+            )
         if method == "vms.update":
             return await self.desktop.update(vm_id, payload)
         if method == "vms.settings.get":
             return await self.desktop.get_settings(vm_id)
         if method == "vms.disk.resize":
             return await self.desktop.resize_disk(vm_id, payload)
+        if method == "vms.disk.delete":
+            from .managed_disk_delete import delete_managed_disk
+
+            return await delete_managed_disk(self.desktop, vm_id, payload)
         if method == "hardware.capabilities":
             return await self.desktop.probe.get(
                 self.service.config.profile(payload.get("profile_id"))
@@ -149,6 +177,11 @@ class RuntimeOwner:
             )
         if method == "vms.restart":
             return await self.desktop.restart(vm_id)
+        if method == "vms.reboot":
+            expected = payload.get("expected_instance_id")
+            if not isinstance(expected, str) or not expected:
+                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "expected_instance_id is required")
+            return await self.desktop.reboot(vm_id, expected_instance_id=expected)
         if method == "vms.reset":
             result = await self.service.reset(vm_id)
             return (
@@ -165,10 +198,23 @@ class RuntimeOwner:
         if method == "display.ticket":
             return self.display.ticket(vm_id, str(payload["instance_id"]))
         if method == "display.sync":
-            await self.service.observe(vm_id, actor="operator")
+            try:
+                await self.service.observe(vm_id, actor="operator")
+            except PaletteError as error:
+                if error.code != ErrorCode.VM_NOT_RUNNING:
+                    raise
             return (await self.service.status(vm_id, actor="operator")).model_dump(mode="json")
         if method == "control.acquire":
             return await self.service.control.acquire(vm_id, str(payload["instance_id"]))
+        if method == "control.metrics":
+            instance = self.service.manager.get(vm_id)
+            controller = instance.controller
+            return {
+                "instance_id": instance.view.instance_id,
+                "input": controller.operator_timings.snapshot() if controller else {},
+                "runtime": self.service.control.timings.snapshot(),
+                "display": self.display.timings.snapshot(),
+            }
         if method == "control.heartbeat":
             return self.service.control.heartbeat(vm_id, str(payload["lease_id"]))
         if method == "control.release":

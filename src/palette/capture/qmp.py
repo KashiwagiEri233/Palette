@@ -26,6 +26,7 @@ from ..errors import ErrorCode, PaletteError, QmpCommandError
 from ..models import Size
 from ..qmp.client import QmpClient
 from .base import CapturedImage
+from .work import image_work
 
 logger = logging.getLogger("palette.capture")
 
@@ -82,8 +83,14 @@ class QmpCaptureBackend:
             except QmpCommandError as exc:
                 raise _capture_error(exc) from exc
 
-        raw = self._read_and_cleanup(sink)
-        return self._encode(raw, format_used=format_used, sink=sink, started=started)
+        return await image_work(
+            lambda: self._encode(
+                self._read_and_cleanup(sink),
+                format_used=format_used,
+                sink=sink,
+                started=started,
+            )
+        )
 
     # -- internals -------------------------------------------------------------------
     async def _screendump(self, sink: Path, display_id: str, head: int, *, fmt: str | None) -> None:

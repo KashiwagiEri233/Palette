@@ -20,6 +20,7 @@ class VmDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
     name: str = Field(min_length=1, max_length=120)
     profile_id: str
+    os_preset: Literal["windows", "linux", "custom"] = "custom"
     source: Literal["image", "iso"]
     path: str = Field(min_length=1, max_length=4096)
     image_format: Literal["qcow2", "raw"] = "qcow2"
@@ -47,6 +48,7 @@ class VmUpdate(BaseModel):
     network: Literal["offline", "restricted-lab", "nat"]
     iso_attached: bool
     settings: HardwareSettings
+    delete_drives: list[str] = Field(default_factory=list, max_length=256)
 
     @field_validator("name")
     @classmethod
@@ -58,6 +60,7 @@ class DiskResize(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     revision: int = Field(ge=0)
     disk_gib: int = Field(ge=1, le=4096)
+    drive_id: str = Field(default="drive-primary", pattern=r"^drive-[a-z0-9_-]{1,16}$")
 
 
 class ResizeOperation(BaseModel):
@@ -67,6 +70,7 @@ class ResizeOperation(BaseModel):
     before_bytes: int = Field(ge=1)
     target_bytes: int = Field(ge=1)
     disk_gib: int = Field(ge=1, le=4096)
+    drive_id: str = Field(default="drive-primary", pattern=r"^drive-[a-z0-9_-]{1,16}$")
 
     @model_validator(mode="after")
     def consistent_capacity(self) -> ResizeOperation:
@@ -84,6 +88,22 @@ def sync_directory(path: Path) -> None:
             os.close(fd)
 
 
+class ManagedDisk(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    owner: str = Field(pattern=r"^(?:data|inst)_[0-9a-f]{12}$")
+    size_gib: int = Field(ge=1, le=4096)
+    deleting: bool = False
+    format: Literal["qcow2", "raw"] = "qcow2"
+    virtual_size: int | None = Field(default=None, ge=1)
+    source_name: str | None = Field(default=None, max_length=4096)
+
+
+class DiskDelete(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    revision: int = Field(ge=0)
+    drive_id: str = Field(pattern=r"^drive-[a-z0-9_-]{1,16}$")
+
+
 class VmDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: Literal[1, 2] = 2
@@ -93,7 +113,10 @@ class VmDefinition(BaseModel):
     profile: Profile
     storage_owner: str | None = None
     seed_owner: str | None = None
+    data_disks: dict[str, ManagedDisk] = Field(default_factory=dict, max_length=256)
+    drives_initialized: bool = False
     iso_attached: bool = True
+    tools_iso_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     created_at: str
     updated_at: str
 
@@ -113,6 +136,20 @@ class DefinitionRepository:
                         ErrorCode.INVALID_ARGUMENT, "VM definition exceeds its limit"
                     )
                 definition = VmDefinition.model_validate_json(path.read_text(encoding="utf-8"))
+                # Definitions written before upstream integrations existed inherit only
+                # missing channel settings from their trusted profile. Never inherit
+                # directory exports, disks, graphics, resources, or explicit opt-outs.
+                defaults = manager.config.profiles.get(definition.profile.profile_id)
+                if defaults is not None:
+                    updates = {
+                        name: getattr(defaults, name)
+                        for name in ("guest_agent", "guest_desktop")
+                        if name not in definition.profile.model_fields_set
+                    }
+                    if updates:
+                        definition = definition.model_copy(
+                            update={"profile": definition.profile.model_copy(update=updates)}
+                        )
                 validate_identifier(definition.vm_id, what="vm_id")
                 if path.stem != definition.vm_id:
                     raise PaletteError(
@@ -128,6 +165,11 @@ class DefinitionRepository:
             for owner in (definition.storage_owner, definition.seed_owner)
             if owner is not None
         }
+        roots.update(
+            self.guard.resolve("vms", definition.vm_id, disk.owner)
+            for definition in self.definitions.values()
+            for disk in definition.data_disks.values()
+        )
         self.manager.persistent_roots.clear()
         self.manager.persistent_roots.update(roots)
 

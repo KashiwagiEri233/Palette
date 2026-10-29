@@ -9,10 +9,80 @@ import pytest
 
 from palette.errors import ErrorCode, PaletteError, QmpCommandError, QmpDisconnectedError
 from palette.qmp.client import ALLOWED_COMMANDS, QmpClient, qapi_declares_argument
+from palette.qmp.transport import MemoryTransport, MemoryWriter
 from support.fake_qmp_server import GREETING, FakeQmpServer, connected_client
 
 
 class TestHandshake:
+    async def test_eof_before_greeting_fails_immediately(self):
+        reader = asyncio.StreamReader()
+        reader.feed_eof()
+        client = QmpClient(
+            MemoryTransport(reader, MemoryWriter(lambda _: None)), handshake_timeout=30
+        )
+        with pytest.raises(QmpDisconnectedError, match="channel closed"):
+            await asyncio.wait_for(client.start(), 0.5)
+        assert client.diagnostics()["eof"]
+        await client.close()
+
+    async def test_eof_after_greeting_does_not_wait_for_capabilities_timeout(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(json.dumps(GREETING).encode() + b"\n")
+        reader.feed_eof()
+        writer = MemoryWriter(lambda _: pytest.fail("must not send after EOF"))
+        client = QmpClient(MemoryTransport(reader, writer), handshake_timeout=30)
+        with pytest.raises(QmpDisconnectedError):
+            await asyncio.wait_for(client.start(), 0.5)
+        await client.close()
+
+    async def test_reader_error_before_greeting_is_a_disconnect(self):
+        reader = asyncio.StreamReader()
+        reader.set_exception(OSError("read failed"))
+        client = QmpClient(
+            MemoryTransport(reader, MemoryWriter(lambda _: None)), handshake_timeout=30
+        )
+        with pytest.raises(QmpDisconnectedError):
+            await asyncio.wait_for(client.start(), 0.5)
+        await client.close()
+
+    async def test_close_unblocks_a_pending_greeting(self):
+        client = QmpClient(MemoryTransport(asyncio.StreamReader(), MemoryWriter(lambda _: None)))
+        pending = asyncio.create_task(client.start())
+        await asyncio.sleep(0)
+        await client.close()
+        with pytest.raises(QmpDisconnectedError, match="closed"):
+            await asyncio.wait_for(pending, 0.5)
+        assert not client.connected
+
+    async def test_cancelled_start_releases_reader_and_writer(self):
+        writer = MemoryWriter(lambda _: None)
+        client = QmpClient(MemoryTransport(asyncio.StreamReader(), writer))
+        pending = asyncio.create_task(client.start())
+        await asyncio.sleep(0)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert client._reader_task is None
+        assert writer._closed
+        assert client._greeting_future.done()
+        await client.close()
+
+    async def test_cancel_during_capabilities_also_releases_transport(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(json.dumps(GREETING).encode() + b"\n")
+        sent = asyncio.Event()
+        writer = MemoryWriter(lambda _: sent.set())
+        client = QmpClient(MemoryTransport(reader, writer))
+        pending = asyncio.create_task(client.start())
+        await sent.wait()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert writer._closed
+        assert client._reader_task is None
+        assert not client._pending
+        assert not client.connected
+
     async def test_the_greeting_is_read_then_capabilities_are_negotiated(self) -> None:
         server = FakeQmpServer()
         async with connected_client(server) as transport:
@@ -129,6 +199,51 @@ class TestCorrelation:
 
 
 class TestFailures:
+    async def test_uncorrelated_protocol_errors_are_bounded_and_attached_to_timeout(self):
+        reader = asyncio.StreamReader()
+        client = QmpClient(MemoryTransport(reader, MemoryWriter(lambda _: None)))
+        client._connected = True
+        for index in range(12):
+            client._dispatch_line(
+                json.dumps(
+                    {"error": {"class": "GenericError", "desc": f"JSON parse error {index}"}}
+                ).encode()
+            )
+        with pytest.raises(PaletteError) as error:
+            await client.execute("input-send-event", timeout=0.01)
+        diagnostics = error.value.details["qmp"]
+        assert len(diagnostics["protocol_errors"]) == 8
+        assert diagnostics["protocol_errors"][0]["description"] == "JSON parse error 4"
+        assert error.value.details["request_id"]
+        assert error.value.details["command"] == "input-send-event"
+        await client.close()
+
+    @pytest.mark.parametrize("phase", ["write", "drain"])
+    async def test_write_failure_does_not_skip_writer_cleanup(self, phase):
+        class FailedWriter:
+            closes = 0
+            waits = 0
+
+            def write(self, data):
+                if phase == "write":
+                    raise BrokenPipeError("peer gone")
+
+            async def drain(self):
+                raise ConnectionResetError("peer gone")
+
+            def close(self):
+                self.closes += 1
+
+            async def wait_closed(self):
+                self.waits += 1
+
+        writer = FailedWriter()
+        transport = MemoryTransport(asyncio.StreamReader(), writer)
+        with pytest.raises(QmpDisconnectedError):
+            await transport.send_json({"execute": "query-status"})
+        await asyncio.gather(transport.close(), transport.close())
+        assert writer.closes == writer.waits == 1
+
     async def test_command_deadline_includes_a_stalled_drain(self) -> None:
         server = FakeQmpServer()
         async with connected_client(server) as transport:
@@ -286,11 +401,15 @@ class TestAllowList:
 
     def test_the_allow_list_is_explicit(self) -> None:
         assert "input-send-event" in ALLOWED_COMMANDS
+        # The enhancement watcher reads chardev frontend state; without this the clipboard
+        # and resize capabilities could never be reported as available.
+        assert "query-chardev" in ALLOWED_COMMANDS
         assert "screendump" in ALLOWED_COMMANDS
         assert "system_powerdown" in ALLOWED_COMMANDS
         assert "human-monitor-command" not in ALLOWED_COMMANDS
         assert "migrate" not in ALLOWED_COMMANDS
-        assert "device_add" not in ALLOWED_COMMANDS
+        assert "device_add" in ALLOWED_COMMANDS
+        assert "blockdev-add" in ALLOWED_COMMANDS
 
 
 class TestProbe:

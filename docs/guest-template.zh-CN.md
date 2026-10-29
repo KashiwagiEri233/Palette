@@ -78,3 +78,7 @@ PALETTE_E2E=1 PALETTE_E2E_PROFILE=default uv run pytest tests/e2e -v
 ## 4. 可选：集成客户机内增强服务
 
 若需在客户机内启用 `vm_guest_input_text`（原生 Unicode/中文输入）与 `vm_guest_launch_app`（启动注册白名单应用），需在客户机的交互式图形会话中部署实现 `org.palette.tools.0`（`virtio-serial`）协议的守护进程。完整协议与安全要求见[客户机内增强服务契约](../guest/agent/README.zh-CN.md)。
+
+## 可选虚拟机增强工具
+
+客户机安装、能力自动检测与降级、中文剪贴板、自动分辨率、QGA 管理、文件传输和私有 WebDAV 共享目录，请参阅[增强工具指南](guest-enhancements.zh-CN.md)。缺少工具时仍可使用基础虚拟机控制台。

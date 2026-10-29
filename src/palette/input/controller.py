@@ -32,13 +32,15 @@ from typing import Any, cast
 
 from ..audit import AuditLog
 from ..capture.base import CaptureBackend, CapturedImage
+from ..capture.work import image_work
 from ..cleanup import join_cleanup
 from ..config import Profile
-from ..errors import ErrorCode, PaletteError
+from ..errors import ErrorCode, PaletteError, QmpCommandError
 from ..guest_tools.base import GuestToolOutcome
 from ..models import (
     Action,
     ActionSource,
+    ClickAction,
     EffectState,
     ErrorPayload,
     Frame,
@@ -54,9 +56,10 @@ from ..models import (
     parse_action,
 )
 from ..qmp.client import QmpClient
+from ..timing import TimingWindow
 from .coordinates import CoordinateTransform, transform_id_for
 from .dedupe import RequestDeduplicator
-from .events import InputPlanner, button_event, key_event
+from .events import InputPlanner, button_event, key_event, key_plan_batches
 from .frames import (
     FrameRegistry,
     image_difference_ratio,
@@ -64,6 +67,7 @@ from .frames import (
     rescale,
     thumbnail_difference,
 )
+from .keyboard import plan_chord
 from .ledger import InputLedger
 from .scheduler import ActionScheduler, Job, JobKind
 from .state import ActionResult, CursorPositionSource, InstanceView
@@ -72,6 +76,11 @@ logger = logging.getLogger("palette.input")
 
 #: A job may wait this long for the queue before the service reports BUSY.
 DEFAULT_QUEUE_WAIT_SECONDS = 5.0
+
+#: The only run state in which QEMU accepts ``input-send-event`` from a guest that is not
+#: suspended. Spelled as a literal because ``InstanceView`` stores the state as text and
+#: importing the lifecycle enum here would close an import cycle through ``vm.manager``.
+_RUNNING_STATE = "RUNNING"
 
 #: Pixel-difference heuristic settings for ``vm_wait``.
 _STABLE_SAMPLE_INTERVAL = 0.25
@@ -135,10 +144,12 @@ class ActionController:
         self._capture = capture
         self._frames_dir = frames_dir
         self._audit = audit
+        self.operator_timings = TimingWindow()
         self._ledger = InputLedger()
         self._frames = FrameRegistry()
         self._dedupe = RequestDeduplicator()
         self._generation = 0
+        self._guest_snapshots: dict[str, tuple[str, dict[str, int]]] = {}
         self._last_capture_at: float = 0.0
         self.mutation_guard: Callable[[], None] | None = None
         self._shutdown_task: asyncio.Task[ReleaseResult | None] | None = None
@@ -184,6 +195,7 @@ class ActionController:
     def invalidate(self, *, reason: str) -> None:
         """Fence in-flight captures and cancel old work before yielding to the event loop."""
         self._generation += 1
+        self._guest_snapshots.clear()
         self._frames.clear(reason=reason)
         error = PaletteError(ErrorCode.STALE_FRAME, reason, retryable=False)
         self.scheduler.cancel_all(error)
@@ -373,6 +385,8 @@ class ActionController:
         frame_id: str | None,
         parameters: dict[str, Any],
         runner: Callable[[Callable[[], None]], Awaitable[GuestToolOutcome]],
+        capture_after: bool = True,
+        failure_outcome: Callable[[PaletteError], GuestToolOutcome] | None = None,
     ) -> tuple[GuestToolResult, bytes | None]:
         """Run and retain guest receipts using the same queue and identity as visual input."""
         identity = self._identity()
@@ -380,13 +394,15 @@ class ActionController:
 
         def failure(error: PaletteError) -> tuple[GuestToolResult, None]:
             self._record_guest(label, None, error.code)
+            failed = failure_outcome(error) if failure_outcome is not None else None
             return GuestToolResult(
                 ok=False,
                 error=ErrorPayload(**error.as_payload()),
-                effect_state=progress.effect,
+                effect_state=failed.effect_state if failed is not None else progress.effect,
                 request_id=request_id,
                 action_seq=progress.sequence,
                 detail=error.message,
+                data=failed.data if failed is not None else {},
             ), None
 
         async def _job() -> tuple[GuestToolResult, bytes | None]:
@@ -406,14 +422,15 @@ class ActionController:
                 result.effect_state in {EffectState.SUBMITTED, EffectState.PARTIAL}
             )
             settle = self.profile.timeouts.settle_after_input_ms / 1000.0
-            if settle:
+            if settle and capture_after:
                 await asyncio.sleep(settle)
             frame: Frame | None = None
             png: bytes | None = None
             try:
-                frame, captured = await self._capture_frame()
-                png = captured.png_bytes
-                self.view.screen_ready = True
+                if capture_after:
+                    frame, captured = await self._capture_frame()
+                    png = captured.png_bytes
+                    self.view.screen_ready = True
             except PaletteError as exc:
                 logger.info("post-guest-operation capture failed: %s", exc.code)
             error = result.error
@@ -434,6 +451,7 @@ class ActionController:
                 action_seq=progress.sequence,
                 frame=frame,
                 detail=result.detail,
+                data=result.data,
             ), png
 
         job = self.scheduler.make_job(JobKind.ACTION, label, _job)
@@ -460,6 +478,225 @@ class ActionController:
         if code is not None:
             payload["error_code"] = str(code)
         self._audit.record("guest.operation", **payload)
+
+    def remember_guest_snapshot(self, result: GuestToolResult) -> None:
+        """Bind guest labels to the actual QEMU image and its coordinate transform."""
+        snapshot_id = result.data.get("snapshot_id")
+        bounds = result.data.get("virtual_screen")
+        frame = result.frame
+        if not result.ok or frame is None or not isinstance(snapshot_id, str):
+            return
+        if not isinstance(bounds, dict):
+            result.data["labels_usable"] = False
+            return
+        valid = all(type(bounds.get(key)) is int for key in ("left", "top", "width", "height"))
+        if not valid:
+            result.data["labels_usable"] = False
+            return
+        if (bounds["width"], bounds["height"]) != (
+            frame.native_size.width,
+            frame.native_size.height,
+        ):
+            result.data["labels_usable"] = False
+            result.data["label_note"] = "Guest desktop bounds do not match this QEMU display head"
+            return
+        self._guest_snapshots[snapshot_id] = (frame.frame_id, dict(bounds))
+        while len(self._guest_snapshots) > 8:
+            self._guest_snapshots.pop(next(iter(self._guest_snapshots)))
+        result.data["labels_usable"] = True
+        result.data["frame_id"] = frame.frame_id
+        result.data["coordinate_space"] = (
+            "UIA bounds are native guest pixels; locs use returned image pixels"
+        )
+
+    async def run_guest_batch(
+        self,
+        *,
+        operation: str,
+        request_id: str,
+        frame_id: str,
+        parameters: dict[str, Any],
+        resolve: Callable[[str, list[int]], Awaitable[list[list[int]]]],
+        write_text: Callable[[str, Callable[[], None]], Awaitable[GuestToolOutcome]],
+        validate: Callable[[], None],
+        prepare: Callable[[], Awaitable[None]],
+    ) -> tuple[GuestToolResult, bytes | None]:
+        """One queued transaction, with QMP inputs retained in the shared input ledger."""
+        completed = 0
+        sent = False
+        in_flight = False
+        finished = False
+        editing = operation == "multi_edit"
+        entries = parameters.get("locs") or parameters.get("labels") or []
+
+        def failed(error: PaletteError) -> GuestToolOutcome:
+            effect = (
+                EffectState.SUBMITTED
+                if finished
+                else EffectState.UNKNOWN
+                if in_flight
+                else EffectState.PARTIAL
+                if sent
+                else EffectState.NOT_SENT
+            )
+            return GuestToolOutcome(
+                ok=False,
+                effect_state=effect,
+                error=error,
+                data={"completed": completed, "total": len(entries)},
+            )
+
+        async def runner(on_sending: Callable[[], None]) -> GuestToolOutcome:
+            nonlocal completed, sent, in_flight, finished
+            validate()
+            await prepare()
+            frame = self._frames.get(frame_id)
+            transform = self._validate_frame_for_action(frame)
+            labels: list[int] | None = None
+            snapshot_id = str(parameters.get("snapshot_id") or "")
+            bounds: dict[str, int] | None = None
+            if parameters.get("labels") is not None:
+                binding = self._guest_snapshots.get(snapshot_id)
+                if binding is None or binding[0] != frame_id:
+                    raise PaletteError(
+                        ErrorCode.STALE_FRAME, "labels require their original snapshot frame"
+                    )
+                bounds = binding[1]
+                labels = [entry[0] if editing else entry for entry in entries]
+                # Labels have exact native centers, even when the image was downscaled.
+                # Do not quantize them through the smaller screenshot pixel grid.
+                transform = CoordinateTransform.full(frame.native_size, frame.native_size)
+
+            def image_point(point: list[int]) -> tuple[int, int]:
+                if len(point) != 2 or any(type(value) is not int for value in point):
+                    raise PaletteError(
+                        ErrorCode.INVALID_COORDINATES, "invalid guest element coordinates"
+                    )
+                x, y = point
+                if bounds is not None:
+                    x, y = x - bounds["left"], y - bounds["top"]
+                    if (
+                        not 0 <= x < frame.native_size.width
+                        or not 0 <= y < frame.native_size.height
+                    ):
+                        raise PaletteError(
+                            ErrorCode.INVALID_COORDINATES, "element is outside the display"
+                        )
+                transform.validate(x, y)
+                return x, y
+
+            raw_points = (
+                await resolve(snapshot_id, labels)
+                if labels is not None
+                else [entry[:2] for entry in entries]
+            )
+            if len(raw_points) != len(entries):
+                raise PaletteError(
+                    ErrorCode.INVALID_ARGUMENT, "guest returned an incomplete label mapping"
+                )
+            points = [image_point(point) for point in raw_points]
+
+            def sending() -> None:
+                nonlocal sent, in_flight
+                sent = in_flight = True
+                on_sending()
+
+            async def send(events: list[dict[str, Any]], delay: int = 0) -> None:
+                nonlocal in_flight
+                validate()
+                self._check_mutation()
+                self._check_frame_authority(frame)
+                self._ledger.note_presses(events)
+                await self._send_events(
+                    events, timeout=self.profile.timeouts.qmp_command_seconds, on_sending=sending
+                )
+                self._ledger.note_releases(events)
+                in_flight = False
+                if delay:
+                    await asyncio.sleep(delay / 1000)
+
+            async def action(value: Action) -> None:
+                for events, delay in self._planner.batches(value, transform):
+                    await send(events, delay)
+
+            error: PaletteError | None = None
+            try:
+                async with asyncio.timeout(self.profile.guest_tools.request_timeout_seconds):
+                    if not editing and parameters.get("press_ctrl", True):
+                        await send([key_event("ctrl", True)])
+                    for index, point in enumerate(points):
+                        validate()
+                        await self._ensure_size_is_current()
+                        self._check_frame_authority(frame)
+                        if labels is not None:
+                            resolved = await resolve(snapshot_id, [labels[index]])
+                            if len(resolved) != 1 or image_point(resolved[0]) != point:
+                                raise PaletteError(
+                                    ErrorCode.STALE_FRAME,
+                                    "batch target moved; capture a new snapshot",
+                                )
+                        await action(ClickAction(type="click", x=point[0], y=point[1]))
+                        if editing:
+                            if parameters.get("clear", True):
+                                await action(KeyAction(type="key", keys=["CTRL", "A"]))
+                                await action(KeyAction(type="key", keys=["BACKSPACE"]))
+                            text = entries[index][-1]
+                            if text:
+                                result = await write_text(text, sending)
+                                in_flight = result.effect_state == EffectState.UNKNOWN
+                                if (
+                                    not result.ok
+                                    or result.effect_state is not EffectState.SUBMITTED
+                                ):
+                                    raise result.error or PaletteError(
+                                        ErrorCode.GUEST_TOOL_UNAVAILABLE, "guest text input failed"
+                                    )
+                        completed += 1
+                    if not editing and parameters.get("press_ctrl", True):
+                        await send([key_event("ctrl", False)])
+                    finished = True
+            except TimeoutError:
+                error = PaletteError(ErrorCode.TIMEOUT, "batch deadline exceeded", retryable=False)
+            except PaletteError as exc:
+                error = exc
+            finally:
+                await self._bounded_release()
+                if not self._ledger.is_clean:
+                    in_flight = True
+                    finished = False
+                    error = PaletteError(
+                        ErrorCode.ACTION_OUTCOME_UNKNOWN, "input release was not confirmed"
+                    )
+            if error is not None:
+                return failed(error)
+            if not finished:
+                return failed(
+                    PaletteError(
+                        ErrorCode.ACTION_OUTCOME_UNKNOWN, "input release was not confirmed"
+                    )
+                )
+            return GuestToolOutcome(
+                ok=True, method=operation, data={"completed": completed, "total": len(entries)}
+            )
+
+        return await self.run_guest_operation(
+            label="guest." + operation,
+            request_id=request_id,
+            frame_id=frame_id,
+            parameters=parameters,
+            runner=runner,
+            failure_outcome=failed,
+        )
+
+    async def paste_guest_clipboard(self) -> None:
+        """Send Ctrl+V within an already scheduled guest operation, using its ledger."""
+        for events, delay_ms in key_plan_batches(plan_chord(["CTRL", "V"], hold_ms=30), hold_ms=30):
+            self._check_mutation()
+            self._ledger.note_presses(events)
+            await self._send_events(events, timeout=self.profile.timeouts.qmp_command_seconds)
+            self._ledger.note_releases(events)
+            if delay_ms:
+                await asyncio.sleep(delay_ms / 1000)
 
     async def release_inputs(self, *, guarded: bool = False) -> ReleaseResult:
         """Release every key and button the service believes it holds."""
@@ -568,11 +805,17 @@ class ActionController:
             display_id=self.view.display_id, head=self.view.head, sink=sink
         )
         self._require_identity(identity)
-        if max_long_edge is not None and max_long_edge != self.profile.capture.max_long_edge:
-            captured = rescale(captured, max_long_edge, self.profile.capture.max_bytes)
+
+        def process() -> tuple[CapturedImage, bytes]:
+            result = captured
+            if max_long_edge is not None and max_long_edge != self.profile.capture.max_long_edge:
+                result = rescale(result, max_long_edge, self.profile.capture.max_bytes)
+            return result, image_thumbnail(result.png_bytes)
+
+        captured, thumbnail = await image_work(process)
+        self._require_identity(identity)
         frame = self._build_frame(captured, cursor_position_source=cursor_position_source)
         self._last_capture_at = time.monotonic()
-        thumbnail = image_thumbnail(captured.png_bytes)
         return self._frames.add(frame, thumbnail), captured
 
     def _frame_path(self) -> Path:
@@ -759,8 +1002,52 @@ class ActionController:
     ) -> None:
         arguments = self._event_prefix()
         arguments["events"] = events
-        await self._qmp.execute(
-            "input-send-event", arguments, timeout=timeout, on_sending=on_sending
+        try:
+            await self._qmp.execute(
+                "input-send-event", arguments, timeout=timeout, on_sending=on_sending
+            )
+        except QmpCommandError as exc:
+            # QEMU refuses ``input-send-event`` unless it is running or suspended, and
+            # says so as a generic error. Reporting that as a failed QMP command makes a
+            # paused or shutting-down guest look like a broken channel; the honest answer
+            # is that the guest was not in a state that accepts input.
+            if exc.description.strip() == "VM not running":
+                raise PaletteError(
+                    ErrorCode.VM_NOT_RUNNING,
+                    "虚拟机未在运行, 输入未发送",
+                    details={"qmp_class": exc.qmp_class, "command": exc.command},
+                ) from None
+            raise
+
+    async def operator_enhancement(
+        self,
+        label: str,
+        validate: Callable[[], None],
+        runner: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Serialize operator enhancements with input, capture and ownership changes."""
+        identity = self._identity()
+
+        async def run() -> dict[str, Any]:
+            validate()
+            self._require_identity(identity)
+            self.view.action_seq += 1
+            try:
+                result = await runner()
+                validate()
+                self._require_identity(identity)
+                return result
+            finally:
+                if self._audit is not None:
+                    self._audit.record(
+                        "operator.enhancement", vm_id=self.view.vm_id, operation=label
+                    )
+
+        return cast(
+            dict[str, Any],
+            await self.scheduler.submit(
+                self.scheduler.make_job(JobKind.OPERATOR_INPUT, label, run)
+            ),
         )
 
     async def operator_input(
@@ -768,10 +1055,28 @@ class ActionController:
     ) -> int:
         """Send one authenticated batch; successful held inputs survive the batch."""
         identity = self._identity()
+        queued = time.perf_counter()
+        # Human input is best-effort by nature: a keystroke that arrives while the guest is
+        # pausing or shutting down must not cost the operator the control lease, and QEMU
+        # would reject it anyway. Refuse it here, before anything is sent, so the receipt
+        # is honest about the batch never leaving the service.
+        if self.view.state != _RUNNING_STATE:
+            raise PaletteError(
+                ErrorCode.VM_NOT_RUNNING,
+                "虚拟机未在运行, 输入未发送",
+                details={"state": self.view.state},
+            )
 
         async def run() -> int:
+            started = time.perf_counter()
             validate()
             self._require_identity(identity)
+            if self.view.state != _RUNNING_STATE:
+                raise PaletteError(
+                    ErrorCode.VM_NOT_RUNNING,
+                    "虚拟机未在运行, 输入未发送",
+                    details={"state": self.view.state},
+                )
             self._ledger.note_presses(events)
             progress = _InputProgress(self.view, self.view.action_seq)
             await self._send_events(
@@ -779,10 +1084,17 @@ class ActionController:
                 timeout=self.profile.timeouts.qmp_command_seconds,
                 on_sending=progress.sending,
             )
+            acknowledged = time.perf_counter()
             self._ledger.note_releases(events)
             self._require_identity(identity)
             if self._audit is not None:
                 self._audit.record("operator.input", vm_id=self.view.vm_id, count=len(events))
+            self.operator_timings.record(
+                queue_ms=(started - queued) * 1000,
+                qmp_ms=(acknowledged - started) * 1000,
+                audit_ms=(time.perf_counter() - acknowledged) * 1000,
+                total_ms=(time.perf_counter() - queued) * 1000,
+            )
             return self.view.action_seq
 
         return cast(

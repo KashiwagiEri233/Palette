@@ -76,3 +76,7 @@ PALETTE_E2E=1 PALETTE_E2E_PROFILE=default uv run pytest tests/e2e -v
 ## 4. Optional: In-Guest Enhancement Service
 
 To enable `vm_guest_input_text` (native Unicode/CJK text injection) and `vm_guest_launch_app` (launching registered allowlisted apps), install a guest daemon inside the interactive desktop session speaking the `org.palette.tools.0` (`virtio-serial`) protocol. See the [in-guest agent contract](../guest/agent/README.md) for the specification.
+
+## Optional Guest Enhancements
+
+See the [guest enhancement guide](guest-enhancements.md) for guest installation, automatic capability detection and degradation, Unicode clipboard, automatic resolution, QGA management, file transfer, and private WebDAV shared directories. Missing tools preserve the basic VM console.

@@ -1,12 +1,4 @@
-"""Guest tool transport and the host-side bridge.
-
-The bridge owns the parts of the enhancement path that are host-side and testable today:
-handshake, version negotiation, capability reconciliation, request/response correlation,
-timeouts, size limits and generation invalidation on guest reboot. The guest-side service
-is not implemented here — this build ships the protocol, the disabled backend and a mock,
-exactly as the plan prescribes — so the placeholder transport reports *not implemented*
-instead of pretending to connect.
-"""
+"""Private guest transport, negotiated capabilities and bounded correlated requests."""
 
 from __future__ import annotations
 
@@ -21,9 +13,12 @@ from typing import Any, Protocol, runtime_checkable
 
 from ..config import GuestToolsConfig
 from ..errors import ErrorCode, PaletteError
+from ..guest_channel import GuestChannel
 from ..models import EffectState
 from .base import GuestCapabilities, GuestToolOutcome
 from .protocol import (
+    LEGACY_CAPABILITIES,
+    OPERATION_CAPABILITIES,
     PROTOCOL_VERSION,
     SUPPORTED_VERSIONS,
     Envelope,
@@ -65,12 +60,7 @@ class GuestToolTransport(Protocol):
 
 
 class VirtioSerialGuestToolTransport:
-    """Placeholder for the real ``org.palette.tools.0`` virtio-serial channel.
-
-    Not implemented in this build. It exists so that the bridge, the policy checks and the
-    tool surface can be written and tested against the true interface, and so that turning
-    the feature on later is a transport implementation rather than an architecture change.
-    """
+    """Instance-private ``org.palette.tools.0`` socket stream."""
 
     def __init__(
         self, *, port_name: str = "org.palette.tools.0", endpoint: str | None = None
@@ -78,30 +68,53 @@ class VirtioSerialGuestToolTransport:
         self.port_name = port_name
         self.endpoint = endpoint
         self._online = False
+        self._channel = GuestChannel(endpoint) if endpoint else None
+        self._write_lock = asyncio.Lock()
+
+    @property
+    def channel(self) -> GuestChannel | None:
+        return self._channel
 
     @property
     def online(self) -> bool:
-        return self._online
+        return self._online and self._channel is not None and self._channel.connected
 
     def describe(self) -> str:
-        return f"virtio-serial {self.port_name} (not implemented in this build)"
+        return f"virtio-serial {self.port_name}"
 
     async def open(self) -> None:
-        raise PaletteError(
-            ErrorCode.GUEST_TOOL_UNAVAILABLE,
-            "the virtio-serial guest tool transport is not implemented in this build",
-            details={"port": self.port_name, "phase": "enhancement"},
-            retryable=False,
-        )
+        if self._channel is None:
+            raise PaletteError(
+                ErrorCode.GUEST_TOOL_UNAVAILABLE,
+                "the VM has no private guest tool endpoint",
+                details={"port": self.port_name, "phase": "enhancement"},
+            )
+        if not self._online:
+            await self._channel.close()
+        await self._channel.open()
+        self._online = True
 
     async def send(self, data: bytes) -> None:
-        raise PaletteError(ErrorCode.GUEST_TOOL_UNAVAILABLE, "guest tool channel is not open")
+        if not self.online or self._channel is None:
+            raise ConnectionError("guest tool channel is not open")
+        async with self._write_lock:
+            await self._channel.write(data)
 
     async def receive(self, timeout: float) -> bytes:
-        raise PaletteError(ErrorCode.GUEST_TOOL_UNAVAILABLE, "guest tool channel is not open")
+        if not self.online or self._channel is None:
+            return b""
+        try:
+            return await self._channel.read(timeout)
+        except TimeoutError:
+            return b""
+        except (OSError, EOFError):
+            self._online = False
+            raise
 
     async def close(self) -> None:
         self._online = False
+        if self._channel is not None:
+            await self._channel.close()
 
 
 class MemoryGuestToolTransport:
@@ -218,6 +231,7 @@ class BridgeGuestToolBackend:
     _desktop_ready: bool | None = None
     _detail: str | None = None
     _closed: bool = False
+    _connect_id: str = ""
 
     # -- status ----------------------------------------------------------------------
     async def capabilities(self) -> GuestCapabilities:
@@ -246,6 +260,8 @@ class BridgeGuestToolBackend:
         if not self._service_online:
             return ()
         granted = set(self.config.capabilities) & set(self._guest_caps)
+        if self._negotiated == "1.0":
+            granted &= LEGACY_CAPABILITIES
         return tuple(sorted(granted))
 
     def _granted_methods(self) -> tuple[str, ...]:
@@ -254,18 +270,24 @@ class BridgeGuestToolBackend:
         return tuple(sorted(set(self.config.input_methods) & set(self._guest_methods)))
 
     # -- lifecycle -------------------------------------------------------------------
-    async def connect(self) -> GuestCapabilities:
+    async def connect(self, *, attach_timeout: float | None = None) -> GuestCapabilities:
         """Open the channel and complete the handshake. Never raises for a missing guest
-        service: an unavailable enhancement path is a reportable state, not a crash."""
+        service: an unavailable enhancement path is a reportable state, not a crash.
+
+        ``attach_timeout`` bounds transport attachment independently of the optional
+        guest-service handshake. Neither phase holds up QMP startup.
+        """
         if not self.config.enabled:
             self._detail = "guest enhancement tools are disabled for this profile"
             return await self.capabilities()
 
+        await self._teardown_reader()
+        self._closed = False
         self._generation += 1
         self._negotiated = None
         self._service_online = False
         try:
-            async with asyncio.timeout(self.config.request_timeout_seconds):
+            async with asyncio.timeout(attach_timeout or self.config.request_timeout_seconds):
                 await self.transport.open()
         except Exception as exc:
             self._detail = f"guest tool transport unavailable: {type(exc).__name__}"
@@ -275,12 +297,15 @@ class BridgeGuestToolBackend:
         self._decoder = FrameDecoder(max_bytes=self.config.max_message_bytes)
         self._reader = asyncio.create_task(self._read_loop(), name="guest-tools-reader")
         connect_id = f"conn_{uuid.uuid4().hex[:12]}"
+        self._connect_id = connect_id
         hello = Envelope(
-            v=PROTOCOL_VERSION,
+            # The unchanged bootstrap envelope is readable by a strict 1.0 peer;
+            # subsequent requests use the version selected from payload.versions.
+            v="1.0",
             kind=MessageKind.HELLO.value,
             id=connect_id,
             payload=HelloPayload(
-                versions=list(SUPPORTED_VERSIONS),
+                versions=self._supported_versions(),
                 vm_id=self.vm_id,
                 instance_id=self.instance_id,
                 boot_epoch=self.boot_epoch,
@@ -307,9 +332,14 @@ class BridgeGuestToolBackend:
             return await self.capabilities()
 
         try:
-            self._negotiated = negotiate_version(SUPPORTED_VERSIONS, [ack.version])
+            self._negotiated = negotiate_version(self._supported_versions(), [ack.version])
         except PaletteError as exc:
             self._detail = f"protocol version mismatch: {exc.details}"
+            await self._teardown_reader()
+            return await self.capabilities()
+
+        if ack.session != self.config.target_session or ack.session != "interactive":
+            self._detail = "guest service is not attached to the interactive user session"
             await self._teardown_reader()
             return await self.capabilities()
 
@@ -353,6 +383,40 @@ class BridgeGuestToolBackend:
         await self.transport.close()
 
     # -- operations ------------------------------------------------------------------
+    async def execute_operation(
+        self,
+        operation: str,
+        parameters: dict[str, Any],
+        *,
+        on_sending: Callable[[], None] | None = None,
+    ) -> GuestToolOutcome:
+        capability = OPERATION_CAPABILITIES.get(operation)
+        if capability is None:
+            raise PaletteError(
+                ErrorCode.UNSUPPORTED_CAPABILITY,
+                "unregistered guest operation",
+                details={"operation": operation},
+            )
+        caps = await self.capabilities()
+        self._require_ready(caps, capability)
+        if caps.protocol_version != "1.1":
+            raise PaletteError(
+                ErrorCode.UNSUPPORTED_CAPABILITY,
+                "this guest operation requires protocol 1.1",
+            )
+        params = dict(parameters)
+        if operation == "resolve_elements":
+            params["operation"] = operation
+        elif operation.startswith("clipboard."):
+            params["operation"] = operation.split(".", 1)[1]
+        reply = await self._request(
+            self._build_envelope(MessageKind.REQUEST, capability, params),
+            capability=capability,
+            timeout=self.config.request_timeout_seconds,
+            on_sending=on_sending,
+        )
+        return _outcome_from_reply(reply, capability=capability)
+
     async def input_text(
         self,
         *,
@@ -434,23 +498,67 @@ class BridgeGuestToolBackend:
                 f"the guest does not offer {capability!r}",
                 details={"granted": list(caps.capabilities)},
             )
+        if (
+            capability
+            in {
+                "guest.input_text",
+                "guest.launch_app",
+                "guest.app",
+                "guest.snapshot",
+                "guest.batch",
+                "guest.clipboard",
+            }
+            and caps.interactive_desktop_ready is not True
+        ):
+            raise PaletteError(
+                ErrorCode.GUEST_TOOL_UNAVAILABLE, "interactive guest desktop is not ready"
+            )
 
     # -- internals -------------------------------------------------------------------
+    def _supported_versions(self) -> list[str]:
+        return ["1.0"] if self.config.protocol_version == "1.0" else list(SUPPORTED_VERSIONS)
+
     def _build_envelope(
         self, kind: MessageKind, capability: str, params: dict[str, Any]
     ) -> Envelope:
+        payload: dict[str, Any] = {
+            "capability": capability,
+            "params": params,
+            "session": self.config.target_session,
+            "boot_epoch": self.boot_epoch,
+            "generation": self._generation,
+        }
+        if self._negotiated == "1.1":
+            payload.update(
+                connect_id=self._connect_id,
+                timeout_ms=min(65000, max(1, int(self.config.request_timeout_seconds * 1000))),
+            )
         return Envelope(
             v=self._negotiated or PROTOCOL_VERSION,
             kind=kind.value,
             id=f"req_{uuid.uuid4().hex[:16]}",
+            payload=payload,
+        )
+
+    async def _cancel_request(self, request_id: str) -> None:
+        if self._negotiated != "1.1" or not self.transport.online:
+            return
+        envelope = Envelope(
+            v="1.1",
+            kind=MessageKind.CANCEL,
+            id=request_id,
             payload={
-                "capability": capability,
-                "params": params,
-                "session": self.config.target_session,
+                "connect_id": self._connect_id,
                 "boot_epoch": self.boot_epoch,
                 "generation": self._generation,
             },
         )
+        # Cancellation is best effort. It never changes an unknown outcome to not_sent.
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(min(0.5, self.config.request_timeout_seconds)):
+                await self.transport.send(
+                    encode_frame(envelope.model_dump(), max_bytes=self.config.max_message_bytes)
+                )
 
     async def _request(
         self,
@@ -465,15 +573,32 @@ class BridgeGuestToolBackend:
             raise PaletteError(ErrorCode.GUEST_TOOL_UNAVAILABLE, "the guest channel is offline")
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[envelope.id] = _Pending(future=future, capability=capability)
+        sending = False
         try:
             async with asyncio.timeout(timeout):
                 if on_sending is not None:
                     on_sending()
+                sending = True
                 await self.transport.send(data)
-                return await future
+                reply = await future
+                payload = reply.get("payload", {})
+                response_data = payload.get("data", {}) if isinstance(payload, dict) else {}
+                if (
+                    isinstance(response_data, dict)
+                    and response_data.get("reconnect_required") is True
+                ):
+                    self._service_online = False
+                return reply
+        except asyncio.CancelledError:
+            if sending and capability != "hello":
+                await self._cancel_request(envelope.id)
+            raise
         except Exception as exc:
-            if not isinstance(exc, TimeoutError):
-                self._service_online = False
+            if not sending:
+                raise
+            if capability != "hello":
+                await self._cancel_request(envelope.id)
+            self._service_online = False
             raise PaletteError(
                 ErrorCode.GUEST_TOOL_UNAVAILABLE
                 if capability == "hello"
@@ -494,8 +619,12 @@ class BridgeGuestToolBackend:
         try:
             while not self._closed:
                 try:
-                    chunk = await self.transport.receive(self.config.request_timeout_seconds)
+                    chunk = await self.transport.receive(
+                        min(1.0, self.config.request_timeout_seconds)
+                    )
                 except PaletteError:
+                    if not self.transport.online:
+                        break
                     continue
                 except Exception as exc:
                     logger.info("guest tool channel read failed: %s", exc)
@@ -547,9 +676,12 @@ class BridgeGuestToolBackend:
                 if pending.capability == "hello"
                 else MessageKind.RESPONSE.value
             )
-            if envelope.kind not in {expected, MessageKind.ERROR.value} or envelope.v != (
-                self._negotiated or PROTOCOL_VERSION
-            ):
+            valid_version = (
+                envelope.v in self._supported_versions()
+                if pending.capability == "hello"
+                else envelope.v == self._negotiated
+            )
+            if envelope.kind not in {expected, MessageKind.ERROR.value} or not valid_version:
                 pending.future.set_exception(
                     PaletteError(
                         ErrorCode.GUEST_TOOL_UNAVAILABLE,
@@ -599,6 +731,7 @@ def _outcome_from_reply(reply: dict[str, Any], *, capability: str) -> GuestToolO
         method=response.method,
         launch_id=response.launch_id,
         detail=response.detail,
+        data=response.data,
         error=PaletteError(
             ErrorCode.GUEST_TOOL_UNAVAILABLE,
             response.detail or "the guest operation failed",

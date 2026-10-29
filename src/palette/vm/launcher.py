@@ -20,7 +20,9 @@ import locale
 import logging
 import os
 import re
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
@@ -364,11 +366,14 @@ class ExtraVolume:
     ``virtio-blk-pci`` shape as the instance disk.
     """
 
-    path: str
+    path: str | None
     media: Literal["disk", "cdrom"] = "disk"
     format: str = "raw"
     read_only: bool = True
     boot_index: int | None = None
+    device_id: str | None = None
+    interface: str | None = None
+    use_overlay: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,10 +390,20 @@ class LaunchOverrides:
     image_format: str | None = None
     volumes: tuple[ExtraVolume, ...] = ()
     qemu_args: tuple[str, ...] = ()
+    tools_iso: Path | None = None
+    attach_primary: bool = True
+    create_overlay: bool = True
 
     @property
     def is_empty(self) -> bool:
-        return not (self.image or self.volumes or self.qemu_args)
+        return not (
+            self.image
+            or self.volumes
+            or self.qemu_args
+            or self.tools_iso
+            or not self.attach_primary
+            or not self.create_overlay
+        )
 
     def describe(self) -> list[str]:
         """A shape summary for the audit trail: counts and kinds, never paths."""
@@ -399,6 +414,8 @@ class LaunchOverrides:
             parts.append(f"{len(self.volumes)} volume(s)")
         if self.qemu_args:
             parts.append(f"{len(self.qemu_args)} qemu arg(s)")
+        if self.tools_iso:
+            parts.append("tools CD-ROM")
         return parts
 
 
@@ -414,6 +431,13 @@ class LaunchPlan:
     memory_limit_bytes: int | None = None
     max_runtime_seconds: float | None = None
     host_path_config: bytes | None = None
+    guest_agent_endpoint: str | None = None
+    guest_tools_endpoint: str | None = None
+    webdav_endpoint: str | None = None
+    session_endpoint: str | None = None
+    guest_ipc_directory: Path | None = None
+    qmp_endpoint: str | None = None
+    clipboard_enabled: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -431,6 +455,38 @@ class LaunchPlan:
 #: caller-supplied arguments are scanned, so Palette's own `-chardev stdio,id=qmp` is not a
 #: false positive here.
 _EXTRA_CHANNEL_TOKENS = ("-mon", "-monitor", "monitor=", "-chardev", "vnc", "spice", "telnet")
+
+
+def _available_console_port() -> int:
+    """Ask the OS for a usable loopback port instead of assuming 5900 is bindable.
+
+    QEMU interprets its VNC number as a display offset from 5900. The probe is closed
+    before launch; QEMU's ``to`` range handles ordinary competing binds in that window.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = int(probe.getsockname()[1])
+    except OSError as exc:
+        raise PaletteError(
+            ErrorCode.STARTUP_FAILED,
+            "could not allocate a local display port; check loopback socket permissions",
+            details={"errno": exc.errno},
+        ) from exc
+    if port >= 5900:
+        return port
+
+    # Unusual custom ephemeral ranges can return ports QEMU cannot express as a
+    # non-negative display number. Probe the standard high range in that case.
+    for _ in range(32):
+        port = 49152 + secrets.randbelow(16384)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            continue
+    raise PaletteError(ErrorCode.STARTUP_FAILED, "could not find a free local display port")
 
 
 def _flag_extra_channels(args: Sequence[str], notes: list[str]) -> None:
@@ -481,20 +537,25 @@ def _windows_drive_config(
 
 
 def _extra_volume_args(
-    volumes: Sequence[ExtraVolume], notes: list[str], config_sections: list[str]
+    volumes: Sequence[ExtraVolume], notes: list[str], config_sections: list[str], profile: Profile
 ) -> list[str]:
     """Attach caller-supplied disks and CD-ROMs behind explicit blockdev nodes."""
     if not volumes:
         return []
     argv: list[str] = []
-    if any(volume.media == "cdrom" for volume in volumes):
+    if any(
+        volume.interface == "scsi"
+        or (volume.media == "cdrom" and not volume.device_id and volume.interface is None)
+        for volume in volumes
+    ):
         # Added unconditionally when an optical drive is requested: the controller must not
         # depend on which default devices the machine happens to keep.
         argv += ["-device", "virtio-scsi-pci,id=scsi0"]
+    ide_index = 0
     for index, volume in enumerate(volumes):
-        node = f"extra{index}"
-        native_path = _windows_drive_config(
-            volume.path,
+        node = volume.device_id or f"extra{index}"
+        native_path = bool(volume.path) and _windows_drive_config(
+            volume.path or "",
             {
                 "id": node,
                 "if": "none",
@@ -503,7 +564,7 @@ def _extra_volume_args(
             },
             config_sections,
         )
-        if not native_path:
+        if volume.path and not native_path:
             argv += [
                 "-blockdev",
                 json.dumps(
@@ -526,11 +587,35 @@ def _extra_volume_args(
                     separators=(",", ":"),
                 ),
             ]
-        if volume.media == "cdrom":
-            boot = f",bootindex={volume.boot_index}" if volume.boot_index is not None else ""
-            argv += ["-device", f"scsi-cd,drive={node},bus=scsi0.0{boot}"]
+        interface = volume.interface or (
+            "usb"
+            if volume.device_id and volume.media == "cdrom"
+            else "scsi"
+            if volume.media == "cdrom"
+            else "virtio"
+        )
+        boot = f",bootindex={volume.boot_index}" if volume.boot_index is not None else ""
+        backend = f",drive={node}" if volume.path else ""
+        identity = f",id={node}" if volume.device_id else ""
+        kind = "cd" if volume.media == "cdrom" else "hd"
+        if interface == "usb":
+            argv += ["-device", f"usb-bot,id={node}-usb,bus=xhci.0"]
+            argv += ["-device", f"scsi-{kind}{identity}{backend},bus={node}-usb.0{boot}"]
+        elif interface == "scsi":
+            argv += ["-device", f"scsi-{kind}{identity}{backend},bus=scsi0.0{boot}"]
+        elif interface == "ide":
+            q35 = profile.qemu.machine.split(",")[0].startswith(("q35", "pc-q35"))
+            if profile.qemu.arch != "x86_64" or ide_index >= (6 if q35 else 4):
+                raise PaletteError(ErrorCode.INVALID_ARGUMENT, "IDE 设备数量或机器类型不受支持")
+            bus, unit = (ide_index, 0) if q35 else (ide_index // 2, ide_index % 2)
+            argv += ["-device", f"ide-{kind}{identity}{backend},bus=ide.{bus},unit={unit}{boot}"]
+            ide_index += 1
+        elif interface == "nvme" and volume.media == "disk":
+            argv += ["-device", f"nvme{identity}{backend},serial={node}{boot}"]
+        elif interface == "virtio" and volume.media == "disk":
+            argv += ["-device", f"virtio-blk-pci,drive={node}{identity}{boot}"]
         else:
-            argv += ["-device", f"virtio-blk-pci,drive={node}"]
+            raise PaletteError(ErrorCode.INVALID_ARGUMENT, "不支持的磁盘接口或介质类型")
         notes.append(f"attached a caller-supplied {volume.media}")
     return argv
 
@@ -547,8 +632,11 @@ def build_launch_plan(
     accelerator: str | None = None,
     start_paused: bool = True,
     managed_console: bool = False,
+    clipboard_available: bool = True,
+    tools_iso: Path | None = None,
     extra_volumes: Sequence[ExtraVolume] = (),
     caller_args: Sequence[str] = (),
+    attach_primary: bool = True,
 ) -> LaunchPlan:
     """Compose QEMU's arguments from the profile plus anything the caller supplied.
 
@@ -575,7 +663,64 @@ def build_launch_plan(
         argv += ["-cpu", qemu.cpu]
     argv += ["-nodefaults", "-display", "none"]
     if managed_console:
-        argv += ["-vnc", "127.0.0.1:0,to=99,password=on,share=force-shared"]
+        vnc_port = _available_console_port()
+        if not 5900 <= vnc_port <= 65535:
+            raise PaletteError(ErrorCode.STARTUP_FAILED, "invalid local display port")
+        vnc_display = vnc_port - 5900
+        last_display = min(vnc_port + 99, 65535) - 5900
+        argv += [
+            "-vnc",
+            f"127.0.0.1:{vnc_display},to={last_display},password=on,share=force-shared",
+        ]
+    clipboard_enabled = managed_console and profile.guest_desktop.clipboard and clipboard_available
+    endpoints: dict[str, str] = {}
+    ipc_directory: Path | None = None
+    if (
+        profile.guest_agent.enabled
+        or profile.guest_tools.enabled
+        or clipboard_enabled
+        or profile.guest_desktop.shared_folders
+        or profile.guest_desktop.resize
+    ):
+        argv += ["-device", "virtio-serial-pci,id=palette-serial"]
+    for key, enabled, port in (
+        ("qga", profile.guest_agent.enabled, "org.qemu.guest_agent.0"),
+        ("tools", profile.guest_tools.enabled, "org.palette.tools.0"),
+        ("webdav", profile.guest_desktop.shared_folders, "org.spice-space.webdav.0"),
+        ("session", profile.guest_desktop.resize, "org.palette.desktop.0"),
+    ):
+        if not enabled:
+            continue
+        if IS_WINDOWS:
+            from ..windows_unix import endpoint_directory, validate_endpoint
+
+            if ipc_directory is None:
+                ipc_directory = endpoint_directory()
+            endpoint = ipc_directory / f"{key}.sock"
+            validate_endpoint(str(endpoint))
+            endpoints[key] = str(endpoint)
+            path = str(endpoint).replace("\\", "/").replace(",", ",,")
+            backend = f"socket,id=palette-{key},path={path},server=on,wait=off"
+        else:
+            endpoints[key] = str(workdir / f"{key}.sock")
+            backend = f"socket,id=palette-{key},path={key}.sock,server=on,wait=off"
+        argv += [
+            "-chardev",
+            backend,
+            "-device",
+            f"virtserialport,id=palette-{key}-port,bus=palette-serial.0,"
+            f"chardev=palette-{key},name={port}",
+        ]
+    if clipboard_enabled:
+        argv += [
+            "-chardev",
+            "qemu-vdagent,id=palette-vdagent,clipboard=on,mouse=off",
+            "-device",
+            "virtserialport,id=palette-vdagent-port,bus=palette-serial.0,"
+            "chardev=palette-vdagent,name=com.redhat.spice.0",
+        ]
+    elif profile.guest_desktop.clipboard:
+        notes.append("clipboard enhancement unavailable; base display and input remain available")
     nic = network.qemu_nic_argument()
     if qemu.arch == "aarch64" and network.attaches_nic and "model=" not in nic:
         nic += ",model=virtio-net-pci"
@@ -644,22 +789,59 @@ def build_launch_plan(
         f"head={devices.head}",
     ]
 
-    argv += _block_args(
-        overlay_path=overlay_path,
-        profile=profile,
-        notes=notes,
-        config_sections=config_sections,
-        boot_index=1 if any(volume.boot_index == 0 for volume in extra_volumes) else 0,
-    )
-    argv += _extra_volume_args(extra_volumes, notes, config_sections)
+    if attach_primary:
+        argv += _block_args(
+            overlay_path=overlay_path,
+            profile=profile,
+            notes=notes,
+            config_sections=config_sections,
+            boot_index=1 if any(volume.boot_index == 0 for volume in extra_volumes) else 0,
+        )
+    argv += _extra_volume_args(extra_volumes, notes, config_sections, profile)
+    if tools_iso is not None:
+        options = {
+            "id": "palette-tools",
+            "if": "none",
+            "media": "cdrom",
+            "readonly": "on",
+            "format": "raw",
+        }
+        if not _windows_drive_config(str(tools_iso), options, config_sections):
+            # QemuOpts doubles literal commas; -drive does not accept JSON.
+            argv += [
+                "-drive",
+                ",".join(
+                    f"{key}={value.replace(',', ',,')}"
+                    for key, value in {**options, "file": str(tools_iso)}.items()
+                ),
+            ]
+        argv += [
+            "-device",
+            "usb-bot,id=palette-tools-usb,bus=xhci.0",
+            "-device",
+            "scsi-cd,id=palette-tools-cd,drive=palette-tools,bus=palette-tools-usb.0",
+        ]
     if config_sections:
         # Relative to cwd so a non-ASCII runtime directory is never sent via argv.
         argv += ["-readconfig", "qemu-host-paths.conf"]
         notes.append("Windows host paths loaded through a native-codepage drive config")
 
-    # QMP over the child's own stdin/stdout, never a socket. ``signal=off`` keeps QEMU
-    # from installing host signal handlers around our channel.
-    argv += ["-chardev", "stdio,id=qmp,signal=off", "-mon", "chardev=qmp,mode=control"]
+    # Windows stdio drops bytes when the monitor applies backpressure. A private
+    # socket preserves framing under concurrent input, capture and status commands.
+    qmp_endpoint = None
+    if IS_WINDOWS:
+        from ..windows_unix import endpoint_directory, validate_endpoint
+
+        if ipc_directory is None:
+            ipc_directory = endpoint_directory()
+        endpoint = ipc_directory / "qmp.sock"
+        validate_endpoint(str(endpoint))
+        qmp_endpoint = str(endpoint)
+        path = str(endpoint).replace("\\", "/").replace(",", ",,")
+        qmp_backend = f"socket,id=qmp,path={path},server=on,wait=off"
+    else:
+        qmp_backend = "stdio,id=qmp,signal=off"
+    argv += ["-chardev", qmp_backend, "-mon", "chardev=qmp,mode=control"]
     argv += list(qemu.extra_args)
     argv += list(caller_args)
     if caller_args:
@@ -685,6 +867,13 @@ def build_launch_plan(
         host_path_config=(
             "\n".join(config_sections).encode(locale.getencoding()) if config_sections else None
         ),
+        guest_agent_endpoint=endpoints.get("qga"),
+        guest_tools_endpoint=endpoints.get("tools"),
+        webdav_endpoint=endpoints.get("webdav"),
+        session_endpoint=endpoints.get("session"),
+        guest_ipc_directory=ipc_directory,
+        qmp_endpoint=qmp_endpoint,
+        clipboard_enabled=clipboard_enabled,
     )
 
 
@@ -743,9 +932,9 @@ async def spawn_qemu(
 ) -> ManagedProcess:
     """Start QEMU detached from Palette's own standard streams.
 
-    ``stdin``/``stdout`` are the QMP pipe; MCP's stdout must stay clean, so QEMU's
-    diagnostics go to a separate ``stderr`` pipe that the manager consumes continuously
-    (an unread stderr pipe would eventually block the guest).
+    POSIX uses child stdin/stdout for QMP; Windows uses a private AF_UNIX monitor
+    with stdin disconnected and stdout drained separately. Diagnostics stay on
+    stderr, which the manager also consumes continuously.
     """
     task = asyncio.create_task(_spawn_qemu(plan, on_spawn=on_spawn))
     try:
@@ -779,6 +968,10 @@ async def _dispose_spawned(process: ManagedProcess) -> None:
 async def _spawn_qemu(
     plan: LaunchPlan, *, on_spawn: Callable[[ManagedProcess], None] | None = None
 ) -> ManagedProcess:
+    if plan.guest_ipc_directory is not None:
+        from ..windows_unix import prepare_directory
+
+        prepare_directory(plan.guest_ipc_directory)
     if plan.host_path_config is not None:
         try:
             (plan.cwd / "qemu-host-paths.conf").write_bytes(plan.host_path_config)
@@ -791,7 +984,7 @@ async def _spawn_qemu(
             return await _spawn_supervisor(plan, on_spawn=on_spawn)
         process = await asyncio.create_subprocess_exec(
             *plan.argv,
-            stdin=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL if plan.qmp_endpoint else asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(plan.cwd),

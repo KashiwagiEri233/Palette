@@ -60,8 +60,10 @@ class TestStart:
         assert any(argument.startswith("VGA,id=video0") for argument in argv)
         assert any("usb-tablet" in argument for argument in argv)
         assert any("usb-kbd" in argument for argument in argv)
-        # QMP lives on the child's own stdio, never on a socket.
-        assert "stdio,id=qmp,signal=off" in argv
+        if running_vm.plan.qmp_endpoint is None:
+            assert "stdio,id=qmp,signal=off" in argv
+        else:
+            assert any(argument.startswith("socket,id=qmp,") for argument in argv)
         assert not any("vnc" in argument.lower() for argument in argv)
 
     async def test_the_overlay_points_at_the_base_image(self, running_vm, base_image: Path) -> None:

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Palette Display Integration
+Exec=/usr/bin/python3 /usr/local/lib/palette/palette-auto-resize.py
+OnlyShowIn=XFCE;GNOME;MATE;LXDE;LXQt;
+NoDisplay=true
+Terminal=false

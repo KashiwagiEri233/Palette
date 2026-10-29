@@ -64,6 +64,13 @@ COMMANDS = [
     "set_password",
     "query-cpus-fast",
     "query-block",
+    "blockdev-change-medium",
+    "blockdev-add",
+    "blockdev-del",
+    "query-named-block-nodes",
+    "device_add",
+    "device_del",
+    "eject",
     "qom-list",
     "input-send-event",
     "screendump",
@@ -102,6 +109,30 @@ class FakeQemu:
         self.events: list[str] = []
         self.vnc_password = ""
         self.vnc_port: int | None = None
+        self.tools_drive = any("id=palette-tools," in item for item in argv)
+        self.tools_file: str | None = None
+        self.tools_node: str | None = None
+        self.tools_nodes: dict[str, dict] = {}
+        self.tools_usb = any("id=palette-tools-usb," in item for item in argv)
+        self.other_blocks: list[dict] = []
+        for index, value in enumerate(argv):
+            if value == "-blockdev":
+                node = json.loads(argv[index + 1])
+                if node.get("driver") == "file" and node.get("node-name", "").startswith("extra"):
+                    self.other_blocks.append(
+                        {
+                            "device": node["node-name"],
+                            "qdev": "/machine/peripheral/system-cd",
+                            "removable": True,
+                            "inserted": {"file": node["filename"], "ro": True},
+                        }
+                    )
+            elif value == "-drive" and "id=palette-tools," in argv[index + 1]:
+                options = argv[index + 1].replace(",,", "\0").split(",")
+                self.tools_file = next(
+                    (item[5:].replace("\0", ",") for item in options if item.startswith("file=")),
+                    None,
+                )
         if "-vnc" in argv:
             self.start_vnc()
 
@@ -191,6 +222,7 @@ class FakeQemu:
 
     # -- configuration ---------------------------------------------------------------
     def _find_overlay_path(self) -> str | None:
+        first = None
         for index, arg in enumerate(self.argv):
             if arg == "-blockdev" and index + 1 < len(self.argv):
                 try:
@@ -199,8 +231,11 @@ class FakeQemu:
                     continue
                 filename = node.get("filename")
                 if filename:
-                    return str(filename)
-        return None
+                    if node.get("node-name") == "drive-primary-file":
+                        return str(filename)
+                    if first is None:
+                        first = str(filename)
+        return first
 
     def behavior(self) -> dict:
         if not self.behavior_path or not os.path.isfile(self.behavior_path):
@@ -284,8 +319,83 @@ class FakeQemu:
             )
         elif command == "query-cpus-fast":
             self.reply(message_id, [{"cpu-index": 0, "target": "x86_64", "thread-id": os.getpid()}])
-        elif command == "query-block" or command == "qom-list":
-            self.reply(message_id, [])
+        elif command == "query-block":
+            block = {
+                "device": "" if self.tools_node else "palette-tools",
+                "qdev": "palette-tools-cd",
+                "removable": True,
+            }
+            if self.tools_file:
+                block["inserted"] = {
+                    "file": self.tools_file,
+                    "ro": True,
+                    "node-name": self.tools_node,
+                }
+            self.reply(
+                message_id,
+                self.other_blocks
+                + (
+                    [block]
+                    if self.tools_drive and not self.behavior().get("tools_drive_missing")
+                    else []
+                ),
+            )
+        elif command == "query-named-block-nodes":
+            self.reply(message_id, list(self.tools_nodes.values()))
+        elif command == "blockdev-add":
+            if arguments["node-name"] in self.tools_nodes:
+                self.send(
+                    {"id": message_id, "error": {"class": "GenericError", "desc": "duplicate node"}}
+                )
+            else:
+                self.tools_nodes[arguments["node-name"]] = arguments
+                self.reply(message_id, {})
+        elif command == "blockdev-del":
+            self.tools_nodes.pop(arguments["node-name"], None)
+            self.reply(message_id, {})
+        elif command == "device_add":
+            if self.behavior().get("tools_add_fail") == arguments["driver"]:
+                self.send(
+                    {"id": message_id, "error": {"class": "GenericError", "desc": "hotplug failed"}}
+                )
+            else:
+                if arguments["driver"] == "usb-bot":
+                    self.tools_usb = True
+                elif arguments["driver"] == "scsi-cd":
+                    self.tools_drive = True
+                    self.tools_node = arguments["drive"]
+                    self.tools_file = self.tools_nodes[self.tools_node]["file"]["filename"]
+                self.reply(message_id, {})
+        elif command == "device_del":
+            self.tools_usb = False
+            self.reply(message_id, {})
+        elif command in {"blockdev-change-medium", "eject"}:
+            behavior = self.behavior()
+            if behavior.get("tools_media_fail"):
+                self.send(
+                    {
+                        "id": message_id,
+                        "error": {"class": "GenericError", "desc": "media is locked"},
+                    }
+                )
+            else:
+                if command != "eject" or not behavior.get("tools_eject_ignored"):
+                    self.tools_file = (
+                        arguments.get("filename") if command == "blockdev-change-medium" else None
+                    )
+                self.reply(message_id, {})
+        elif command == "qom-list":
+            self.reply(
+                message_id,
+                [
+                    {"name": name, "type": kind}
+                    for name, kind, present in (
+                        ("palette-tools-usb", "child<usb-bot>", self.tools_usb),
+                        ("palette-tools-cd", "child<scsi-cd>", self.tools_drive),
+                    )
+                    if present
+                ],
+            )
         elif command == "input-send-event":
             self.reply(message_id, {})
             behavior = self.behavior()
@@ -316,7 +426,7 @@ class FakeQemu:
         elif command == "system_powerdown":
             self.reply(message_id, {})
             self.send_event("POWERDOWN")
-            if self.behavior().get("ignore_powerdown"):
+            if self.paused or self.behavior().get("ignore_powerdown"):
                 # A guest that does not shut down: the manager must fall through to the
                 # forced path rather than waiting forever or claiming success.
                 return
@@ -455,6 +565,41 @@ def render_png(width: int, height: int, *, frame: int) -> bytes:
     )
 
 
+def socket_monitor(argv: list[str]):
+    option = next((arg for arg in argv if arg.startswith("socket,id=qmp,path=")), None)
+    if option is None:
+        return None
+    options = option.replace(",,", "\0").split(",")
+    endpoint = next(item[5:].replace("\0", ",") for item in options if item.startswith("path="))
+    with socket.socket(1, socket.SOCK_STREAM) as listener:
+        if os.name == "nt":
+            import ctypes
+
+            class Address(ctypes.Structure):
+                _fields_ = [("family", ctypes.c_ushort), ("path", ctypes.c_char * 108)]
+
+            library = ctypes.WinDLL("ws2_32")
+            bind = library.bind
+            bind.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int]
+            bind.restype = ctypes.c_int
+            accept = library.accept
+            accept.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+            accept.restype = ctypes.c_size_t
+            address = Address(family=1, path=endpoint.encode("utf-8"))
+            if bind(listener.fileno(), ctypes.byref(address), ctypes.sizeof(address)):
+                raise OSError("fake QEMU could not bind its QMP socket")
+            listener.listen(1)
+            handle = accept(listener.fileno(), None, None)
+            if handle == ctypes.c_size_t(-1).value:
+                raise OSError("fake QEMU could not accept its QMP peer")
+            connection = socket.socket(1, socket.SOCK_STREAM, fileno=handle)
+        else:
+            listener.bind(endpoint)
+            listener.listen(1)
+            connection, _ = listener.accept()
+    return connection.makefile("rw", encoding="utf-8")
+
+
 def main(argv: list[str]) -> int:
     if "--version" in argv:
         print(f"QEMU emulator version {VERSION} (fake test double)")
@@ -466,12 +611,20 @@ def main(argv: list[str]) -> int:
         sys.stdout.write(DEVICE_HELP)
         for name in (
             "virtio-gpu-pci",
+            "virtio-vga",
             "ramfb",
             "virtio-net-pci",
             "e1000",
             "rtl8139",
             "intel-hda",
             "hda-output",
+            "usb-bot",
+            "scsi-cd",
+            "scsi-hd",
+            "virtio-scsi-pci",
+            "ide-hd",
+            "ide-cd",
+            "nvme",
         ):
             print(f'name "{name}"')
         return 0
@@ -483,6 +636,9 @@ def main(argv: list[str]) -> int:
         print("Available audio drivers:\ncoreaudio\ndsound\npipewire\npa\nalsa")
         return 0
 
+    monitor = socket_monitor(argv)
+    if monitor is not None:
+        sys.stdin = sys.stdout = monitor
     qemu = FakeQemu(argv)
 
     def on_signal(signum, _frame):

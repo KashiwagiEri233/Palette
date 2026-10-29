@@ -247,6 +247,11 @@ button:disabled { cursor: default; }
 .agent-message-tool, .agent-message-system { color: var(--muted-foreground); font-size: 13px; }
 .agent-run-status { padding: 8px 24px; color: var(--muted-foreground); font-size: 12px; }
 .agent-run-status p { color: var(--destructive); margin-top: 4px; }
+.copy-debug-info { flex-shrink: 0; white-space: nowrap; }
+.error-with-debug-info { display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
+.error-with-debug-info > span { flex: 1; min-width: 160px; overflow-wrap: anywhere; }
+.agent-run-error, .agent-provider-error { display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
+.agent-run-error p, .agent-provider-error > span { flex: 1; min-width: 160px; overflow-wrap: anywhere; }
 .environment-results h2 { margin-bottom: 16px; }
 .command-dialog { padding: 0; gap: 0; overflow: hidden; }
 .command-dialog [cmdk-input-wrapper] { padding-right: 52px; }

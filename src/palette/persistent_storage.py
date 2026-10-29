@@ -91,33 +91,97 @@ class PersistentStorage:
                 ErrorCode.IMAGE_INVALID, "invalid disk expansion journal; startup blocked"
             ) from exc
         definition = self.get(vm_id)
-        storage = self.paths(definition)
-        if storage is None or record["overlay"] != str(storage.overlay):
+        target, image_format, storage = self._resize_target(definition, record["drive_id"])
+        if target is None or record["overlay"] != str(target):
             raise PaletteError(ErrorCode.IMAGE_INVALID, "扩容记录与受管理磁盘不一致")
         images = self.service.manager.images_for(definition.profile)
-        info = await images.inspect_image(storage.overlay, image_format="qcow2")
+        info = await images.inspect_image(target, image_format=image_format)
         if [str(entry) for entry in info.chain] != record["chain"] or info.virtual_size not in {
             record["before_bytes"],
             record["target_bytes"],
         }:
             raise PaletteError(ErrorCode.IMAGE_INVALID, "扩容后磁盘容量或 backing chain 无法确认")
-        code, _, _ = await run_tool(
-            [*images.qemu_img_argv, "check", "-q", "-f", "qcow2", str(storage.overlay)], timeout=120
-        )
+        code = 0
+        if image_format == "qcow2":
+            code, _, _ = await run_tool(
+                [*images.qemu_img_argv, "check", "-q", "-f", image_format, str(target)],
+                timeout=120,
+            )
         if code:
             raise PaletteError(ErrorCode.IMAGE_INVALID, "磁盘完整性检查失败; 已阻止启动")
         if info.virtual_size == record["target_bytes"]:
-            if definition.draft.disk_gib != record["disk_gib"]:
-                self._commit_capacity(definition, record["disk_gib"])
-            images.update_manifest(storage, {"virtual_size": info.virtual_size})
+            if self._capacity(definition, record["drive_id"]) != record["disk_gib"]:
+                self._commit_capacity(definition, record["disk_gib"], record["drive_id"])
+            if storage is not None:
+                images.update_manifest(storage, {"virtual_size": info.virtual_size})
         path.unlink()
         sync_directory(path.parent)
 
-    def _commit_capacity(self, definition: VmDefinition, disk_gib: int) -> None:
-        draft = definition.draft.model_copy(update={"disk_gib": disk_gib})
-        profile = definition.profile.model_copy(
-            update={"images": definition.profile.images.model_copy(update={"size_gib": disk_gib})}
+    def _capacity(self, definition: VmDefinition, drive_id: str) -> int:
+        from .primary_drive import PRIMARY_DRIVE_ID
+
+        return (
+            definition.draft.disk_gib
+            if drive_id == PRIMARY_DRIVE_ID
+            else (definition.data_disks[drive_id].size_gib)
         )
+
+    def _resize_target(
+        self, definition: VmDefinition, drive_id: str
+    ) -> tuple[Path | None, str, InstancePaths | None]:
+        from .primary_drive import PRIMARY_DRIVE_ID, primary_present
+
+        if drive_id == PRIMARY_DRIVE_ID and primary_present(definition):
+            storage = self.paths(definition)
+            return storage.overlay if storage else None, "qcow2", storage
+        record = definition.data_disks.get(drive_id)
+        if record is None or record.deleting:
+            raise PaletteError(ErrorCode.INVALID_ARGUMENT, "请选择尚未删除的受管磁盘")
+        path = self.guard.resolve(
+            "vms",
+            definition.vm_id,
+            record.owner,
+            "disk",
+            "disk.raw" if record.format == "raw" else "overlay.qcow2",
+        )
+        images = self.service.manager.images_for(definition.profile)
+        manifest = images.read_manifest(definition.vm_id, record.owner)
+        if not path.is_file() or not manifest or manifest.get("data_drive_id") != drive_id:
+            raise PaletteError(ErrorCode.IMAGE_MISSING, "受管磁盘文件或归属信息缺失")
+        return path, record.format, None
+
+    def _commit_capacity(
+        self, definition: VmDefinition, disk_gib: int, drive_id: str = "drive-primary"
+    ) -> None:
+        from .primary_drive import PRIMARY_DRIVE_ID
+
+        draft = definition.draft
+        profile = definition.profile
+        records = dict(definition.data_disks)
+        if drive_id == PRIMARY_DRIVE_ID:
+            draft = draft.model_copy(update={"disk_gib": disk_gib})
+            profile = profile.model_copy(
+                update={"images": profile.images.model_copy(update={"size_gib": disk_gib})}
+            )
+        else:
+            records[drive_id] = records[drive_id].model_copy(
+                update={"size_gib": disk_gib, "virtual_size": disk_gib * 1024**3}
+            )
+        if draft.settings is not None:
+            draft = draft.model_copy(
+                update={
+                    "settings": draft.settings.model_copy(
+                        update={
+                            "drives": [
+                                drive.model_copy(update={"size_gib": disk_gib})
+                                if drive.id == drive_id
+                                else drive
+                                for drive in draft.settings.drives
+                            ]
+                        }
+                    )
+                }
+            )
         self._save(
             definition.model_copy(
                 update={
@@ -125,6 +189,7 @@ class PersistentStorage:
                     "revision": definition.revision + 1,
                     "draft": draft,
                     "profile": profile,
+                    "data_disks": records,
                     "updated_at": datetime.now(UTC).isoformat(),
                 }
             )
@@ -140,11 +205,11 @@ class PersistentStorage:
             except ValidationError as exc:
                 raise self._validation_error(exc) from exc
             self._revision(definition, request.revision)
-            if request.disk_gib <= definition.draft.disk_gib:
+            target, image_format, _storage = self._resize_target(definition, request.drive_id)
+            if request.disk_gib <= self._capacity(definition, request.drive_id):
                 raise PaletteError(ErrorCode.INVALID_ARGUMENT, "磁盘只能扩容; 不能缩小或保持原容量")
             images = self.service.manager.images_for(definition.profile)
-            storage = self.paths(definition)
-            if storage is None:
+            if target is None:
                 base = (
                     await images.inspect_image(Path(definition.profile.images.base))
                     if definition.draft.source == "image"
@@ -152,21 +217,24 @@ class PersistentStorage:
                 )
                 if base and request.disk_gib * 1024**3 < base.virtual_size:
                     raise PaletteError(ErrorCode.INVALID_ARGUMENT, "容量不能小于基础镜像")
-                self._commit_capacity(definition, request.disk_gib)
+                self._commit_capacity(definition, request.disk_gib, request.drive_id)
             else:
-                info = await images.inspect_image(storage.overlay, image_format="qcow2")
+                info = await images.inspect_image(target, image_format=image_format)
                 if request.disk_gib * 1024**3 <= info.virtual_size:
                     raise PaletteError(ErrorCode.INVALID_ARGUMENT, "目标容量必须大于实盘容量")
-                code, _, _ = await run_tool(
-                    [*images.qemu_img_argv, "check", "-q", "-f", "qcow2", str(storage.overlay)],
-                    timeout=120,
-                )
+                code = 0
+                if image_format == "qcow2":
+                    code, _, _ = await run_tool(
+                        [*images.qemu_img_argv, "check", "-q", "-f", image_format, str(target)],
+                        timeout=120,
+                    )
                 if code:
                     raise PaletteError(ErrorCode.IMAGE_INVALID, "原磁盘完整性检查失败; 未执行扩容")
                 self._write_operation(
                     self.operation_path(vm_id),
                     {
-                        "overlay": str(storage.overlay),
+                        "overlay": str(target),
+                        "drive_id": request.drive_id,
                         "chain": [str(entry) for entry in info.chain],
                         "before_bytes": info.virtual_size,
                         "target_bytes": request.disk_gib * 1024**3,
@@ -180,14 +248,17 @@ class PersistentStorage:
                             *images.qemu_img_argv,
                             "resize",
                             "-f",
-                            "qcow2",
-                            str(storage.overlay),
+                            image_format,
+                            str(target),
                             f"{request.disk_gib}G",
                         ],
                         timeout=120,
                     )
                     await self.recover_resize(vm_id)
-                    if code or self.get(vm_id).draft.disk_gib != request.disk_gib:
+                    if (
+                        code
+                        or self._capacity(self.get(vm_id), request.drive_id) != request.disk_gib
+                    ):
                         raise PaletteError(
                             ErrorCode.IMAGE_INVALID, "磁盘扩容失败; 请检查当前实盘容量后重试"
                         )
@@ -195,7 +266,8 @@ class PersistentStorage:
                 await finish_cleanup(asyncio.create_task(resize()))
             return {
                 "revision": self.get(vm_id).revision,
-                "disk_gib": self.get(vm_id).draft.disk_gib,
+                "disk_gib": self._capacity(self.get(vm_id), request.drive_id),
+                "drive_id": request.drive_id,
             }
 
     def require_stopped(self, vm_id: str) -> None:
@@ -212,6 +284,8 @@ class PersistentStorage:
             self.paths(definition)
 
     def paths(self, definition: VmDefinition) -> InstancePaths | None:
+        from .primary_drive import primary_present
+
         owner = definition.storage_owner
         if owner is None:
             return None
@@ -224,7 +298,9 @@ class PersistentStorage:
         root = self.guard.resolve("vms", definition.vm_id, owner)
         overlay = self.guard.resolve("vms", definition.vm_id, owner, "disk", "overlay.qcow2")
         variables = self.guard.resolve("vms", definition.vm_id, owner, "disk", "vars.fd")
-        if not overlay.is_file() or (record.get("hardware_vars") and not variables.is_file()):
+        if (primary_present(definition) and not overlay.is_file()) or (
+            record.get("hardware_vars") and not variables.is_file()
+        ):
             raise PaletteError(
                 ErrorCode.IMAGE_MISSING, "persistent disk or UEFI variables are missing"
             )
@@ -241,7 +317,13 @@ class PersistentStorage:
         )
 
     async def seed(self, definition: VmDefinition) -> VmDefinition:
-        if definition.draft.source != "iso" or definition.seed_owner is not None:
+        from .primary_drive import primary_present
+
+        if (
+            not primary_present(definition)
+            or definition.draft.source != "iso"
+            or definition.seed_owner is not None
+        ):
             return definition
         images = self.service.manager.images_for(definition.profile)
         paths = images.allocate_instance(definition.vm_id, "seed_" + uuid.uuid4().hex[:12])

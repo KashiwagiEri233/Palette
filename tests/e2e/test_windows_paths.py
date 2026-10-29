@@ -15,7 +15,7 @@ import pytest
 
 from palette.config import load_config
 from palette.qmp.client import QmpClient
-from palette.qmp.transport import ProcessQmpTransport
+from palette.qmp.transport import connect_process_qmp
 from palette.vm.images import resolve_qemu_img
 from palette.vm.launcher import ExtraVolume, build_launch_plan, run_tool, spawn_qemu
 from palette.vm.managed import terminate_process_group
@@ -54,7 +54,7 @@ async def test_real_qemu_opens_chinese_paths_without_changing_media_flags(tmp_pa
         extra_volumes=(ExtraVolume(path=str(media), media="cdrom", boot_index=0),),
     )
     process = await spawn_qemu(plan)
-    qmp = QmpClient(ProcessQmpTransport(process))
+    qmp = QmpClient(await connect_process_qmp(process, plan.qmp_endpoint, timeout=10))
     try:
         await qmp.start()
         assert (await qmp.execute("query-status"))["running"] is False
@@ -72,4 +72,21 @@ async def test_real_qemu_opens_chinese_paths_without_changing_media_flags(tmp_pa
             assert await asyncio.to_thread(terminate_process_group, process.pid)
             await asyncio.wait_for(process.wait(), 10)
         await qmp.close()
+        if plan.guest_ipc_directory is not None:
+            from palette.windows_unix import cleanup_directory
+
+            cleanup_directory(
+                plan.guest_ipc_directory,
+                [
+                    endpoint
+                    for endpoint in (
+                        plan.qmp_endpoint,
+                        plan.guest_agent_endpoint,
+                        plan.guest_tools_endpoint,
+                        plan.webdav_endpoint,
+                        plan.session_endpoint,
+                    )
+                    if endpoint is not None
+                ],
+            )
     assert media.read_bytes() == b"\0" * (1024 * 1024)

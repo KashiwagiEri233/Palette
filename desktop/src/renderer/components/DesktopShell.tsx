@@ -27,9 +27,10 @@ interface Props {
   onForward(): void
   canBack: boolean
   canForward: boolean
+  vmId?: string
 }
 
-export function DesktopShell({ preferences, onPreferences, rail, navigation, children, onSearch, onBack, onForward, canBack, canForward }: Props) {
+export function DesktopShell({ preferences, onPreferences, rail, navigation, children, onSearch, onBack, onForward, canBack, canForward, vmId }: Props) {
   const width = useViewportWidth()
   const hasNavigation = navigation != null
   const sidebarHidden = !hasNavigation || preferences.sidebarHidden
@@ -48,7 +49,7 @@ export function DesktopShell({ preferences, onPreferences, rail, navigation, chi
     <header className="desktop-titlebar">
       <div className="titlebar-history"><IconButton label="后退" disabled={!canBack} onClick={onBack}><ArrowLeft size={16} /></IconButton><IconButton label="前进" disabled={!canForward} onClick={onForward}><ArrowRight size={16} /></IconButton></div>
       {hasNavigation && <IconButton label={preferences.sidebarHidden ? '展开侧栏' : '收起侧栏'} onClick={() => onPreferences({ sidebarHidden: !preferences.sidebarHidden })}><PanelLeft size={16} /></IconButton>}
-      <IconButton label="应用菜单" onClick={() => void window.palette.request('window.command', undefined, { action: 'menu' })}><Menu size={16} /></IconButton>
+      <IconButton label="应用菜单" onClick={() => void window.palette.request('window.command', vmId, { action: 'menu' })}><Menu size={16} /></IconButton>
       <div className="titlebar-center" />
       <IconButton label="搜索虚拟机和会话" onClick={onSearch}><Search size={16} /></IconButton>
     </header>

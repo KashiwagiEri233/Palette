@@ -33,7 +33,7 @@ The chat selector only offers providers with an application-saved API Key and at
 
 The chat supports streaming Markdown replies, including headings, lists, code blocks, quotes and tables, as well as Stop and manual/automatic context compaction. The model selector on the right of the composer shows the current model and effort. Open it to search models grouped by provider or choose a reasoning effort. Models without reasoning support show Off and disable the effort option. Selections are saved to the global Agent configuration; changes are disabled during a run or compaction. API keys and custom endpoints remain under Settings → Agent. Hover over or click the context ring to its left to see estimated token usage, remaining capacity and the manual compaction action. Compaction is disabled while running or for empty/read-only conversations; usage may remain unknown after compaction until the next model response. The conversation no longer shows a branch navigation button. Web links open in the system browser after validation; raw HTML and automatic remote image loading are disabled. Switching pages keeps tasks running. Human takeover stops the VM's built-in task before acquiring control. Only one Agent run may drive a VM at a time; other clients can still observe. Closing the app stops its Agent tasks while the background option keeps the daemon and VMs running. Interrupted tasks never resume automatically.
 
-API Keys are encrypted through the operating system's secure storage; when that facility is unavailable they are kept only in memory. Conversations use pi JSONL files in the configuration-scoped application data directory. The default tool-call limit is 100, configurable from 1 to 1000. Guest shell execution and file read/write/edit remain **unavailable adapter placeholders**; automatic approvals, step replay, OAuth and third-party extension installation are not implemented.
+API Keys are encrypted through the operating system's secure storage; when that facility is unavailable they are kept only in memory. Conversations use pi JSONL files in the configuration-scoped application data directory. The default tool-call limit is 100, configurable from 1 to 1000. The built-in Agent directly calls optional Unicode input, guest clipboard, QGA binary transfers and Windows filesystem/PowerShell/process/registry/App/UIA/batch tools; live availability is reported per VM. See [guest enhancements](guest-enhancements.md). Automatic approvals, step replay, OAuth and third-party extension installation are not implemented.
 
 Minimum window size is1100×700. Below1280px navigation becomes a VM icon strip; below1100 effective CSS pixels the workspace is a drawer. Drag separators or double-click to reset. Layout and light/dark/system preferences persist locally. Ctrl+N creates a conversation, Ctrl+K opens commands, Ctrl+B toggles navigation, and Ctrl+J toggles workspace; macOS uses Cmd equivalents. Ctrl+Alt releases human control, with Ctrl+Alt+G retained; the UI action is “结束控制”.
 
@@ -78,7 +78,23 @@ npm --prefix desktop run preview
 
 ### VM Creation Wizard
 
-You can create a persistent VM from two source types:
+Every creation entry uses four steps: **Choose configuration → Choose source → Configure VM → Confirm creation**.
+
+First select a **Preset** or **Custom** configuration. Presets offer Windows and Linux guests in x86_64 or ARM64; Custom retains trusted Profile selection. Guest presets are independent of host execution profiles: a Linux guest on a Windows host still uses the appropriate Windows-host accelerator. TCG requires explicit software-emulation selection. Targets without a matching Profile show a reason and never silently switch accelerators.
+
+| Suggested configuration | Windows | Linux |
+| --- | --- | --- |
+| CPU / RAM / disk | 4 cores / 8 GiB / 80 GiB | 2 cores / 4 GiB / 32 GiB |
+| x86_64 display / NIC | VirtIO VGA / e1000 | VirtIO VGA / VirtIO Net |
+| ARM64 display / NIC | RAMFB / VirtIO Net | VirtIO GPU / VirtIO Net |
+
+The x86_64 presets prefer `virtio-vga`; if absent from the selected QEMU, Windows uses `VGA` and Linux uses `virtio-gpu-pci`, with an explanation in the wizard. Targets with no supported candidate are unavailable. ARM64 uses `ramfb` for Windows and `virtio-gpu-pci` for Linux. These defaults apply when creating a VM or explicitly reselecting a preset; saved VMs and custom Profiles retain their settings.
+
+Network mode, audio, storage controller and firmware inherit the base Profile. Step three exposes CPU cores, memory and disk size directly, without opening advanced settings; the final edited values are saved. Back navigation and background refresh preserve edits, and replacing a modified configuration requires confirmation. CPU/memory cannot exceed host totals, and disk size cannot be smaller than the imported image's virtual capacity; validation occurs before creation.
+
+A preset records the intended guest family, without detecting the installed OS, installing drivers, configuring TPM or bypassing Windows setup checks. Supply media with matching architecture, firmware and drivers. For the Windows x64 tools/driver ISO and menu mounting action, see [guest enhancements](guest-enhancements.md).
+
+Step two offers two source types:
 
 1. **Import Base Image (`qcow2` / `raw`)**: The imported file is treated strictly as a **read-only base image** (preserve its original path and any backing chain). Palette creates a writable overlay inside `.runtime/`. The configured virtual disk size cannot be smaller than the base image.
 2. **Install from ISO**: Palette creates a managed blank disk of your chosen capacity and attaches the installer ISO. Firmware (BIOS / UEFI) and storage drivers must match the guest OS (e.g., Windows ISO installs may require an extra CD-ROM with VirtIO drivers).
@@ -89,12 +105,13 @@ Persistent VM definitions are stored under `<runtime_root>/definitions/`. Writab
 
 ### Lifecycle & Restoring Initial State
 
-The VM management list provides **Start / Shut Down**, **Restart**, **Pause**, **VM Settings**, and **Delete VM** directly in each row. Start changes to Shut Down while the VM is active; unavailable actions are disabled. Pause is shown but is not supported yet. **More** retains Force Stop and Restore Initial State. Deleting a VM still requires confirmation.
+The VM management list provides **Start / Shut Down**, **Restart**, **Pause**, **VM Settings**, and **Delete VM** directly in each row. Start changes to Shut Down while the VM is active. The power button in the console, VM list, and VM menus force stops the VM after confirmation, like cutting its power. The dialog warns about unsaved data and guest filesystem corruption; cancel leaves the VM running. To shut down safely, use the guest OS or choose **Request Graceful Shutdown** from **More**. Unavailable actions are disabled. Pause is shown but is not supported yet. **More** retains Force Stop and Restore Initial State. Deleting a VM still requires confirmation.
 
-* **Graceful Shutdown & Force Stop**: Normal shutdown sends an ACPI shutdown signal; if the guest does not power off within the timeout budget, Palette Desktop reports an error and leaves the VM running rather than silently killing it. **Force Stop** requires explicit confirmation.
-  The timeout message provides a **Force Stop…** action that opens this confirmation. Confirmation is tied to the original running instance: if another client has restarted the VM, Palette refuses to stop the replacement. A normal shutdown initiated inside the guest is recognized as **Stopped** once QEMU emits a guest shutdown event and exits successfully; a crash remains a failure.
-* **Restart**: Preserves all persistent disk changes and UEFI variables.
-* **Restore Initial State**: Discards all writable disk modifications and resets UEFI variables — image-backed VMs return to the clean read-only base image, and ISO-backed VMs return to a fresh blank disk.
+* **Graceful Shutdown & Force Stop**: The power button uses the explicit force-stop path and does not wait for a guest shutdown request. **Request Graceful Shutdown** and **Quit Completely** use the graceful path: Palette prefers an online QEMU Guest Agent with shutdown support. It uses ACPI through QMP when the agent is unavailable or explicitly rejects the capability. An uncertain agent request is never automatically replayed. Paused guests resume first so they can handle the request. The console keeps displaying the guest during shutdown without a covering placeholder; manual input is released and takeover is disabled.
+  The shutdown budget covers command dispatch, the guest-agent lock, and waiting for process exit. A timeout or channel failure displays an error without silently killing a running guest. **Force Stop…** is available during the wait and after failure, and requires separate confirmation. Cancelling that confirmation leaves the original graceful wait active. Confirmed force stop can interrupt the wait immediately, and cancels any pending restart or restore so it cannot create a replacement instance afterward.
+  Confirmation is tied to the original instance: if another client has restarted the VM, Palette refuses to stop its replacement. Force stop can terminate the owned process immediately to break a blocked shutdown; otherwise it first asks QEMU to quit before terminating the process and its guard if necessary. Only confirmed process exit is reported as **Stopped**; disks and UEFI variables remain intact. Failed instances with live processes can still be force stopped and are not treated as exited. Enhancement-channel closing and file-handle cleanup are bounded so they cannot hold shutdown indefinitely. A normal shutdown initiated inside the guest is recognized as **Stopped** once QEMU emits a guest shutdown event and exits successfully; a crash remains a failure.
+* **Restart**: Immediately resets the hardware (`system_reset`) without confirmation or a graceful guest shutdown. The QEMU process, `instance_id`, persistent disks and UEFI variables remain; unsaved memory contents are lost. Human control and Agent tasks end, old frames and input credentials become invalid, and control must be acquired again after the display recovers. Older backends must be updated, restarted and reconnected.
+* **Restore Initial State**: Discards managed system disk modifications and resets UEFI variables — image-backed VMs return to the clean read-only base image, and ISO-backed VMs return to a fresh blank disk. Additional disk and optical image files retain their contents.
 * **Delete VM**: Removes only managed files inside `.runtime/` that have no remaining dependents. Imported base images and external ISOs are **never** deleted.
 
 ### Window Close & Exit Modes
@@ -102,13 +119,13 @@ The VM management list provides **Start / Shut Down**, **Restart**, **Pause**, *
 Closing the Palette Desktop window always prompts **"Exit Palette?"** (even when no VMs exist or all VMs are stopped) with two options:
 
 * **Close Window Only**: Closes the Electron UI while leaving the background `daemon` and any running VMs active for MCP clients.
-* **Quit Completely**: Gracefully shuts down all running VMs owned by the connected backend, stops the backend owner, verifies process termination, and then closes the window (preserving VM definitions and persistent disks, and leaving other config roots untouched). If a guest shutdown or daemon stop fails, the window stays open with the error message so you can retry, cancel, or choose **Close Window Only**.
+* **Quit Completely**: Independently requests graceful shutdown for each active VM owned by the connected backend and waits for all results, stops the backend owner, verifies process termination, and then closes the window (preserving VM definitions and persistent disks, and leaving other config roots untouched). If a guest shutdown or daemon stop fails, the window stays open with the error message so you can retry, cancel, or choose **Close Window Only**.
 
 If a VM operation is already in progress, **Quit Completely** asks you to wait instead of queuing another shutdown. You can still cancel or choose **Close Window Only**. After a shutdown failure, VM status refreshes even while the exit dialog is open; force stopping remains a separate confirmed action.
 
-When a guest times out during **Quit Completely**, **Force Stop This VM and Quit…** opens a separate confirmation naming the affected VM and warning about unsaved data. After confirmation, Palette stops that instance, continues graceful shutdown for the remaining VMs, and verifies backend termination. Cancelling the confirmation leaves the affected VM running. This recovery requires an updated backend advertising `vm-stop-identity`.
+When a guest times out or its shutdown channel fails during **Quit Completely**, **Force Stop This VM and Quit…** opens a separate confirmation naming the affected VM and warning about unsaved data. After confirmation, Palette stops that instance, continues graceful shutdown for the remaining VMs, and verifies backend termination. Cancelling the confirmation leaves the affected VM running. This recovery requires an updated backend advertising `vm-stop-identity`.
 
-ACPI shutdown depends on the guest's power-button handling. It is a different mechanism from an in-guest agent such as VMware Tools, and a guest that responds to one may not respond to the other. A timeout is not repaired by treating a blank display as shutdown or by claiming an automatic force stop was graceful.
+ACPI depends on the guest's power-button handling; QEMU Guest Agent depends on a service inside the guest. Neither guarantees that the guest will complete shutdown. Palette checks actual QEMU process exit; a blank display is not evidence of shutdown.
 
 ## 3. Virtual Machine Hardware Settings
 
@@ -120,18 +137,38 @@ Open **VM Settings** directly from the VM management row, or from the VM's actio
 | --- | --- |
 | **General** | View or update the VM display name and notes |
 | **Processor & Memory** | **vCPUs**: `1–64` cores; **Memory**: `256–1,048,576 MiB`. Host CPU/RAM figures are shown for reference and do not reserve host capacity |
-| **Disk & Boot** | **Managed Disk Expansion**: Confirmed as an independent operation (requires saving or discarding other form edits first), grow-only up to `4096 GiB`. The UI distinguishes configured capacity, actual disk virtual size, and host bytes used. Expansion modifies only the managed writable layer, leaving base images and UEFI vars untouched, and does not automatically grow guest OS partitions. Interrupted resizes recover from on-disk state and operation journals, blocking boot if integrity cannot be verified.<br>**ISO & Boot Order**: Attach, swap, or eject an ISO on both image-backed and ISO-backed VMs. Boot order supports **Automatic** (CD-ROM first on initial boot, disk first thereafter), **Disk First**, and **CD-ROM First** (requires mounted media) |
-| **Display** | Dynamically filters GPU models (`VGA`, `virtio-gpu-pci`, `ramfb`) based on guest architecture and local QEMU `-device help`. Supported GPUs accept a default resolution hint (`ramfb` is controlled by firmware/guest and explains this constraint in the UI) |
+| **Boot** | Select any optical drive with connected media for boot. Boot order supports **Automatic** (CD-ROM first on initial boot, disks first thereafter), **Disk First**, and **CD-ROM First** (requires mounted media). Drive order controls priority within each media type |
+| **Display** | Dynamically filters GPU models (`VGA`, `virtio-vga`, `virtio-gpu-pci`, `ramfb`) based on guest architecture and local QEMU `-device help`. Supported GPUs accept a default resolution hint (`ramfb` is controlled by firmware/guest and explains this constraint in the UI) |
 | **Network** | Choose **Offline (`offline`)**, **Restricted Lab (`restricted-lab`)**, or **NAT (`nat`)**, select the NIC model, set a custom MAC address, and configure TCP/UDP port forwards. New port forwards bind strictly to `127.0.0.1` |
 | **Audio** | Routes guest audio through **Intel HDA** to the host's default audio output device (**microphone capture is never enabled**). Requires a supported QEMU audio backend (`CoreAudio` on macOS, `DirectSound` on Windows, `PipeWire`/`PulseAudio`/`ALSA` on Linux) and guest HDA drivers; missing backends fail with a clear diagnostic |
 
-> The **More Hardware Options** step in the creation wizard reuses these exact forms. Version-1 VM definitions are upgraded in place upon saving without mutating disks on read.
+The settings sidebar groups **Devices** and **Drives**, with one entry per drive. Select an entry to edit it; its action menu offers **Move Up**, **Move Down**, and **Delete drive…**. Order, interfaces and other edits share one draft, preserved through selection changes and background refresh.
+
+If the connected backend has not loaded the current drive-management code, settings ask you to restart the backend and reconnect. Missing capability information is not reported as QEMU lacking storage interfaces.
+
+The disk created with the VM is an ordinary entry in this list. Edit its interface, access mode and connection state, reorder it, or delete it using the same actions as other drives. Save commits deletion; Cancel preserves its contents. Removing the original disk does not remove the VM or source image, and subsequent starts or Restore Initial State do not recreate it. A VM can have no hard disks and boot from optical media.
+
+**New…** opens a configuration dialog for **Removable media**, **Interface**, and, for ordinary disks, **Capacity / GiB** and **Image format (QCOW2 / RAW)**. Choose **Create** for a blank disk or **Import…** for an existing image. Removable media creates an ordinary optical drive: **Browse…** selects an external ISO, while **Create** can leave it empty. Cancelling the dialog or file picker adds nothing. Files are created or imported only when settings are saved.
+
+Disk interfaces include VirtIO, IDE, SCSI, NVMe and USB; optical drives support IDE, SCSI and USB. The local QEMU device list, architecture and machine filter the actual choices. ARM64 does not offer PC IDE; VirtIO Block and NVMe are not optical interfaces. Guests require matching drivers, and IDE count is limited by machine ports. Saved order controls device construction and boot priority within the disk/optical groups; the selected optical drive takes priority within its group.
+
+Ordinary disks belong to the VM. Import creates an independent copy in the selected format inside the VM directory, flattening its backing chain and preserving the source. Guest writes modify the copy. Blank disks accept `1–4096 GiB`; imports preserve the actual source virtual capacity, up to `4096 GiB`. Details show name, format, virtual capacity and path. Allocated disk capacity and format cannot be edited directly. Restarting and restoring the system disk preserve data disks.
+
+Each managed disk has an **Expand disk** action, including the original disk and added RAW/QCOW2 disks. Expansion is a separate, grow-only operation up to `4096 GiB`; save or discard other edits first. It preserves source images and UEFI variables, and does not grow guest partitions automatically. Interrupted operations recover from an on-disk journal and block boot if image integrity cannot be verified.
+
+**Delete drive…** removes the entry from the draft after confirmation. **Save** deletes the owned image; **Cancel / Discard** preserves the device and data. External ISOs and previously attached external disks only lose their device entry; their files remain. The backend checks VM, image-chain and configuration references before committing settings and cleaning files. Failed cleanup retains a pending record under **Boot → Unused disks**, where deletion can be staged and saved again. Unsaved edits never delete files, and missing disks are never silently recreated.
+
+Configure up to nine drives in total, including the original disk, while stopped; running VMs are read-only. Interface selection and reordering preserve device IDs. Creation and deletion use the settings dialog’s Save/Cancel flow, without a separate immediate file-deletion action.
+
+The creation ISO and all other ISOs are ordinary optical-drive media with the same sidebar editor, replacement, eject and removal actions. There is no separate installation-media setting. Disconnecting a disk, ejecting an ISO, or removing an optical drive preserves the original file. CD-ROM First requires connected media; ejecting the last available medium resets the UI boot order to Automatic. Extra NICs are not supported yet.
+
+> The **More Hardware Options** step in the creation wizard reuses the display, network, audio and boot forms. Additional drives are configured in VM settings. Version-1 VM definitions are upgraded in place upon saving without mutating disks on read.
 
 ## 4. Live Console & Human Control Handoff
 
 ### Read-Only Display Gateway (`DisplayGateway`)
 
-Opening the **Console** tab starts in **View Only** mode:
+Opening the **Console** tab starts in **View Only** mode. The host pointer stays visible over the guest until takeover. Taking control uses the guest cursor; ending control restores the host pointer:
 
 * Video frames stream over a localhost-only WebSocket RFB gateway authenticated by a **one-time display ticket** issued to the Electron main process.
 * The gateway enforces read-only viewing at the RFB protocol layer — even if `noVNC` flags were tampered with in the renderer, input messages over the display socket are dropped.
@@ -175,3 +212,20 @@ npm --prefix desktop run test:e2e
 ```
 
 The Electron Playwright suite (`npm --prefix desktop run test:e2e`) runs against an isolated config root, supervised fake QEMU child processes, and real localhost RFB connections to verify VM creation, hardware settings, live console streaming, human takeover, and shutdown dialogs. For physical guest verification, follow the [acceptance test guide](acceptance-test.md).
+
+An optional VirtIO VGA test boots a disposable BIOS guest with real x86_64 QEMU. For example, in PowerShell:
+
+```powershell
+$env:PALETTE_VIRTIO_VGA_QEMU = 'C:/Program Files/qemu/qemu-system-x86_64.exe'
+uv run pytest tests/e2e/test_virtio_vga.py
+```
+
+It verifies resolution parameter acceptance, framebuffer capture, authenticated VNC, keyboard/tablet display bindings, and a visible response to keyboard input. The test uses TCG and disables SMM for its minimal BIOS guest; it does not establish Windows/Linux driver or guest desktop resolution acceptance.
+
+For real QEMU multiple-drive and tools-hotplug verification, set `PALETTE_DRIVES_QEMU` to the same executable and run `uv run pytest tests/e2e/test_real_drives.py`; sibling `qemu-img` and `qemu-io` executables are required. It checks writable disks, shared read-only backing files, loaded/empty optical drives, tools drive creation/reuse/ejection, and preservation of other media. An offline write/read pattern verifies managed data disk contents survive restart and system disk reset. This firmware-only test does not verify Windows driver installation.
+
+## Optional Guest Enhancements
+
+See the [guest enhancement guide](guest-enhancements.md) for guest installation, automatic capability detection and degradation, Unicode clipboard, automatic resolution, QGA management, file transfer, and private WebDAV shared directories. Missing tools preserve the basic VM console.
+
+For real QEMU shutdown recovery verification, set `PALETTE_SHUTDOWN_QEMU` to the absolute path of `qemu-system-x86_64` and run `uv run pytest tests/e2e/test_real_shutdown.py`. It checks pause/resume, explicit force stop during a graceful wait, stopping after QMP disconnect, and disk preservation. The disposable firmware guest does not establish acceptance of Windows guest services or ACPI shutdown.

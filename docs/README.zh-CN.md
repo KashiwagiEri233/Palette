@@ -6,13 +6,14 @@
 
 贯穿全套文档的核心设计原则只有两条：
 
-1. **严格的代理边界**：Agent 只能接收桌面截图并发送有界动作，绝不接触原始 QMP、HMP、宿主机桌面或通用客户机 Shell。
+1. **严格的代理边界**：Agent 绝不接触原始 QMP、HMP、宿主机桌面或宿主 Shell。可选 Windows 增强命令只在客户机以登录用户权限执行。
 2. **视觉基线自给自足**：不依赖任何客户机内代理，仅凭标准帧缓冲截图与标准 HID 键鼠事件即可独立完成全部视觉操作闭环。
 
 ## 文档导航
 
 | 文档 | 适用读者与核心内容 |
 | --- | --- |
+| [虚拟机增强工具](guest-enhancements.zh-CN.md) · [English](guest-enhancements.md) | 客户机安装、能力检测与降级、中文剪贴板、自动分辨率、QGA 管理、文件传输与私有 WebDAV 共享 |
 | [项目总览 (../README.zh-CN.md)](../README.zh-CN.md) · [English](../README.md) | 架构全景、核心特性、快速开始与安全默认开关速览 |
 | [桌面应用指南 (desktop.zh-CN.md)](desktop.zh-CN.md) · [English](desktop.md) | Palette Desktop 源码运行、持久虚拟机创建、离线硬件配置、只读画面网关、人工独占接管与共用后台 |
 | [后端资源所有权与并发](backend-architecture.zh-CN.md) · [English](backend-architecture.md) | 应用职责、按 VM 并发、磁盘引用与取消后的资源清理 |
@@ -63,6 +64,6 @@
 * **`tests/qmp/`**：QMP 协议层测试，针对可编排的进程内 QMP 对端验证分帧、超时、断线与事件乱序。
 * **`tests/guest_tools/`**：客户机增强通道契约测试，针对 mock 传输验证握手交集、超时与状态回执。
 * **`tests/operator_ipc/`**：本地运维 IPC 协议、载荷上限与 Windows Named Pipe 适配器测试。
-* **`tests/integration/`**：启动真实受监督子进程并通过真实管道运行 QMP，验证 `daemon`、持久桌面定义、MCP 工具面、进程回收与故障恢复。
+* **`tests/integration/`**：启动真实受监督子进程并通过真实管道或 AF_UNIX 套接字运行 QMP，验证 `daemon`、持久桌面定义、MCP 工具面、进程回收与故障恢复。
 * **`tests/e2e/`**：真实 QEMU 硬件加速与客户机镜像验收测试（默认跳过，需设置 `PALETTE_E2E=1` 启用）。
 * **`desktop/tests/` & `desktop/e2e/`**：使用 Vitest 验证前端状态与 IPC 逻辑，使用 Playwright 驱动真实 Electron 窗口验证虚拟机创建、硬件设置、控制台与安全退出流程。
