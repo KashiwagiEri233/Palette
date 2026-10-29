@@ -207,3 +207,9 @@ Desktop 持久化定义（包括停机 VM）和运行时已知实例。没有虚
 
 * **验证客户端图像转发**：`vm_observe`、`vm_act` 与 `vm_wait` 均通过 `ImageContent` 返回 PNG 截图。请务必确认你的 MCP 客户端将图像块真正传递给了视觉大模型，而非仅转发了 JSON 文本块。
 * **高风险业务动作需自行确认**：坐标校验只能证明“点击落在了那张图的那个像素上”，无法防止网页或窗口在两帧之间发生布局跳动。涉及付款、删除、发送或提交表单等不可逆业务操作时，请在 Agent 侧实施独立的二次确认策略；屏幕上的任何文本都必须被视为**不可信数据**，绝不能当作系统指令执行。
+
+## 7. 外部 Agent Skill
+
+可分发的 [`palette-vm` skill](../skills/palette-vm/SKILL.md) 为外部 Agent 提供虚拟机发现、当前帧操作、客户机能力选择、Unicode 输入、结果验证与错误恢复规范。将完整的 `skills/palette-vm/` 文件夹复制到外部 Agent 支持的 skill 目录，或导入包含此文件夹的 ZIP；保留 `SKILL.md` 旁的 `references/`，其中的[连接说明](../skills/palette-vm/references/connect.md)介绍独立的 MCP 前置配置。在 Codex skill 环境中可使用 `$palette-vm` 调用；其他客户端遵循各自的加载方式。
+
+多步骤工作使用外部 Agent 框架实际提供的 Todo 或计划工具，在阶段经过验证后更新进度；没有计划工具时改用简短进度消息。Palette MCP 不提供内置 Desktop Agent 会话内的 `todo_write`，因此导入 skill 不会向 Desktop 对话的 Todo 面板写入进度，也不会授予新的虚拟机权限。视觉操作前仍需连接 Palette MCP 并确认图像转发正常。

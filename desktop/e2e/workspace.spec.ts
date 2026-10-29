@@ -110,13 +110,16 @@ test('workspace navigation, persisted drafts, responsive panels, settings and co
     const verifyAdvancedActions = async (running: boolean) => {
       await managementRow.getByRole('button', { name: '工作区测试 的操作', exact: true }).click()
       const menu = page.getByRole('menu')
-      await expect(menu.getByRole('menuitem')).toHaveCount(2)
+      await expect(menu.getByRole('menuitem')).toHaveText(['请求正常关机', '安装增强工具与驱动', '弹出增强工具光盘', '强制停止', '恢复初始状态'])
+      await expect(menu.getByRole('menuitem', { name: '弹出增强工具光盘', exact: true })).toBeDisabled()
       await expect(menu.getByRole('menuitem', { name: '强制停止', exact: true })).toBeVisible()
       await expect(menu.getByRole('menuitem', { name: '恢复初始状态', exact: true })).toBeVisible()
       if (running) {
+        await expect(menu.getByRole('menuitem', { name: '请求正常关机', exact: true })).toBeEnabled()
         await expect(menu.getByRole('menuitem', { name: '强制停止', exact: true })).toBeEnabled()
         await expect(menu.getByRole('menuitem', { name: '恢复初始状态', exact: true })).toBeDisabled()
       } else {
+        await expect(menu.getByRole('menuitem', { name: '请求正常关机', exact: true })).toBeDisabled()
         await expect(menu.getByRole('menuitem', { name: '强制停止', exact: true })).toBeDisabled()
         await expect(menu.getByRole('menuitem', { name: '恢复初始状态', exact: true })).toBeEnabled()
       }
@@ -287,12 +290,12 @@ test('workspace navigation, persisted drafts, responsive panels, settings and co
     await page.getByRole('button', { name: '设置', exact: true }).click()
     await expect(page.locator('.settings-navigation')).toBeVisible()
     await page.getByRole('button', { name: 'Agent', exact: true }).click()
-    await expect(page.getByRole('combobox', { name: '模型提供方', exact: true })).toBeEnabled()
-    await expect(page.getByRole('combobox', { name: '模型提供方', exact: true })).toHaveText('openai')
-    await expect(page.getByRole('combobox', { name: '模型', exact: true })).toBeEnabled()
-    await expect(page.getByRole('combobox', { name: '模型', exact: true })).toHaveText('选择模型')
-    await expect(page.getByText('未配置', { exact: true })).toBeVisible()
-    await expect(page.getByRole('combobox', { name: '默认推理强度', exact: true })).toBeDisabled()
+    await expect(page.getByRole('heading', { name: '模型提供商', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: '添加提供商', exact: true })).toBeEnabled()
+    await expect(page.locator('.agent-provider-empty')).toContainText('尚未添加提供商')
+    await expect(page.getByRole('combobox', { name: '默认推理强度', exact: true })).toBeEnabled()
+    await expect(page.getByRole('combobox', { name: '默认推理强度', exact: true })).toHaveText('Medium')
+    await expect(page.getByRole('spinbutton', { name: '最大工具调用次数', exact: true })).toHaveValue('100')
     await page.getByRole('button', { name: '外观', exact: true }).click()
     await page.getByRole('button', { name: '深色', exact: true }).click()
     await expect(page.locator('html')).toHaveClass(/dark/)
@@ -331,20 +334,17 @@ test('workspace navigation, persisted drafts, responsive panels, settings and co
     await expect(managementRow).toBeVisible()
     expect((await page.evaluate(async () => window.palette.request('conversations.list', undefined, {}))).conversations).toHaveLength(1)
     const readVmStatus = () => page.evaluate(async vmId => {
-      const result = await window.palette.request('vms.list') as { vms: { vm_id: string; status: { state: string; instance_id?: string } }[] }
+      const result = await window.palette.request('vms.list') as { vms: { vm_id: string; status: { state: string; instance_id?: string; boot_epoch: number } }[] }
       return result.vms.find(vm => vm.vm_id === vmId)?.status
     }, vmId)
     await managementRow.getByRole('button', { name: '启动', exact: true }).click()
     await expect.poll(async () => (await readVmStatus())?.state, { timeout: 20_000 }).toBe('RUNNING')
     await verifyManagementActions(true)
     await verifyAdvancedActions(true)
-    const startedInstance = (await readVmStatus())?.instance_id
-    expect(startedInstance).toBeTruthy()
+    const startedStatus = (await readVmStatus())!
+    expect(startedStatus.instance_id).toBeTruthy()
     await managementRow.getByRole('button', { name: '重启', exact: true }).click()
-    await expect.poll(async () => {
-      const status = await readVmStatus()
-      return status?.state === 'RUNNING' && status.instance_id !== startedInstance
-    }, { timeout: 20_000 }).toBe(true)
+    await expect.poll(readVmStatus, { timeout: 20_000 }).toMatchObject({ state: 'RUNNING', instance_id: startedStatus.instance_id, boot_epoch: startedStatus.boot_epoch + 1 })
     await managementRow.getByRole('button', { name: '关机', exact: true }).click()
     await page.getByRole('dialog', { name: '强制停止虚拟机', exact: true }).getByRole('button', { name: '确认', exact: true }).click()
     await expect.poll(async () => (await readVmStatus())?.state, { timeout: 10_000 }).toBe('STOPPED')

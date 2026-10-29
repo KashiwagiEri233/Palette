@@ -9,15 +9,15 @@ type WithClassName<P> = Omit<P, "className"> & { className?: string }
 
 const ScrollArea = React.forwardRef<
   HTMLDivElement,
-  WithClassName<ScrollAreaPrimitive.Root.Props> & { viewportClassName?: string }
->(({ className, viewportClassName, children, ...props }, ref) => (
+  WithClassName<ScrollAreaPrimitive.Root.Props> & { viewportClassName?: string; viewportRef?: React.Ref<HTMLDivElement>; onViewportScroll?: React.UIEventHandler<HTMLDivElement> }
+>(({ className, viewportClassName, viewportRef, onViewportScroll, children, ...props }, ref) => (
   <ScrollAreaPrimitive.Root
     data-slot="scroll-area"
     ref={ref}
     className={cn("relative overflow-hidden", className)}
     {...props}
   >
-    <ScrollAreaPrimitive.Viewport data-slot="scroll-area-viewport" className={cn("h-full w-full rounded-[inherit]", viewportClassName)}>
+    <ScrollAreaPrimitive.Viewport ref={viewportRef} onScroll={onViewportScroll} data-slot="scroll-area-viewport" className={cn("h-full w-full rounded-[inherit]", viewportClassName)}>
       <ScrollAreaPrimitive.Content>{children}</ScrollAreaPrimitive.Content>
     </ScrollAreaPrimitive.Viewport>
     <ScrollBar />

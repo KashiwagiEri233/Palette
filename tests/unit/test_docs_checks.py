@@ -10,6 +10,9 @@ AGENT_RULES = [
     "AGENTS.md",
     "desktop/.better-design/rules.md",
     "desktop/src/.better-design/rules.md",
+    "skills/palette-vm/SKILL.md",
+    "skills/palette-vm/references/connect.md",
+    "skills/palette-vm/references/nested/tools.md",
 ]
 
 
@@ -39,6 +42,9 @@ def test_agent_rules_still_validate_links_and_fences(tmp_path: Path, relative: s
         "docs/user-guide.md",
         "desktop/.better-design/notes.md",
         "desktop/src/.better-design/notes.md",
+        "skills/README.md",
+        "skills/palette-vm/README.md",
+        "skills/palette-vm/assets/notes.md",
     ],
 )
 def test_other_pages_still_require_translation(tmp_path: Path, relative: str) -> None:

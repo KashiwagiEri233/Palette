@@ -60,11 +60,43 @@ export interface AgentSettings {
 }
 export interface AgentMessageView {
   id: string
+  entryId?: string
+  turnId?: string
   role: 'user' | 'assistant' | 'tool' | 'system'
   text: string
+  blocks?: AgentContentBlock[]
   toolName?: string
   status: 'complete' | 'streaming' | 'error'
 }
+export interface AgentTodo {
+  content: string
+  status: 'pending' | 'in_progress' | 'completed'
+}
+export interface AgentImageReference {
+  entryId: string
+  contentIndex: number
+  mimeType: 'image/png'
+}
+export type AgentToolStatus = 'preparing' | 'running' | 'complete' | 'error' | 'cancelled' | 'unknown' | 'ended'
+export interface AgentToolView {
+  callId: string
+  name: string
+  arguments: unknown
+  partialArguments?: string
+  status: AgentToolStatus
+  result?: unknown
+  resultText?: string
+  images: AgentImageReference[]
+  durationMs?: number
+  todos?: AgentTodo[]
+  previousTodos?: AgentTodo[]
+}
+export type AgentContentBlock =
+  | { id: string; type: 'text'; text: string }
+  | { id: string; type: 'reasoning'; text: string }
+  | { id: string; type: 'tool-call'; tool: AgentToolView }
+  | { id: string; type: 'image'; image: AgentImageReference }
+  | { id: string; type: 'other'; value: unknown }
 export interface AgentRunView {
   id: string
   state: 'starting' | 'running' | 'stopping' | 'completed' | 'cancelled' | 'failed' | 'interrupted'
@@ -84,6 +116,7 @@ export interface AgentView {
   tree: AgentTreeEntry[]
   compacting: boolean
   contextUsage: AgentContextUsage | null
+  todos?: AgentTodo[]
 }
 export interface AgentSnapshot { streamEpoch: string; seq: number; view: AgentView }
 export interface AgentEvent extends AgentSnapshot { runId: string | null }
@@ -96,11 +129,12 @@ export interface AgentRoutes {
   'agent.credentials.set': { payload: { providerId: string; key: string }; result: { configured: boolean; persistent: boolean } }
   'agent.credentials.remove': { payload: { providerId: string }; result: { configured: false } }
   'agent.snapshot': { payload: { conversationId: string }; result: AgentSnapshot }
+  'agent.message.image': { payload: { conversationId: string; entryId: string; contentIndex: number }; result: { mimeType: 'image/png'; dataBase64: string } }
   'agent.start': { payload: { conversationId: string; text: string; requestId: string }; result: { runId: string } }
   'agent.stop': { payload: { conversationId: string }; result: AgentSnapshot }
   'agent.compact': { payload: { conversationId: string }; result: AgentSnapshot }
   'agent.tree.navigate': { payload: { conversationId: string; entryId: string }; result: AgentSnapshot & { editorText?: string } }
 }
 export type AgentMethod = keyof AgentRoutes
-export const agentMethods = new Set<string>(['agent.settings.get', 'agent.settings.update', 'agent.providers.save', 'agent.providers.delete', 'agent.models.discover', 'agent.credentials.set', 'agent.credentials.remove', 'agent.snapshot', 'agent.start', 'agent.stop', 'agent.compact', 'agent.tree.navigate'])
+export const agentMethods = new Set<string>(['agent.settings.get', 'agent.settings.update', 'agent.providers.save', 'agent.providers.delete', 'agent.models.discover', 'agent.credentials.set', 'agent.credentials.remove', 'agent.snapshot', 'agent.message.image', 'agent.start', 'agent.stop', 'agent.compact', 'agent.tree.navigate'])
 export const activeRun = (run: AgentRunView | null | undefined): boolean => !!run && ['starting', 'running', 'stopping'].includes(run.state)

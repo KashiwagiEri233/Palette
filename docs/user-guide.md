@@ -210,3 +210,9 @@ When Palette Desktop or `uv run palette daemon start` is running on the host, co
 
 * **Verify Image Forwarding**: `vm_observe`, `vm_act`, and `vm_wait` deliver PNG screenshots as `ImageContent`. Confirm that your MCP client forwards image blocks to the vision model rather than dropping them and passing only JSON text.
 * **Confirm High-Impact Actions**: Coordinate validation guarantees where a click lands in pixel space, not what a dynamic web page rendered a millisecond later. Gate payments, deletions, and form submissions behind your own confirmation policy, and treat all text visible on the guest screen strictly as **untrusted data**, never as operator instructions.
+
+## 7. External Agent Skill
+
+The portable [`palette-vm` skill](../skills/palette-vm/SKILL.md) guides external agents through VM discovery, current-frame actions, guest capabilities, Unicode input, outcome verification and recovery. Copy the complete `skills/palette-vm/` folder into the external agent's supported skill directory or import a ZIP containing that folder. Keep `references/` with `SKILL.md`; the package's [connection guidance](../skills/palette-vm/references/connect.md) explains the separate MCP prerequisite. In a Codex skills environment, invoke it as `$palette-vm`; other clients use their own skill-loading convention.
+
+For multi-step work, the skill uses the external harness's available Todo or plan tool and updates progress at verified milestones. If no planning tool exists, it uses brief progress messages. Palette MCP does not expose the built-in Desktop agent's conversation-local `todo_write`, so importing this skill does not populate a Desktop conversation's Todo panel or grant new VM permissions. Connect the Palette MCP server and ensure image forwarding before visual work.

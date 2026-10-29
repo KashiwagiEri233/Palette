@@ -77,7 +77,10 @@ export class AgentCredentials implements CredentialStore {
     const redact = (item: unknown): unknown => {
       if (typeof item === 'string') return keys.reduce((text, key) => text.split(key).join('[redacted]'), item)
       if (Array.isArray(item)) return item.map(redact)
-      if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item).map(([key, entry]) => [key, redact(entry)]))
+      if (item && typeof item === 'object') {
+        const image = 'type' in item && item.type === 'image' && 'mimeType' in item && typeof item.mimeType === 'string'
+        return Object.fromEntries(Object.entries(item).map(([key, entry]) => [key, image && key === 'data' ? entry : redact(entry)]))
+      }
       return item
     }
     return redact(value)

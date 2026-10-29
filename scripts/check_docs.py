@@ -44,6 +44,25 @@ SWITCHER_EN_TO_ZH = "[简体中文]("
 SWITCHER_ZH_TO_EN = "[English]("
 
 
+def is_agent_document(relative: str) -> bool:
+    """Skill entrypoints and their references are machine-facing instructions.
+
+    Keep user-facing READMEs, guides and output assets subject to bilingual pairing.
+    All files, including agent documents, still receive link/fence/encoding checks.
+    """
+    if relative in UNPAIRED:
+        return True
+    parts = pathlib.PurePosixPath(relative).parts
+    return (
+        len(parts) >= 3
+        and parts[0] == "skills"
+        and (
+            (len(parts) == 3 and parts[2] == "SKILL.md")
+            or (len(parts) >= 4 and parts[2] == "references")
+        )
+    )
+
+
 def markdown_files(root: pathlib.Path) -> list[pathlib.Path]:
     """The markdown this repository *ships*.
 
@@ -104,7 +123,7 @@ def check(path: pathlib.Path, root: pathlib.Path) -> list[str]:
     if fences % 2:
         problems.append(f"{relative}: unbalanced code fences ({fences})")
 
-    if relative not in UNPAIRED:
+    if not is_agent_document(relative):
         wanted = SWITCHER_ZH_TO_EN if relative.endswith(".zh-CN.md") else SWITCHER_EN_TO_ZH
         if wanted not in text:
             problems.append(f"{relative}: missing the language switcher for {wanted.strip('[')}")
@@ -123,11 +142,13 @@ def check_pairing(root: pathlib.Path, files: list[pathlib.Path]) -> list[str]:
     present = {path.relative_to(root).as_posix() for path in files}
     problems: list[str] = []
     for relative in sorted(present):
+        if is_agent_document(relative):
+            continue
         if relative.endswith(".zh-CN.md"):
             counterpart = relative[: -len(".zh-CN.md")] + ".md"
             if counterpart not in present:
                 problems.append(f"{relative}: no English counterpart ({counterpart})")
-        elif relative.endswith(".md") and relative not in UNPAIRED:
+        elif relative.endswith(".md"):
             counterpart = relative[: -len(".md")] + ".zh-CN.md"
             if counterpart not in present:
                 problems.append(f"{relative}: no Chinese counterpart ({counterpart})")
