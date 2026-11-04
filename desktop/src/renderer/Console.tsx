@@ -1,6 +1,7 @@
 import { CopyDebugInfoButton } from './components/CopyDebugInfoButton'
 import { useEffect, useRef, useState } from 'react'
-import RFB from '@novnc/novnc'
+import { createDisplaySession, type DisplaySession } from './lib/display-session'
+import type { RawDisplayTicket } from './lib/raw-display'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PcMouseIcon, ExpandIcon, CollapseIcon, RefreshIcon } from '@/components/icons'
@@ -18,7 +19,7 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
   const mount = useRef<HTMLDivElement>(null)
   const panel = useRef<HTMLElement>(null)
   const surface = useRef<HTMLDivElement>(null)
-  const rfb = useRef<RFB | null>(null)
+  const rfb = useRef<DisplaySession | null>(null)
   const lease = useRef<ControlLease | null>(null)
   const queue = useRef<InputQueue | null>(null)
   const wheel = useRef(new WheelAccumulator())
@@ -134,7 +135,6 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
 
   useEffect(() => {
     let disposed = false
-    let observer: MutationObserver | undefined
     let syncingGeometry = false
     let geometryDirty = false
     setConnected(false); setDisplayError('')
@@ -155,11 +155,10 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
     void (async () => {
       try {
         if (!await sync() || disposed) return
-        const result = await window.palette.request('display.ticket', vm.vm_id, { instance_id: vm.status.instance_id }) as { url: string }
+        const result = await window.palette.request('display.ticket', vm.vm_id, { instance_id: vm.status.instance_id }) as RawDisplayTicket
         if (disposed || !mount.current) return
-        const client = new RFB(mount.current, result.url, { shared: true })
+        const client = createDisplaySession(mount.current, result, selectedScale.current === 'fit')
         rfb.current = client
-        client.viewOnly = true; client.scaleViewport = selectedScale.current === 'fit'; client.resizeSession = false; client.focusOnClick = false
         client.addEventListener('connect', () => { if (!disposed) setConnected(true) })
         client.addEventListener('disconnect', () => {
           if (rfb.current === client) rfb.current = null
@@ -188,14 +187,13 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
             if (geometryDirty && !disposed) void syncGeometry()
           }
         }
-        observer = new MutationObserver(() => {
+        client.addEventListener('geometry', () => {
           const canvas = mount.current?.querySelector('canvas')
           if (canvas && (canvas.width !== geometry.current.width || canvas.height !== geometry.current.height)) {
             geometryDirty = true
             void syncGeometry()
           }
         })
-        observer.observe(mount.current, { childList: true, subtree: true, attributes: true, attributeFilter: ['width', 'height'] })
       } catch (error) { if (!disposed) setDisplayError(String(error)) }
     })()
     const lost = (): void => { if (lease.current) toast.info('已释放人工控制'); void release() }
@@ -212,7 +210,7 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
     document.addEventListener('visibilitychange', visibility)
     document.addEventListener('fullscreenchange', fullscreen)
     return () => {
-      disposed = true; observer?.disconnect(); void release()
+      disposed = true; void release()
       rfb.current?.disconnect(); rfb.current = null
       window.removeEventListener('blur', lost); window.removeEventListener('palette-control-lost', controlLost)
       document.removeEventListener('visibilitychange', visibility); document.removeEventListener('fullscreenchange', fullscreen)

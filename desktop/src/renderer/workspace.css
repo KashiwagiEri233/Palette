@@ -165,6 +165,12 @@ button:disabled { cursor: default; }
 .permission-list dd { color: var(--muted-foreground); margin: 0; }
 .theme-selector { margin-top: 20px; display: flex; width: fit-content; }
 .environment-results { margin-top: 24px; }
+.display-settings-card { margin-top: 20px; }
+.display-settings-content { padding: 20px; }
+.display-settings-toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.display-settings-instances { margin-top: 16px; overflow-x: auto; }
+.display-settings-error { margin-top: 12px; color: var(--destructive); font-size: 12px; }
+.display-settings-error button { margin-top: 8px; }
 .agent-settings-fields { border: 0; padding: 0; min-width: 0; }
 .agent-provider-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 20px 0 12px; }
 .agent-provider-toolbar h3 { font-size: 13px; font-weight: 500; }

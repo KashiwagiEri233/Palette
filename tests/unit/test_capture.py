@@ -73,6 +73,24 @@ def backend(client: ScreendumpQmp, **overrides) -> QmpCaptureBackend:
 
 
 class TestHappyPath:
+    async def test_acquisition_reads_geometry_without_decoding_pixels(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from PIL import Image
+
+        payload = render_png(320, 200)
+        capture = backend(ScreendumpQmp(payload=payload))
+
+        def forbid_decode(*args, **kwargs):
+            pytest.fail("acquisition must not decode or encode pixels")
+
+        monkeypatch.setattr(Image.Image, "load", forbid_decode)
+        sink = tmp_path / "snapshot.png"
+        acquired = await capture.acquire(display_id="video0", head=0, sink=sink)
+        assert acquired.native_size == Size(width=320, height=200)
+        assert acquired.data == payload
+        assert not sink.exists()
+
     async def test_png_capture_reports_the_framebuffer_size(self, tmp_path: Path) -> None:
         client = ScreendumpQmp(payload=render_png(1280, 800))
         result = await backend(client).capture(display_id="video0", head=0, sink=tmp_path / "f.png")

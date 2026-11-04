@@ -8,6 +8,7 @@ import { ButtonGroup } from '@/components/ui/button-group'
 import { Kbd } from '@/components/ui/kbd'
 import type { OwnerInfo, DoctorReport } from '../../shared/types'
 import { AgentSettingsForm } from './AgentSettings'
+import { DisplaySettingsForm } from './DisplaySettings'
 
 export const settingsSections = [
   { id: 'runtime', label: '运行环境' }, { id: 'agent', label: 'Agent' },
@@ -24,6 +25,7 @@ export function SettingsPage({ category, owner, theme, onTheme, onReconnect, onC
   return <div className="settings-page page-scroll"><div className="settings-form">
     <header className="page-header"><h1>{category === 'runtime' ? '环境设置' : settingsSections.find(item => item.id === category)?.label}</h1>{category === 'runtime' && <Button variant="outline" disabled={checking || !owner} onClick={() => { setChecking(true); void window.palette.request('doctor').then(result => setDoctor(result as DoctorReport)).catch(onError).finally(() => setChecking(false)) }}>{checking ? '检查中…' : '检查环境'}</Button>}</header>
     {category === 'runtime' && <><Card><CardContent className="settings-content"><div><Label>配置目录</Label><p className="path-value">{owner?.config_root ?? '未连接'}</p><Button variant="secondary" onClick={onChooseRoot}><FolderIcon className="size-4" />选择目录</Button></div><div><Label>运行目录</Label><p className="path-value">{owner?.runtime_root ?? '未连接'}</p></div><div><Label>后台版本</Label><p>{owner?.version ?? '—'}</p><Button variant="outline" onClick={onReconnect}>重新连接</Button></div></CardContent></Card>
+      <DisplaySettingsForm owner={owner} />
       {doctor && <section className="environment-results"><h2>{doctor.ok ? '环境检查通过' : '环境需要配置'}</h2><Table><TableHeader><TableRow><TableHead>检查项</TableHead><TableHead>结果</TableHead><TableHead>详情</TableHead></TableRow></TableHeader><TableBody>{doctor.checks.map((check, index) => <TableRow key={index}><TableCell>{check.name}</TableCell><TableCell>{check.ok ? '通过' : check.blocking ? '需要处理' : '提示'}</TableCell><TableCell className="break-all">{typeof check.detail === 'string' ? check.detail : JSON.stringify(check.detail ?? '')}</TableCell></TableRow>)}</TableBody></Table></section>}</>}
     {category === 'agent' && <AgentSettingsForm onError={onError} />}
     {category === 'permissions' && <><h2>Agent 权限</h2><p className="field-hint">视觉操作权限由虚拟机配置决定，任务运行时可随时停止或人工接管。</p><dl className="permission-list"><div><dt>客户机联网</dt><dd>由虚拟机网络配置决定</dd></div><div><dt>客户机文件传输</dt><dd>通过增强工具，按客户机服务状态提供</dd></div><div><dt>客户机命令执行</dt><dd>未接入</dd></div><div><dt>客户机文字与剪贴板</dt><dd>Agent 直接调用，按客户机服务状态提供</dd></div><div><dt>删除、提交和关机审批</dt><dd>暂不可用</dd></div></dl></>}

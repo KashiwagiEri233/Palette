@@ -29,3 +29,32 @@ class TimingWindow:
                 },
             }
         return result
+
+
+def process_tree_metrics() -> dict[str, object]:
+    """Cumulative CPU seconds and RSS, with identities for honest interval deltas."""
+    import psutil
+
+    owner = psutil.Process()
+    processes = []
+    incomplete = False
+    try:
+        children = owner.children(recursive=True)
+    except psutil.Error:
+        children = []
+        incomplete = True
+    for process in [owner, *children]:
+        try:
+            with process.oneshot():
+                cpu = process.cpu_times()
+                processes.append(
+                    {
+                        "pid": process.pid,
+                        "created_at": process.create_time(),
+                        "cpu_seconds": cpu.user + cpu.system,
+                        "rss_bytes": process.memory_info().rss,
+                    }
+                )
+        except psutil.Error:
+            incomplete = True
+    return {"processes": processes, "incomplete": incomplete}

@@ -25,13 +25,14 @@ from ..config import CaptureConfig
 from ..errors import ErrorCode, PaletteError, QmpCommandError
 from ..models import Size
 from ..qmp.client import QmpClient
-from .base import CapturedImage
-from .work import image_work
+from .base import AcquiredImage, CapturedImage
+from .work import capture_io, image_work
 
 logger = logging.getLogger("palette.capture")
 
 #: Guard against a decompression bomb from an unexpected display surface.
 MAX_FRAMEBUFFER_PIXELS = 8192 * 4320
+MAX_CAPTURE_BYTES = MAX_FRAMEBUFFER_PIXELS * 4 + 1024 * 1024
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _PPM_MAGIC = (b"P6", b"P3", b"P5", b"P2")
 
@@ -51,6 +52,10 @@ class QmpCaptureBackend:
         return self._png_supported
 
     async def capture(self, *, display_id: str, head: int, sink: Path) -> CapturedImage:
+        acquired = await self.acquire(display_id=display_id, head=head, sink=sink)
+        return await image_work(lambda: self.encode(acquired))
+
+    async def acquire(self, *, display_id: str, head: int, sink: Path) -> AcquiredImage:
         started = time.perf_counter()
         sink.parent.mkdir(parents=True, exist_ok=True)
         sink.unlink(missing_ok=True)
@@ -83,13 +88,41 @@ class QmpCaptureBackend:
             except QmpCommandError as exc:
                 raise _capture_error(exc) from exc
 
-        return await image_work(
-            lambda: self._encode(
-                self._read_and_cleanup(sink),
-                format_used=format_used,
-                sink=sink,
+        def read() -> AcquiredImage:
+            raw = self._read_and_cleanup(sink)
+            detected = _detect_format(raw)
+            if detected == "unknown":
+                raise PaletteError(ErrorCode.CAPTURE_FAILED, "the capture is neither PNG nor PPM")
+            try:
+                with Image.open(io.BytesIO(raw)) as image:
+                    native = Size(width=image.width, height=image.height)
+                    if native.width * native.height > MAX_FRAMEBUFFER_PIXELS:
+                        raise PaletteError(
+                            ErrorCode.CAPTURE_TOO_LARGE,
+                            "the framebuffer is larger than this service will decode",
+                        )
+            except PaletteError:
+                raise
+            except Exception as exc:
+                raise PaletteError(
+                    ErrorCode.CAPTURE_FAILED, "the capture header could not be decoded"
+                ) from exc
+            return AcquiredImage(
+                data=raw,
+                native_size=native,
+                format_used=detected,
                 started=started,
+                source_path=sink if self._config.keep_frames else None,
             )
+
+        return await capture_io(read)
+
+    def encode(self, acquired: AcquiredImage) -> CapturedImage:
+        return self._encode(
+            acquired.data,
+            format_used=acquired.format_used,
+            sink=acquired.source_path,
+            started=acquired.started,
         )
 
     # -- internals -------------------------------------------------------------------
@@ -112,19 +145,25 @@ class QmpCaptureBackend:
                 "screendump reported success but produced no file",
             )
         try:
-            data = sink.read_bytes()
+            with sink.open("rb") as handle:
+                data = handle.read(MAX_CAPTURE_BYTES + 1)
+            if len(data) > MAX_CAPTURE_BYTES:
+                raise PaletteError(ErrorCode.CAPTURE_TOO_LARGE, "the capture file is too large")
         except OSError as exc:
             raise PaletteError(
                 ErrorCode.CAPTURE_FAILED, "the capture file could not be read"
             ) from exc
-        if not self._config.keep_frames:
-            try:
-                sink.unlink(missing_ok=True)
-            except OSError:  # pragma: no cover - Windows file lock races
-                logger.debug("could not remove the transient capture file")
+        finally:
+            if not self._config.keep_frames:
+                try:
+                    sink.unlink(missing_ok=True)
+                except OSError:  # pragma: no cover - Windows file lock races
+                    logger.debug("could not remove the transient capture file")
         return data
 
-    def _encode(self, raw: bytes, *, format_used: str, sink: Path, started: float) -> CapturedImage:
+    def _encode(
+        self, raw: bytes, *, format_used: str, sink: Path | None, started: float
+    ) -> CapturedImage:
         if not raw:
             raise PaletteError(ErrorCode.CAPTURE_FAILED, "the capture file was empty")
         detected = _detect_format(raw)
@@ -137,7 +176,6 @@ class QmpCaptureBackend:
 
         try:
             with Image.open(io.BytesIO(raw)) as image:
-                image.load()
                 native = Size(width=image.width, height=image.height)
                 if native.width * native.height > MAX_FRAMEBUFFER_PIXELS:
                     raise PaletteError(
@@ -145,6 +183,7 @@ class QmpCaptureBackend:
                         "the framebuffer is larger than this service will decode",
                         details={"width": native.width, "height": native.height},
                     )
+                image.load()
                 png_bytes, image_size, scaled = self._render(image)
         except PaletteError:
             raise

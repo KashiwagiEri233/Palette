@@ -139,6 +139,7 @@ class Ticket:
     vm_id: str
     instance_id: str
     expires: float
+    generation: str | None = None
 
 
 class DisplayGateway:
@@ -177,7 +178,11 @@ class DisplayGateway:
     def ticket(self, vm_id: str, instance_id: str) -> dict[str, str]:
         instance = self.service.manager.get(vm_id)
         self.service.require_instance_id(instance, instance_id)
-        if instance.console_address is None:
+        bridge = instance.display_bridge
+        source = (
+            bridge.source if bridge and not bridge.source.closed and bridge.source.frame else None
+        )
+        if instance.console_address is None and source is None:
             raise PaletteError(
                 ErrorCode.UNSUPPORTED_CAPABILITY,
                 "restart this VM with the desktop service to enable its console",
@@ -188,8 +193,75 @@ class DisplayGateway:
         if len(self.tickets) >= 64:
             raise PaletteError(ErrorCode.BUSY, "too many pending display connections")
         token = secrets.token_urlsafe(32)
-        self.tickets[token] = Ticket(vm_id, instance_id, time.monotonic() + 60)
-        return {"url": f"ws://127.0.0.1:{self.port}/display?ticket={token}"}
+        self.tickets[token] = Ticket(
+            vm_id, instance_id, time.monotonic() + 60, source.generation if source else None
+        )
+        path = "raw-display" if source else "display"
+        return {
+            "url": f"ws://127.0.0.1:{self.port}/{path}?ticket={token}",
+            "provider": "raw" if source else "rfb",
+            "generation": source.generation if source else "",
+            "instance_id": instance_id,
+        }
+
+    async def _raw(self, ws: ServerConnection, ticket: Ticket) -> None:
+        instance = self.service.manager.get(ticket.vm_id)
+        bridge = instance.display_bridge
+        if bridge is None or bridge.source.generation != ticket.generation:
+            raise ValueError("raw display generation changed")
+        source = bridge.source
+        queue = source.subscribe()
+        acknowledgements: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
+        pending_seq: int | None = None
+
+        async def send() -> None:
+            nonlocal pending_seq
+            while True:
+                frame = await queue.get()
+                if frame is None:
+                    await ws.close(code=1001, reason="raw display ended")
+                    return
+                current = self.service.manager.find(ticket.vm_id)
+                if current is not instance or current.display_bridge is not bridge:
+                    return
+                started = time.perf_counter()
+                pending_seq = frame.seq
+                async with asyncio.timeout(5):
+                    await ws.send(frame.wire())
+                    await acknowledgements.get()
+                pending_seq = None
+                self.timings.record(forward_ms=(time.perf_counter() - started) * 1000)
+
+        async def receive_acknowledgements() -> None:
+            while True:
+                message = await ws.recv()
+                if (
+                    not isinstance(message, bytes)
+                    or len(message) != 8
+                    or struct.unpack(">Q", message)[0] != pending_seq
+                    or acknowledgements.full()
+                ):
+                    raise ValueError("raw display accepts only its pending frame acknowledgement")
+                acknowledgements.put_nowait(struct.unpack(">Q", message)[0])
+
+        async def invalidated() -> None:
+            await source.invalidated.wait()
+            await ws.close(code=1001, reason="raw display surface changed")
+
+        tasks = [
+            asyncio.create_task(send()),
+            asyncio.create_task(receive_acknowledgements()),
+            asyncio.create_task(invalidated()),
+        ]
+        try:
+            completed, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in completed:
+                task.result()
+        finally:
+            source.unsubscribe(queue)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _handle(self, ws: ServerConnection) -> None:
         writer: asyncio.StreamWriter | None = None
@@ -202,11 +274,26 @@ class DisplayGateway:
             url = urlsplit(ws.request.path)
             token = parse_qs(url.query).get("ticket", [""])[0]
             ticket = self.tickets.pop(token, None)
-            if url.path != "/display" or ticket is None or ticket.expires <= time.monotonic():
+            if (
+                ticket is None
+                or ticket.expires <= time.monotonic()
+                or url.path != ("/raw-display" if ticket.generation else "/display")
+            ):
                 await ws.close(code=1008, reason="display ticket is invalid")
                 return
             instance = self.service.manager.get(ticket.vm_id)
             self.service.require_instance_id(instance, ticket.instance_id)
+            if ticket.generation:
+                bridge = instance.display_bridge
+                if (
+                    bridge is None
+                    or bridge.source.closed
+                    or bridge.source.generation != ticket.generation
+                ):
+                    raise ValueError("raw display ticket names an obsolete source")
+                accepted = True
+                await self._raw(ws, ticket)
+                return
             if instance.console_address is None or instance.console_password is None:
                 return
             accepted = True
@@ -306,7 +393,17 @@ class DisplayGateway:
             if disconnect_lease is not None and ticket is not None:
                 with contextlib.suppress(PaletteError):
                     current = self.service.manager.find(ticket.vm_id)
-                    if current is not None and current.view.instance_id == ticket.instance_id:
+                    if (
+                        current is not None
+                        and current.view.instance_id == ticket.instance_id
+                        and (
+                            ticket.generation is None
+                            or (
+                                current.display_bridge is not None
+                                and current.display_bridge.source.generation == ticket.generation
+                            )
+                        )
+                    ):
                         await self.service.control.revoke(
                             ticket.vm_id,
                             expected_lease=disconnect_lease,

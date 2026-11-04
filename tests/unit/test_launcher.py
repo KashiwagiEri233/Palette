@@ -37,6 +37,44 @@ def plan_for(profile, *, overlay: Path, workdir: Path, **kwargs):
 
 
 class TestArgumentVector:
+    def test_steady_vnc_does_not_require_a_helper_or_posix_fd_passing(
+        self, profile, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(launcher, "IS_WINDOWS", False)
+        plan = plan_for(
+            profile,
+            overlay=tmp_path / "o.qcow2",
+            workdir=tmp_path,
+            steady_display=True,
+            managed_console=True,
+        )
+        assert plan.steady_display and not plan.experimental_display
+        assert "dbus,p2p=yes,gl=off" in plan.argv and "-vnc" in plan.argv
+        assert "stdio,id=qmp,signal=off" in plan.argv
+        assert plan.qmp_endpoint is None
+
+    @pytest.mark.parametrize("windows", [True, False])
+    def test_dbus_opt_in_keeps_one_private_qmp_and_vnc_fallback(
+        self, profile, tmp_path, monkeypatch, windows
+    ):
+        from palette import windows_unix
+
+        monkeypatch.setattr(launcher, "IS_WINDOWS", windows)
+        monkeypatch.setattr(windows_unix, "endpoint_directory", lambda: tmp_path)
+        monkeypatch.setattr(windows_unix, "validate_endpoint", lambda value: value.encode())
+        plan = plan_for(
+            profile,
+            overlay=tmp_path / "o.qcow2",
+            workdir=tmp_path,
+            experimental_display=True,
+            managed_console=True,
+        )
+        assert "dbus,p2p=yes,gl=off" in plan.argv
+        assert plan.argv.count("-mon") == 1
+        assert plan.qmp_endpoint == str(tmp_path / "qmp.sock")
+        assert "stdio,id=qmp,signal=off" not in plan.argv
+        assert "-vnc" in plan.argv
+
     def test_windows_enhancements_use_private_nonblocking_sockets(
         self, profile, tmp_path, monkeypatch
     ):

@@ -31,9 +31,29 @@ class CapturedImage:
         return len(self.png_bytes)
 
 
+@dataclass(frozen=True, slots=True)
+class AcquiredImage:
+    """Immutable screendump bytes and geometry, before expensive image processing."""
+
+    data: bytes
+    native_size: Size
+    format_used: str
+    started: float
+    source_path: Path | None = None
+
+
 @runtime_checkable
 class CaptureBackend(Protocol):
     """Swappable so that a VNC backend can replace QMP screendump without touching
     the input path or the tool contracts."""
 
     async def capture(self, *, display_id: str, head: int, sink: Path) -> CapturedImage: ...
+
+
+@runtime_checkable
+class SplitCaptureBackend(CaptureBackend, Protocol):
+    """Optional two-stage path; legacy backends retain the combined capture contract."""
+
+    async def acquire(self, *, display_id: str, head: int, sink: Path) -> AcquiredImage: ...
+
+    def encode(self, acquired: AcquiredImage) -> CapturedImage: ...

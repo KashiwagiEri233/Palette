@@ -35,6 +35,8 @@ from ..capture.base import CaptureBackend
 from ..capture.qmp import QmpCaptureBackend
 from ..cleanup import join_cleanup
 from ..config import PaletteConfig, Profile
+from ..display_bridge import DisplayBridge, dbus_available, display_available
+from ..display_settings import DisplayMode, DisplaySettings
 from ..errors import ErrorCode, PaletteError
 from ..guest_agent import QemuGuestAgent
 from ..guest_desktop import RfbGuestDesktop
@@ -149,6 +151,10 @@ class VmInstance:
     persistent_storage: bool = False
     console_address: tuple[str, int] | None = None
     console_password: str | None = None
+    display_bridge: DisplayBridge | None = None
+    display_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    display_requested_mode: DisplayMode = "inherit"
+    display_reason: str | None = None
 
     @property
     def state(self) -> VmState:
@@ -198,6 +204,7 @@ class VmManager:
         self.storage = VmStorage(config)
         self.persistent_roots = self.storage.persistent_roots
         self.console_enabled = False
+        self.display_settings = DisplaySettings(config.runtime_root)
 
     # -- lookup ----------------------------------------------------------------------
     def get(self, vm_id: str) -> VmInstance:
@@ -519,6 +526,24 @@ class VmManager:
                     [binary, *profile.qemu.argv_prefix, "-chardev", "help"], timeout=5
                 )
                 clipboard_available = code == 0 and "qemu-vdagent" in output.split()
+        instance.display_requested_mode = self.display_settings.mode
+        experimental_display = (
+            self.console_enabled
+            and instance.display_requested_mode == "inherit"
+            and self.config.host.experimental_display == "dbus"
+            and await display_available(
+                self.config.host.experimental_display_helper, binary, profile.qemu.argv_prefix
+            )
+        )
+        steady_display = experimental_display
+        if self.console_enabled and instance.display_requested_mode == "low_latency":
+            steady_display = await dbus_available(binary, profile.qemu.argv_prefix)
+            if not steady_display:
+                instance.display_reason = (
+                    "This QEMU build does not provide D-Bus display; compatibility mode is active"
+                )
+        elif instance.display_requested_mode == "low_latency":
+            instance.display_reason = "The managed desktop display is disabled for this instance"
         plan = build_launch_plan(
             profile=profile,
             binary=binary,
@@ -535,6 +560,8 @@ class VmManager:
             clipboard_available=clipboard_available,
             tools_iso=overrides.tools_iso,
             attach_primary=overrides.attach_primary,
+            experimental_display=experimental_display,
+            steady_display=steady_display,
         )
         instance.plan = plan
         process = await spawn_qemu(
@@ -626,6 +653,8 @@ class VmManager:
             ) from exc
 
         instance.view.qmp_ready = True
+        if plan.experimental_display:
+            await self.start_display_bridge(instance)
         if self.console_enabled and {"query-vnc", "set_password"}.issubset(qmp.commands or ()):
             import secrets
 
@@ -691,6 +720,38 @@ class VmManager:
                 "host_boot_epoch": instance.view.boot_epoch,
             },
         )
+
+    async def start_display_bridge(self, instance: VmInstance) -> None:
+        """Opt-in setup or explicit viewer reconnect. Failure retains the VNC console."""
+        async with instance.display_lock:
+            if (
+                instance.plan is None
+                or not instance.plan.experimental_display
+                or instance.qmp is None
+                or not instance.qmp.connected
+                or instance.process is None
+                or instance.process.returncode is not None
+                or self.config.host.experimental_display_helper is None
+            ):
+                return
+            if instance.display_bridge is not None:
+                if not instance.display_bridge.source.closed:
+                    return
+                await instance.display_bridge.close()
+            bridge = DisplayBridge(
+                Path(self.config.host.experimental_display_helper), instance.view.instance_id
+            )
+            instance.display_bridge = bridge
+            try:
+                await bridge.start(
+                    instance.qmp,
+                    instance.process.pid,
+                    instance.profile.devices.head,
+                    instance.guard,
+                )
+            except (OSError, PaletteError, TimeoutError) as error:
+                logger.warning("experimental display unavailable; retaining VNC: %s", error)
+                await bridge.close()
 
     async def _build_guest_tools(self, instance: VmInstance) -> GuestToolBackend:
         config = instance.profile.guest_tools
@@ -1011,6 +1072,7 @@ class VmManager:
             with contextlib.suppress(Exception):
                 await instance.controller.shutdown(release=False)
         for name, channel in (
+            ("experimental display", instance.display_bridge),
             ("guest tools", instance.guest_tools),
             ("guest agent", instance.qemu_guest_agent),
             ("guest desktop", instance.guest_desktop),

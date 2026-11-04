@@ -411,6 +411,9 @@ class HostConfig(_Strict):
     )
     audit_enabled: bool = True
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    # Trusted host opt-in only. Agent requests cannot select a display transport.
+    experimental_display: Literal["off", "dbus"] = "off"
+    experimental_display_helper: str | None = None
     #: Reserved for the operator identity that authorises destructive lifecycle actions
     #: when no interactive confirmation channel exists.
     operator_authorized: bool = True

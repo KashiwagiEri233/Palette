@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from palette.capture.work import image_work
+from palette.capture.work import capture_io, image_work
 from palette.timing import TimingWindow
 
 
@@ -66,6 +66,24 @@ async def test_only_two_image_workers_execute_at_once() -> None:
         gate.set()
         await asyncio.gather(*tasks)
     assert peak == 2
+
+
+async def test_acquisition_io_does_not_wait_for_the_png_encoder_slots() -> None:
+    gate = threading.Event()
+    loop = asyncio.get_running_loop()
+    entered = [asyncio.Event(), asyncio.Event()]
+
+    def work(index: int) -> None:
+        loop.call_soon_threadsafe(entered[index].set)
+        gate.wait(5)
+
+    tasks = [asyncio.create_task(image_work(lambda i=i: work(i))) for i in range(2)]
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), 2)
+        assert await asyncio.wait_for(capture_io(lambda: b"header"), 1) == b"header"
+    finally:
+        gate.set()
+        await asyncio.gather(*tasks)
 
 
 def test_timing_windows_are_bounded_and_ignore_nonfinite_values() -> None:

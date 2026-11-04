@@ -86,6 +86,8 @@ async def test_multiple_inputs_and_receipts_share_one_connection(stream_fixture)
     client = OperatorClient(owner.service.config.runtime_root)
     metrics = await client.call("control.metrics", vm_id="desktop")
     assert metrics["input"]["qmp_ms"]["count"] == 10
+    assert metrics["input_transport"] == "operator-input-stream-v1"
+    assert metrics["observation_pipeline"] == "split"
     assert "operator-input-stream-v1" in (await client.call("hello"))["features"]
 
 
