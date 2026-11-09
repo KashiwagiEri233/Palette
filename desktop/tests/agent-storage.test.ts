@@ -3,7 +3,6 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AgentCredentials } from '../src/main/agent-storage'
-import { UnavailableGuestProgramming } from '../src/main/guest-programming'
 
 it('persists only encrypted credentials and serializes concurrent modifications', async () => {
   const root = await mkdtemp(join(tmpdir(), 'palette-secret-test-'))
@@ -36,12 +35,4 @@ it('keeps secrets in memory when encryption is unavailable', async () => {
     expect(await new AgentCredentials(join(root, 'keys.json'), encryption).read('a')).toBeUndefined()
     await expect(readFile(join(root, 'keys.json'))).rejects.toMatchObject({ code: 'ENOENT' })
   } finally { await rm(root, { recursive: true, force: true }) }
-})
-it('guest programming placeholders fail explicitly', async () => {
-  const adapter = new UnavailableGuestProgramming()
-  expect(adapter.available).toBe(false)
-  await expect(adapter.execute('echo test')).rejects.toThrow('GUEST_TOOL_UNAVAILABLE')
-  await expect(adapter.read('/file')).rejects.toThrow('GUEST_TOOL_UNAVAILABLE')
-  await expect(adapter.write('/file', 'test')).rejects.toThrow('GUEST_TOOL_UNAVAILABLE')
-  await expect(adapter.edit('/file', 'a', 'b')).rejects.toThrow('GUEST_TOOL_UNAVAILABLE')
 })

@@ -550,7 +550,12 @@ class ImageManager:
         return True
 
     def prune_instances(
-        self, vm_id: str, *, keep_instance_ids: set[str], protected_paths: tuple[Path, ...] = ()
+        self,
+        vm_id: str,
+        *,
+        keep_instance_ids: set[str],
+        protected_paths: tuple[Path, ...] = (),
+        strict: bool = False,
     ) -> list[str]:
         """Remove old instances beyond the retention limit, newest kept first."""
         records: dict[Path, dict[str, Any]] = {}
@@ -577,6 +582,10 @@ class ImageManager:
         candidates.sort(key=lambda entry: str(entry.get("created_at", "")), reverse=True)
         surplus = candidates[self.max_overlays if self.keep_overlays else 0 :]
         pending = {Path(entry["root"]) for entry in surplus}
+        if strict:
+            vm_root = self.guard.resolve("vms", vm_id)
+            if vm_root.exists() and any(child not in pending for child in vm_root.iterdir()):
+                raise PaletteError(ErrorCode.STATE_CONFLICT, "虚拟机文件的归属或退出状态无法确认")
 
         def owners(paths: list[str] | tuple[Path, ...]) -> set[Path]:
             result: set[Path] = set()
@@ -614,22 +623,55 @@ class ImageManager:
                 pending.discard(root)
                 roots.update(dependencies.get(root, set()) - seen)
 
+        wanted = set(pending)
         protect((set(records) - pending) | owners(protected_paths))
+        if strict and pending != wanted:
+            raise PaletteError(ErrorCode.STATE_CONFLICT, "虚拟机文件仍被其他虚拟机或配置引用")
         removed: list[str] = []
+        ordered: list[Path] = []
         while pending:
             referenced = set().union(*(dependencies[root] for root in pending))
             ready = pending - referenced
             if not ready:
+                if strict:
+                    raise PaletteError(ErrorCode.STATE_CONFLICT, "虚拟机磁盘存在循环依赖")
                 logger.warning("retention kept a cyclic disk dependency for %s", vm_id)
                 break
             root = min(ready, key=lambda path: str(records[path].get("created_at", "")))
             pending.remove(root)
+            ordered.append(root)
+
+        blocked: set[Path] = set()
+        for root in ordered:
+            if root in blocked:
+                continue
             instance_id = str(records[root]["instance_id"])
+            manifest = self.guard.resolve("vms", vm_id, instance_id, "manifest.json")
+            try:
+                manifest_data = manifest.read_bytes() if strict else b""
+            except OSError as exc:
+                raise PaletteError(ErrorCode.STATE_CONFLICT, "虚拟机文件归属记录无法读取") from exc
             try:
                 if self.delete_instance(vm_id, instance_id):
                     removed.append(instance_id)
             except (PaletteError, OSError) as exc:
-                protect(set(dependencies[root]))
+                if strict:
+                    if root.is_dir() and not manifest.exists():
+                        try:
+                            manifest.write_bytes(manifest_data)
+                        except OSError as restore_error:
+                            raise PaletteError(
+                                ErrorCode.STATE_CONFLICT, "虚拟机文件清理失败, 归属记录无法恢复"
+                            ) from restore_error
+                    raise PaletteError(
+                        ErrorCode.STATE_CONFLICT, "虚拟机文件清理失败, 请重试删除"
+                    ) from exc
+                todo = set(dependencies[root])
+                while todo:
+                    dependency = todo.pop()
+                    if dependency not in blocked:
+                        blocked.add(dependency)
+                        todo.update(dependencies.get(dependency, set()) - blocked)
                 logger.warning("prune skipped %s/%s: %s", vm_id, instance_id, type(exc).__name__)
         return removed
 

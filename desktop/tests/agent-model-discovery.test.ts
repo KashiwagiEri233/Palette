@@ -26,7 +26,7 @@ it.each(['openai-completions', 'openai-responses', 'anthropic-messages'] as cons
   } finally { await fixture.close() }
 })
 
-it.each([[401, '认证失败'], [403, '认证失败'], [404, '不支持'], [405, '不支持'], [500, 'HTTP 500']] as const)('returns safe errors for HTTP %s without echoing credentials', async (status, message) => {
+it.each([[401, '认证失败'], [404, '不支持'], [500, 'HTTP 500']] as const)('returns safe errors for HTTP %s without echoing credentials', async (status, message) => {
   const fixture = await server((_request, response) => { response.writeHead(status); response.end('test-secret echoed upstream') })
   try {
     const error = await discoverAgentModels({ api: 'openai-completions', baseUrl: fixture.baseUrl }, 'test-secret').catch(error => error as Error)

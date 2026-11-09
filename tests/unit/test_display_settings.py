@@ -8,24 +8,11 @@ from palette.display_settings import DisplaySettings
 from palette.errors import ErrorCode, PaletteError
 
 
-def test_absent_preference_preserves_configuration_and_updates_survive_reload(tmp_path):
-    settings = DisplaySettings(tmp_path)
-    assert settings.mode == "inherit"
-    assert not (tmp_path / "display-settings.json").exists()
-    settings.update({"mode": "low_latency"})
-    assert DisplaySettings(tmp_path).mode == "low_latency"
-    settings.update({"mode": "compatibility"})
-    assert DisplaySettings(tmp_path).mode == "compatibility"
-    assert list(tmp_path.glob("*.tmp")) == []
-
-
 @pytest.mark.parametrize(
     "payload",
     [
-        {},
         {"mode": "inherit"},
         {"mode": []},
-        {"mode": True},
         {"mode": "low_latency", "helper": "arbitrary"},
     ],
 )

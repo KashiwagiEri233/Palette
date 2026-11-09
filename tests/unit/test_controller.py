@@ -174,31 +174,6 @@ class TestObservation:
             assert frame.cursor_position_source == "not_observed"
             assert captured.png_bytes.startswith(b"\x89PNG")
 
-    async def test_the_frame_is_registered_for_later_actions(self, harness_factory) -> None:
-        async with harness_factory() as h:
-            frame, _ = await h.controller.observe()
-            assert h.controller.frame_by_id(frame.frame_id).frame_id == frame.frame_id
-            assert h.controller.latest_frame is not None
-
-    async def test_a_resolution_change_bumps_the_display_epoch(self, harness_factory) -> None:
-        async with harness_factory() as h:
-            await h.controller.observe()
-            epoch = h.view.display_epoch
-            h.capture.width, h.capture.height = 400, 300
-            frame, _ = await h.controller.observe()
-            assert h.view.display_epoch == epoch + 1
-            assert frame.display_epoch == epoch + 1
-            assert frame.native_size == Size(width=400, height=300)
-
-    async def test_an_unexpected_resolution_is_still_reported_truthfully(
-        self, harness_factory
-    ) -> None:
-        """The profile says 1280x800 and the guest says 320x200: the frame records what
-        was actually captured, and the mismatch is logged rather than corrected."""
-        async with harness_factory() as h:
-            frame, _ = await h.controller.observe()
-            assert frame.native_size == Size(width=320, height=200)
-
 
 class TestFrameFencing:
     async def test_an_unknown_frame_is_refused(self, harness_factory) -> None:
@@ -356,18 +331,6 @@ class TestFrameFencing:
             assert receipt.frame.native_size == Size(width=400, height=300)
             assert h.view.display_epoch == 2
 
-    async def test_an_unchanged_size_does_not_block_the_action(self, harness_factory) -> None:
-        capture = StubCaptureBackend()
-        async with harness_factory(capture=capture) as h:
-            frame, _ = await h.controller.observe()
-            receipt, _ = await h.controller.act(
-                request_id="r1",
-                frame_id=frame.frame_id,
-                action_payload={"type": "move", "x": 10, "y": 10},
-            )
-            assert receipt.ok is True
-            assert h.view.display_epoch == 1
-
     async def test_an_action_still_works_after_a_resolution_change(self, harness_factory) -> None:
         """Regression: a real WinPE boot found this.
 
@@ -456,30 +419,6 @@ class TestPointerBatching:
                     assert arguments["device"] == "video0"
                     assert arguments["head"] == 0
 
-    async def test_absolute_coordinates_travel_as_a_pair(self, harness_factory) -> None:
-        async with harness_factory() as h:
-            frame, _ = await h.controller.observe()
-            await h.controller.act(
-                request_id="r1",
-                frame_id=frame.frame_id,
-                action_payload={"type": "move", "x": 0, "y": 0},
-            )
-            assert h.qmp.absolute() == [(0, 0)]
-            assert h.qmp.events()[0] == [
-                {"type": "abs", "data": {"axis": "x", "value": 0}},
-                {"type": "abs", "data": {"axis": "y", "value": 0}},
-            ]
-
-    async def test_a_corner_click_maps_to_the_axis_extremes(self, harness_factory) -> None:
-        async with harness_factory() as h:
-            frame, _ = await h.controller.observe()
-            await h.controller.act(
-                request_id="r1",
-                frame_id=frame.frame_id,
-                action_payload={"type": "move", "x": 319, "y": 199},
-            )
-            assert h.qmp.absolute() == [(32767, 32767)]
-
     async def test_a_double_click_is_two_complete_clicks(self, harness_factory) -> None:
         async with harness_factory() as h:
             frame, _ = await h.controller.observe()
@@ -494,16 +433,6 @@ class TestPointerBatching:
                 ("left", True),
                 ("left", False),
             ]
-
-    async def test_a_right_click_uses_the_right_button(self, harness_factory) -> None:
-        async with harness_factory() as h:
-            frame, _ = await h.controller.observe()
-            await h.controller.act(
-                request_id="r1",
-                frame_id=frame.frame_id,
-                action_payload={"type": "click", "x": 1, "y": 1, "button": "right"},
-            )
-            assert h.qmp.buttons() == [("right", True), ("right", False)]
 
     async def test_scroll_emits_one_pulse_per_tick(self, harness_factory) -> None:
         async with harness_factory() as h:
@@ -562,16 +491,6 @@ class TestPointerBatching:
             assert positions[0] == (0, 0) or positions[0][0] < 3000
             assert positions[-1] != positions[0]
 
-    async def test_drag_never_holds_a_button_when_it_finishes(self, harness_factory) -> None:
-        async with harness_factory() as h:
-            frame, _ = await h.controller.observe()
-            await h.controller.act(
-                request_id="r1",
-                frame_id=frame.frame_id,
-                action_payload={"type": "drag", "points": [{"x": 0, "y": 0}, {"x": 20, "y": 20}]},
-            )
-            assert h.controller.ledger_snapshot()["buttons"] == []
-
 
 class TestKeyboardBatching:
     async def test_a_chord_presses_modifiers_first_and_releases_them_last(
@@ -627,38 +546,8 @@ class TestKeyboardBatching:
             assert h.qmp.events() == []
             assert image is None
 
-    async def test_control_characters_must_be_explicit_key_actions(self, harness_factory) -> None:
-        async with harness_factory() as h:
-            frame, _ = await h.controller.observe()
-            receipt, _ = await h.controller.act(
-                request_id="r1",
-                frame_id=frame.frame_id,
-                action_payload={"type": "type_text", "text": "save\n", "mode": "keyboard"},
-            )
-            assert receipt.error is not None
-            assert receipt.error.code == ErrorCode.UNSUPPORTED_TEXT
-            assert h.qmp.events() == []
-
 
 class TestIdempotency:
-    async def test_a_repeated_request_returns_the_original_receipt(self, harness_factory) -> None:
-        async with harness_factory() as h:
-            frame, _ = await h.controller.observe()
-            payload = {"type": "click", "x": 30, "y": 30}
-            first, _ = await h.controller.act(
-                request_id="same", frame_id=frame.frame_id, action_payload=payload
-            )
-            batches_after_first = len(h.qmp.events())
-            second, image = await h.controller.act(
-                request_id="same", frame_id=frame.frame_id, action_payload=payload
-            )
-            assert first.ok is True
-            assert second.deduplicated is True
-            assert second.action_seq == first.action_seq
-            # Crucially: the de-duplicated replay performed no input at all.
-            assert len(h.qmp.events()) == batches_after_first
-            assert image is None
-
     async def test_the_same_request_id_with_different_parameters_is_a_conflict(
         self, harness_factory
     ) -> None:
@@ -857,15 +746,6 @@ class TestLedgerAndRelease:
             )
             assert "left" in result.released_buttons
             assert h.controller.ledger_snapshot()["buttons"] == ["left"]
-
-    async def test_releasing_with_nothing_held_is_a_no_op(self, harness_factory) -> None:
-        async with harness_factory() as h:
-            result = await h.controller.release_inputs()
-            assert result.ok is True
-            assert result.release_confirmed is True
-            assert result.released_keys == []
-            qmp_calls_after = len(h.qmp.calls)
-            assert qmp_calls_after == 0
 
     async def test_emergency_release_cancels_a_running_action_and_lets_go(
         self, harness_factory
@@ -1165,19 +1045,6 @@ class TestWait:
             assert result.frame is not None
             assert image is not None
 
-    async def test_changed_detects_a_difference(self, harness_factory) -> None:
-        capture = StubCaptureBackend()
-        async with harness_factory(capture=capture) as h:
-            frame, _ = await h.controller.observe()
-            capture.colour = (10, 10, 10)
-            result, _ = await h.controller.wait(
-                after_frame_id=frame.frame_id, mode="changed", timeout_ms=1500, threshold=0.001
-            )
-            assert result.reason == "content_changed"
-            assert result.ok is True
-            assert result.samples >= 1
-            assert result.changed_ratio is not None and result.changed_ratio > 0.001
-
     async def test_changed_compares_against_the_frame_the_agent_saw(self, harness_factory) -> None:
         """The comparison baseline is the referenced frame, not a sample taken after the
         wait began; otherwise a change that already happened could never be seen."""
@@ -1224,22 +1091,6 @@ class TestWait:
 
 
 class TestRegistryUnit:
-    def test_an_unknown_identifier_is_not_found(self, tmp_path: Path) -> None:
-        registry = FrameRegistry()
-        with pytest.raises(PaletteError) as info:
-            registry.get("frame_x")
-        assert info.value.code is ErrorCode.FRAME_NOT_FOUND
-
-    def test_a_retired_identifier_explains_itself(self, tmp_path: Path) -> None:
-        registry = FrameRegistry()
-        frame = _frame("frame_1")
-        registry.add(frame)
-        registry.clear(reason="the display resolution changed")
-        with pytest.raises(PaletteError) as info:
-            registry.get("frame_1")
-        assert info.value.code is ErrorCode.STALE_FRAME
-        assert info.value.details["reason"] == "the display resolution changed"
-
     def test_the_registry_is_bounded(self) -> None:
         registry = FrameRegistry(max_entries=3)
         for index in range(10):

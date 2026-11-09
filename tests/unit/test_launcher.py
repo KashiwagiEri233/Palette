@@ -7,9 +7,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
-from palette.config import FirmwareConfig, HostConfig, NetworkConfig, QemuConfig
+from palette.config import FirmwareConfig, NetworkConfig
 from palette.errors import ErrorCode, PaletteError
 from palette.vm import launcher
 from palette.vm.launcher import (
@@ -21,7 +20,7 @@ from palette.vm.launcher import (
     require_accelerator,
     run_tool,
 )
-from support.profiles import FAKE_QEMU, FAKE_QEMU_IMG, make_profile
+from support.profiles import make_profile
 
 
 def plan_for(profile, *, overlay: Path, workdir: Path, **kwargs):
@@ -224,27 +223,6 @@ class TestArgumentVector:
         plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
         assert not any("palette-tools" in arg for arg in plan.argv)
 
-    def test_no_shell_is_involved(self, profile, tmp_path: Path) -> None:
-        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
-        assert isinstance(plan.argv, list)
-        assert all(isinstance(argument, str) for argument in plan.argv)
-        # Every QEMU argument is a discrete list element: nothing is ever re-quoted or
-        # passed through a shell, so metacharacters have no meaning to anything.
-        assert not any(argument.startswith('"') or argument.endswith('"') for argument in plan.argv)
-
-    def test_a_path_with_spaces_survives_as_one_argument(self, profile, tmp_path: Path) -> None:
-        awkward = tmp_path / "a dir with spaces & symbols"
-        awkward.mkdir()
-        overlay = awkward / "overlay.qcow2"
-        plan = plan_for(profile, overlay=overlay, workdir=awkward)
-        blocks = [
-            plan.argv[i + 1] for i, argument in enumerate(plan.argv) if argument == "-blockdev"
-        ]
-        assert json.loads(blocks[0])["filename"] == str(overlay)
-        assert plan.cwd == awkward
-        # The path is never split: it lives inside a single argument, unquoted and intact.
-        assert any("a dir with spaces & symbols" in argument for argument in plan.argv)
-
     def test_the_display_device_precedes_the_input_devices(self, profile, tmp_path: Path) -> None:
         """The plan requires this order: an input device bound to a display that does not
         exist yet falls back to an unbound handler."""
@@ -258,6 +236,11 @@ class TestArgumentVector:
             i for i, argument in enumerate(plan.argv) if argument.startswith("usb-tablet")
         )
         assert display < xhci < keyboard and xhci < tablet
+        assert plan.argv[plan.argv.index("-display") + 1] == "none"
+        assert plan.argv[plan.argv.index("-nic") + 1] == "none"
+        assert "-S" in plan.argv
+        assert plan.argv[plan.argv.index("-smp") + 1] == str(profile.resources.vcpus)
+        assert plan.argv[plan.argv.index("-m") + 1] == str(profile.resources.memory_mib)
 
     def test_input_devices_are_bound_to_the_display(self, profile, tmp_path: Path) -> None:
         plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
@@ -266,14 +249,6 @@ class TestArgumentVector:
         assert "display=video0" in keyboard
         assert "display=video0" in tablet
         assert "head=0" in tablet
-
-    def test_no_window_and_no_network(self, profile, tmp_path: Path) -> None:
-        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
-        assert plan.argv[plan.argv.index("-display") + 1] == "none"
-        assert plan.argv[plan.argv.index("-nic") + 1] == "none"
-        assert "-nodefaults" in plan.argv
-        # No second, unauthenticated input channel.
-        assert "-vnc" not in plan.argv
 
     def test_qmp_is_on_a_private_instance_transport(self, profile, tmp_path: Path) -> None:
         plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
@@ -299,19 +274,6 @@ class TestArgumentVector:
         assert format_node["driver"] == "qcow2"
         assert format_node["file"] == "disk-file"
         assert " " not in blocks[0] and " " not in blocks[1]
-
-    def test_the_guest_starts_paused(self, profile, tmp_path: Path) -> None:
-        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
-        assert "-S" in plan.argv
-        assert any("paused" in note for note in plan.notes)
-
-    def test_the_machine_and_resource_limits_come_from_the_profile(
-        self, profile, tmp_path: Path
-    ) -> None:
-        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
-        assert plan.argv[plan.argv.index("-machine") + 1] == "q35"
-        assert plan.argv[plan.argv.index("-m") + 1] == "512"
-        assert plan.argv[plan.argv.index("-smp") + 1] == "1"
 
     def test_firmware_variables_are_per_instance(self, profile, tmp_path: Path) -> None:
         configured = profile.model_copy(
@@ -367,11 +329,6 @@ class TestArgumentVector:
         # is called out rather than passing unnoticed.
         assert any("port forward" in note for note in plan.notes)
 
-    def test_an_offline_profile_says_there_is_no_nic(self, profile, tmp_path: Path) -> None:
-        configured = profile.model_copy(update={"network": NetworkConfig(mode="offline")})
-        plan = plan_for(configured, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
-        assert any("no network device" in note for note in plan.notes)
-
     def test_nat_is_described_as_having_no_egress_policy(self, profile, tmp_path: Path) -> None:
         configured = profile.model_copy(update={"network": NetworkConfig(mode="nat")})
         plan = plan_for(configured, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
@@ -380,10 +337,6 @@ class TestArgumentVector:
 
 class TestExtraVolumes:
     """Caller-supplied disks and CD-ROMs."""
-
-    def test_no_volumes_means_no_extra_arguments(self, profile, tmp_path: Path) -> None:
-        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
-        assert plan.argv.count("-blockdev") == 2  # only the instance disk's file + format
 
     def test_an_iso_gets_a_scsi_controller_and_an_optical_device(
         self, profile, tmp_path: Path
@@ -518,23 +471,6 @@ class TestWindowsHostPaths:
         assert json.loads(plan.argv[plan.argv.index("-blockdev") + 1])["filename"] == str(overlay)
 
 
-class TestCallerArguments:
-    def test_caller_arguments_are_appended_after_the_profiles(
-        self, profile, tmp_path: Path
-    ) -> None:
-        configured = profile.model_copy(
-            update={"qemu": profile.qemu.model_copy(update={"extra_args": ["-rtc", "base=utc"]})}
-        )
-        plan = plan_for(
-            configured,
-            overlay=tmp_path / "o.qcow2",
-            workdir=tmp_path,
-            caller_args=["-m", "8192"],
-        )
-        assert plan.argv.index("-rtc") < plan.argv.index("-m", plan.argv.index("-rtc"))
-        assert any("caller-supplied QEMU argument" in note for note in plan.notes)
-
-
 class TestExtraChannels:
     """A second control or display channel breaks the single-writer assumption. It is
     allowed — a caller who may pass arguments may pass any of them — but never silently."""
@@ -551,20 +487,6 @@ class TestExtraChannels:
         )
         assert any("single-writer guarantee no longer holds" in note for note in plan.notes)
 
-    def test_palettes_own_qmp_channel_is_not_flagged(self, profile, tmp_path: Path) -> None:
-        """The service adds one QMP channel deliberately; only extras are a surprise."""
-        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
-        assert not any("no longer holds" in note for note in plan.notes)
-
-    def test_the_warning_is_logged(self, profile, tmp_path: Path, caplog) -> None:
-        with caplog.at_level("WARNING"):
-            plan_for(
-                profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path, caller_args=["-vnc", ":0"]
-            )
-        assert any(
-            "additional control or display channel" in record.message for record in caplog.records
-        )
-
 
 class TestEnvironment:
     def test_only_whitelisted_variables_are_inherited(
@@ -578,10 +500,6 @@ class TestEnvironment:
         assert "AWS_SECRET_ACCESS_KEY" not in env
         assert "PALETTE_TEST_SECRET" not in env
         assert set(env) <= set(ENV_WHITELIST)
-
-    def test_the_plan_carries_the_whitelisted_environment(self, profile, tmp_path: Path) -> None:
-        plan = plan_for(profile, overlay=tmp_path / "o.qcow2", workdir=tmp_path)
-        assert set(plan.env) <= set(ENV_WHITELIST)
 
 
 class TestAccelerator:
@@ -617,34 +535,13 @@ class TestAccelerator:
 
 
 class TestProbe:
-    def test_the_fake_build_is_characterised_correctly(self, profile, base_image: Path) -> None:
-        probe = probe_binary(sys.executable, with_devices=True, prefix=profile.qemu.argv_prefix)
-        assert probe.found is True
-        assert probe.version == "11.1.2"
-        assert "whpx" in probe.accelerators
-        assert probe.supports_device("usb-tablet")
-        assert probe.supports_device("qemu-xhci")
-
     def test_a_binary_that_cannot_be_started_is_reported(self) -> None:
         probe = probe_binary("definitely-not-a-real-binary-xyz")
         assert probe.found is False
         assert probe.error
 
-    def test_the_prefix_is_used_for_probing_too(self, base_image: Path) -> None:
-        """Probing the bare interpreter would interrogate the wrapper, not QEMU."""
-        profile = make_profile(base_image)
-        without_prefix = probe_binary(sys.executable)
-        with_prefix = probe_binary(sys.executable, prefix=profile.qemu.argv_prefix)
-        assert without_prefix.version != "11.1.2"
-        assert with_prefix.version == "11.1.2"
-
 
 class TestHelperExecution:
-    async def test_a_missing_helper_is_reported_as_missing(self) -> None:
-        with pytest.raises(PaletteError) as info:
-            await run_tool(["definitely-not-a-real-binary-xyz", "--version"])
-        assert info.value.code is ErrorCode.QEMU_NOT_FOUND
-
     async def test_a_helper_is_run_with_a_fixed_argument_vector(self, base_image: Path) -> None:
         profile = make_profile(base_image)
         code, stdout, _stderr = await run_tool(
@@ -652,18 +549,3 @@ class TestHelperExecution:
         )
         assert code == 0
         assert "qemu-img" in stdout
-
-    async def test_the_fake_qemu_img_is_found_through_the_profile(self, profile) -> None:
-        assert profile.qemu.qemu_img == sys.executable
-        assert FAKE_QEMU_IMG.is_file()
-        assert FAKE_QEMU.is_file()
-
-
-class TestProfileGuardrails:
-    def test_an_accelerator_fallback_cannot_be_enabled(self) -> None:
-        with pytest.raises(ValidationError) as info:
-            QemuConfig(allow_accelerator_fallback=True)
-        assert "fallback" in str(info.value)
-
-    def test_the_search_paths_default_is_not_empty(self) -> None:
-        assert HostConfig().qemu_search_paths

@@ -16,15 +16,10 @@ def transform(image: tuple[int, int], native: tuple[int, int]) -> CoordinateTran
 
 
 class TestEndpoints:
-    def test_origin_maps_to_origin(self) -> None:
-        assert transform((320, 200), (320, 200)).to_qemu(0, 0) == (0, 0)
-
-    def test_last_pixel_maps_to_last_axis_value(self) -> None:
-        # The plan's use of size-1 is what makes the final pixel reachable; a naive
-        # x * 32767 / width would leave the bottom-right corner permanently unreachable.
-        assert transform((320, 200), (320, 200)).to_qemu(319, 199) == (QEMU_ABS_MAX, QEMU_ABS_MAX)
-
     def test_scaled_image_endpoints_agree(self) -> None:
+        native = transform((320, 200), (320, 200))
+        assert native.to_qemu(0, 0) == (0, 0)
+        assert native.to_qemu(319, 199) == (QEMU_ABS_MAX, QEMU_ABS_MAX)
         scaled = transform((160, 100), (320, 200))
         assert scaled.to_qemu(0, 0) == (0, 0)
         assert scaled.to_qemu(159, 99) == (QEMU_ABS_MAX, QEMU_ABS_MAX)
@@ -86,19 +81,12 @@ class TestViewport:
             )
         assert info.value.code is ErrorCode.NOT_IMPLEMENTED
 
-    def test_full_viewport_is_accepted(self) -> None:
-        plane = transform((320, 200), (320, 200))
-        assert plane.viewport.model_dump() == {"x": 0, "y": 0, "width": 320, "height": 200}
-
 
 class TestTransformId:
-    def test_unscaled_frames_get_a_full_id(self) -> None:
-        assert (
-            transform_id_for(Size(width=1280, height=800), Size(width=1280, height=800))
-            == "full_1280x800"
-        )
-
     def test_scaled_frames_record_both_sizes(self) -> None:
+        assert transform_id_for(Size(width=1280, height=800), Size(width=1280, height=800)) == (
+            "full_1280x800"
+        )
         identity = transform_id_for(Size(width=640, height=400), Size(width=1280, height=800))
         assert identity == "fit_640x400_of_1280x800"
 
@@ -111,6 +99,3 @@ class TestInterpolation:
     def test_intermediate_points_are_preserved(self) -> None:
         path = interpolate([(0, 0), (0, 10), (10, 10)], steps_per_segment=1)
         assert path == [(0, 0), (0, 10), (10, 10)]
-
-    def test_a_single_point_is_returned_unchanged(self) -> None:
-        assert interpolate([(3, 4)], steps_per_segment=4) == [(3, 4)]

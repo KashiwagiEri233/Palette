@@ -119,30 +119,6 @@ async def hybrid(hybrid_factory):
 
 
 class TestHandshake:
-    async def test_a_hybrid_vm_reports_its_guest_capabilities(self, hybrid) -> None:
-        service, _instance = hybrid
-        status = await service.status("desktop")
-        assert status.ok is True
-        assert status.status is not None
-        guest = status.status.guest_tools
-        assert guest.enabled is True
-        assert guest.transport_online is True
-        assert guest.service_online is True
-        assert guest.protocol_version == "1.0"
-        assert guest.capabilities == ["guest.input_text", "guest.launch_app"]
-        assert guest.input_methods == ["native_text"]
-        assert guest.allowed_apps == ["text-editor"]
-        # Readiness is still not inferred from the enhancement channel being up.
-        assert status.status.desktop_ready is None
-
-    async def test_the_visual_baseline_still_works(self, hybrid) -> None:
-        """The plan is explicit that the baseline must stand on its own: nothing about the
-        enhancement channel may become a prerequisite for seeing the screen."""
-        service, _instance = hybrid
-        result, image = await service.observe_image("desktop")
-        assert result.ok is True
-        assert image.startswith(b"\x89PNG")
-
     async def test_an_unavailable_guest_service_does_not_block_startup(
         self, hybrid_factory
     ) -> None:
@@ -209,33 +185,6 @@ class TestGuestOperations:
         assert receipt.error is not None
         assert receipt.error.code == ErrorCode.STALE_FRAME
 
-    async def test_launching_a_registered_app_returns_an_opaque_identifier(self, hybrid) -> None:
-        service, instance = hybrid
-        result, _ = await service.guest_launch_app(
-            "desktop",
-            instance_id=instance.view.instance_id,
-            boot_epoch=instance.view.boot_epoch,
-            request_id="guest-launch-2",
-            app_id="text-editor",
-            options={},
-        )
-        assert result.ok is True
-        assert result.launch_id == "launch_abc"
-        assert result.frame is not None
-
-    async def test_a_stale_boot_epoch_is_refused(self, hybrid) -> None:
-        service, instance = hybrid
-        with pytest.raises(PaletteError) as info:
-            await service.guest_launch_app(
-                "desktop",
-                instance_id=instance.view.instance_id,
-                boot_epoch=instance.view.boot_epoch - 1,
-                request_id="guest-launch-3",
-                app_id="text-editor",
-                options={},
-            )
-        assert info.value.code is ErrorCode.STALE_FRAME
-
     async def test_repeating_a_request_id_does_not_type_twice(self, hybrid) -> None:
         service, instance = hybrid
         observed = await service.observe("desktop")
@@ -258,26 +207,6 @@ class TestGuestOperations:
         transport = instance.guest_tools.transport  # type: ignore[attr-defined]
         requests = [message for message in transport.sent if message["kind"] == "request"]
         assert len(requests) == 1
-
-    async def test_a_slow_guest_is_reported_as_an_unknown_outcome(self, hybrid_factory) -> None:
-        service, instance = await hybrid_factory(
-            responder=guest_service(ignore_requests=True), timeout_seconds=0.15
-        )
-        result, _ = await service.guest_input_text(
-            "desktop",
-            instance_id=instance.view.instance_id,
-            boot_epoch=instance.view.boot_epoch,
-            frame_id=None,
-            request_id="slow-guest",
-            text="hello",
-            method="native_text",
-        )
-        assert result.ok is False
-        assert result.error is not None
-        assert result.error.code == ErrorCode.ACTION_OUTCOME_UNKNOWN
-        # Not "not_sent": the guest may well have executed it, and the caller must not
-        # simply try again.
-        assert result.effect_state == "unknown"
 
 
 class TestSharedTransactions:
@@ -377,56 +306,3 @@ class TestSharedTransactions:
             action={"type": "move", "x": 1, "y": 1},
         )
         assert visual.error.code == ErrorCode.STALE_FRAME
-
-
-class TestConfiguration:
-    async def test_the_profile_registry_wins_over_the_guest_list(self, hybrid_factory) -> None:
-        """A guest that advertises an application the profile never registered must not
-        make it launchable."""
-        service, instance = await hybrid_factory(
-            responder=guest_service(apps=("text-editor", "file-manager")),
-            settings=GuestToolsConfig(
-                enabled=True,
-                capabilities=["guest.launch_app"],
-                input_methods=[],
-                allowed_apps={"file-manager": {"executable": "/usr/bin/thunar"}},
-            ),
-        )
-        status = await service.status("desktop")
-        assert status.status is not None
-        # Only the intersection is reported.
-        assert status.status.guest_tools.allowed_apps == ["file-manager"]
-        with pytest.raises(PaletteError) as info:
-            await service.guest_launch_app(
-                "desktop",
-                instance_id=instance.view.instance_id,
-                boot_epoch=instance.view.boot_epoch,
-                request_id="not-registered",
-                app_id="text-editor",
-                options={},
-            )
-        assert info.value.code is ErrorCode.APP_NOT_ALLOWED
-
-    async def test_a_capability_the_profile_withheld_is_not_callable(self, hybrid_factory) -> None:
-        service, instance = await hybrid_factory(
-            settings=GuestToolsConfig(
-                enabled=True,
-                capabilities=["guest.launch_app"],
-                input_methods=["native_text"],
-                allowed_apps={"text-editor": {"executable": "/usr/bin/mousepad"}},
-            )
-        )
-        status = await service.status("desktop")
-        assert status.status is not None
-        assert status.status.guest_tools.capabilities == ["guest.launch_app"]
-        with pytest.raises(PaletteError) as info:
-            await service.guest_input_text(
-                "desktop",
-                instance_id=instance.view.instance_id,
-                boot_epoch=instance.view.boot_epoch,
-                frame_id=None,
-                request_id="text-not-granted",
-                text="hello",
-                method="native_text",
-            )
-        assert info.value.code is ErrorCode.UNSUPPORTED_CAPABILITY

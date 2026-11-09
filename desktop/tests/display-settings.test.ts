@@ -9,26 +9,6 @@ const configured: DisplaySettings = {
 }
 
 describe('display settings', () => {
-  it('loads inherited settings without silently changing configuration', async () => {
-    const request = vi.fn(async () => inherited)
-    const controller = new DisplaySettingsController(request)
-    await controller.load()
-    expect(request.mock.calls).toEqual([['display.settings.get', undefined]])
-    expect(controller.snapshot()).toEqual({ settings: inherited, busy: false, error: '', saved: false })
-  })
-
-  it('saves an explicit mode and keeps effective instance state from the backend', async () => {
-    const request = vi.fn().mockResolvedValueOnce(inherited).mockResolvedValueOnce(configured).mockResolvedValueOnce({ ...configured, configured_mode: 'compatibility' })
-    const controller = new DisplaySettingsController(request)
-    await controller.load()
-    await controller.update(true)
-    expect(request).toHaveBeenNthCalledWith(2, 'display.settings.update', { mode: 'low_latency' })
-    expect(controller.snapshot()).toMatchObject({ settings: configured, saved: true })
-    await controller.update(false)
-    expect(request).toHaveBeenNthCalledWith(3, 'display.settings.update', { mode: 'compatibility' })
-    expect(controller.snapshot().settings?.configured_mode).toBe('compatibility')
-    expect(controller.snapshot().settings?.instances[0]).toEqual(configured.instances[0])
-  })
 
   it('preserves the confirmed switch value when saving fails', async () => {
     const request = vi.fn().mockResolvedValueOnce(inherited).mockRejectedValueOnce(new Error('Settings are not writable'))

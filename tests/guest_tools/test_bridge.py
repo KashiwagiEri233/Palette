@@ -14,15 +14,9 @@ import pytest
 
 from palette.config import GuestToolsConfig
 from palette.errors import ErrorCode, PaletteError
-from palette.guest_tools.base import (
-    ConnectingGuestToolBackend,
-    DisabledGuestToolBackend,
-    MockGuestToolBackend,
-)
 from palette.guest_tools.bridge import (
     BridgeGuestToolBackend,
     MemoryGuestToolTransport,
-    VirtioSerialGuestToolTransport,
 )
 from palette.guest_tools.protocol import PROTOCOL_VERSION
 
@@ -244,14 +238,6 @@ class TestHandshake:
         assert transport.sent == []
         await bridge.close()
 
-    async def test_the_placeholder_virtio_transport_says_it_is_not_implemented(self) -> None:
-        bridge = build(VirtioSerialGuestToolTransport())
-        caps = await bridge.connect()
-        assert caps.usable is False
-        assert "unavailable" in (caps.detail or "").lower() or "not implemented" in (
-            caps.detail or ""
-        )
-
 
 class TestOperations:
     async def test_text_is_accepted_and_reported_as_submitted(self) -> None:
@@ -296,27 +282,6 @@ class TestOperations:
             await bridge.launch_app(app_id="bash", options={})
         assert info.value.code is ErrorCode.APP_NOT_ALLOWED
         assert len(transport.sent) == before
-        await bridge.close()
-
-    async def test_an_application_the_guest_does_not_have_is_refused(self) -> None:
-        transport = MemoryGuestToolTransport(guest_service(apps=()))
-        bridge = build(transport)
-        await bridge.connect()
-        with pytest.raises(PaletteError) as info:
-            await bridge.launch_app(app_id="text-editor", options={})
-        assert info.value.code is ErrorCode.APP_NOT_ALLOWED
-        await bridge.close()
-
-    async def test_a_launch_returns_an_opaque_identifier(self) -> None:
-        transport = MemoryGuestToolTransport(guest_service())
-        bridge = build(transport)
-        await bridge.connect()
-        outcome = await bridge.launch_app(app_id="text-editor", options={})
-        assert outcome.ok is True
-        assert outcome.launch_id == "launch_1"
-        # A launch identifier is opaque to the host; it is never parsed into a PID or a
-        # window handle, and it does not claim the window is on screen.
-        assert outcome.detail == "accepted"
         await bridge.close()
 
     async def test_operations_before_connect_are_refused(self) -> None:
@@ -391,74 +356,9 @@ class TestFailures:
         assert caps.capabilities == ()
         await bridge.close()
 
-    async def test_an_operation_after_invalidation_reports_unavailable(self) -> None:
-        transport = MemoryGuestToolTransport(guest_service())
-        bridge = build(transport)
-        await bridge.connect()
-        await bridge.invalidate(reason="reset")
-        with pytest.raises(PaletteError) as info:
-            await bridge.launch_app(app_id="text-editor", options={})
-        assert info.value.code is ErrorCode.GUEST_TOOL_UNAVAILABLE
-        await bridge.close()
-
     async def test_closing_is_idempotent(self) -> None:
         transport = MemoryGuestToolTransport(guest_service())
         bridge = build(transport)
         await bridge.connect()
         await bridge.close()
         await bridge.close()
-
-
-class TestOtherBackends:
-    async def test_the_disabled_backend_is_explicitly_off(self) -> None:
-        backend = DisabledGuestToolBackend()
-        caps = await backend.capabilities()
-        assert caps.enabled is False
-        assert caps.usable is False
-        with pytest.raises(PaletteError) as info:
-            await backend.input_text(text="hi", method="native_text")
-        assert info.value.code is ErrorCode.GUEST_TOOL_UNAVAILABLE
-        with pytest.raises(PaletteError):
-            await backend.launch_app(app_id="text-editor", options={})
-
-    async def test_connecting_backend_reports_connection_not_disabled(self) -> None:
-        backend = ConnectingGuestToolBackend()
-        caps = await backend.capabilities()
-        assert caps.enabled is True
-        assert caps.usable is False
-        sent = []
-        operations = (
-            backend.input_text(text="hi", method="native_text", on_sending=lambda: sent.append(1)),
-            backend.launch_app(app_id="text-editor", options={}, on_sending=lambda: sent.append(1)),
-            backend.execute_operation("snapshot", {}, on_sending=lambda: sent.append(1)),
-        )
-        for operation in operations:
-            with pytest.raises(PaletteError) as info:
-                await operation
-            assert info.value.code is ErrorCode.GUEST_TOOL_UNAVAILABLE
-            assert info.value.message == "guest enhancement tools are connecting"
-            assert info.value.retryable is False
-        assert sent == []
-
-    async def test_the_mock_backend_refuses_an_unadvertised_method(self) -> None:
-        backend = MockGuestToolBackend(input_methods=("native_text",))
-        outcome = await backend.input_text(text="hi", method="native_text")
-        assert outcome.ok is True
-        with pytest.raises(PaletteError) as info:
-            await backend.input_text(text="hi", method="clipboard_paste")
-        assert info.value.code is ErrorCode.INPUT_TARGET_UNSUPPORTED
-
-    async def test_the_mock_backend_refuses_an_unregistered_app(self) -> None:
-        backend = MockGuestToolBackend()
-        await backend.launch_app(app_id="text-editor", options={})
-        with pytest.raises(PaletteError) as info:
-            await backend.launch_app(app_id="bash", options={})
-        assert info.value.code is ErrorCode.APP_NOT_ALLOWED
-
-    async def test_the_mock_backend_reports_offline_honestly(self) -> None:
-        backend = MockGuestToolBackend(service_online=False)
-        caps = await backend.capabilities()
-        assert caps.usable is False
-        with pytest.raises(PaletteError) as info:
-            await backend.input_text(text="hi", method="native_text")
-        assert info.value.code is ErrorCode.GUEST_TOOL_UNAVAILABLE

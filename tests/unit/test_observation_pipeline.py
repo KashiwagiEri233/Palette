@@ -130,28 +130,8 @@ async def test_late_old_encoding_does_not_replace_action_followup_frame(pipeline
     assert controller.latest_frame == receipt.frame
 
 
-async def test_only_two_snapshots_are_acquired_while_encoders_are_busy(pipeline):
+async def test_two_snapshot_limit_holds_through_cancellation_while_input_proceeds(pipeline):
     controller, capture, qmp = pipeline
-    capture.block(1)
-    capture.block(2)
-    first = asyncio.create_task(controller.observe())
-    second = asyncio.create_task(controller.observe())
-    await entered(capture, 1)
-    await entered(capture, 2)
-    third = asyncio.create_task(controller.observe())
-    await asyncio.sleep(0.01)
-    assert len(capture.acquisitions) == 2
-    await asyncio.wait_for(controller.operator_input([key_event("a", False)], lambda: None), 1)
-    assert qmp.qcodes() == [("a", False)]
-    capture.gates[1].set()
-    await first
-    await entered(capture, 3)
-    capture.gates[2].set()
-    await asyncio.gather(second, third)
-
-
-async def test_cancelled_encoding_retains_capacity_until_thread_finishes(pipeline):
-    controller, capture, _qmp = pipeline
     capture.block(1)
     capture.block(2)
     first = asyncio.create_task(controller.observe())
@@ -163,6 +143,8 @@ async def test_cancelled_encoding_retains_capacity_until_thread_finishes(pipelin
     await asyncio.sleep(0.01)
     assert not first.done()
     assert len(capture.acquisitions) == 2
+    await asyncio.wait_for(controller.operator_input([key_event("a", False)], lambda: None), 1)
+    assert qmp.qcodes() == [("a", False)]
     capture.gates[1].set()
     with pytest.raises(asyncio.CancelledError):
         await first

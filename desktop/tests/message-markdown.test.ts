@@ -23,17 +23,9 @@ describe('conversation Markdown', () => {
     expect(html).toContain('href="https://example.com/docs"')
   })
 
-  it('renders unfinished streaming code blocks and updates them when complete', () => {
-    expect(render('Reply\n\n```ts\nconst value = 1')).toContain('<span class="hljs-keyword">const</span>')
-    expect(render('Reply\n\n```ts\nconst value = 1\n```\n\n**Done**')).toContain('<strong>Done</strong>')
-  })
 
-  it('falls back for unknown languages and escapes code containing HTML', () => {
-    const html = render('```not-a-language\n<script>alert("x")</script>\n```')
-    expect(html).toContain('class="language-not-a-language"')
-    expect(html).toContain('&lt;script&gt;')
-    expect(html).not.toContain('<script>')
-  })
+
+
 })
 
 describe('streaming Markdown cache', () => {

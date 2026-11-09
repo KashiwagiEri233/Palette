@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from palette.agent_ipc import AgentCommand
+from palette.display_settings import DisplaySettings
 from palette.operator import OperatorClient
 from palette.runtime import RuntimeOwner
 
@@ -19,7 +20,9 @@ async def test_display_preference_survives_reload_and_requires_restart(service, 
         client = OperatorClient(service.config.runtime_root)
         assert "display-settings-v1" in (await client.call("hello"))["features"]
         assert (await client.call("display.settings.get"))["configured_mode"] == "inherit"
+        assert not (service.config.runtime_root / "display-settings.json").exists()
         await client.call("display.settings.update", payload={"mode": "low_latency"})
+        assert DisplaySettings(service.config.runtime_root).mode == "low_latency"
         instance = await service.manager.start("desktop")
         assert instance.plan.steady_display
         assert not instance.plan.experimental_display
@@ -48,6 +51,7 @@ async def test_display_preference_survives_reload_and_requires_restart(service, 
         await owner.close()
     restored = RuntimeOwner(type(service)(service.config))
     assert restored.service.manager.display_settings.mode == "compatibility"
+    assert not list(service.config.runtime_root.glob("display-settings-*.tmp"))
 
 
 async def test_unsupported_qemu_reports_the_actual_compatible_mode(service, monkeypatch):

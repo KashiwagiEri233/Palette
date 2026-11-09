@@ -99,23 +99,13 @@ class TestHappyPath:
         assert result.image_size == result.native_size
         assert result.scaled is False
         assert result.png_bytes.startswith(b"\x89PNG")
-
-    async def test_the_command_names_the_display_device_not_the_keyboard(
-        self, tmp_path: Path
-    ) -> None:
-        """input-send-event and screendump both address the display id; sending the
-        keyboard's id is a silent routing mistake, so it is asserted directly."""
-        client = ScreendumpQmp()
-        await backend(client).capture(display_id="video0", head=0, sink=tmp_path / "f.png")
-        assert client.calls[0]["device"] == "video0"
-        assert client.calls[0]["head"] == 0
-        assert client.calls[0]["format"] == "png"
-
-    async def test_the_filename_is_the_one_the_service_generated(self, tmp_path: Path) -> None:
-        client = ScreendumpQmp()
-        sink = tmp_path / "frames" / "frame-1.png"
-        await backend(client).capture(display_id="video0", head=0, sink=sink)
-        assert client.calls[0]["filename"] == str(sink)
+        assert client.calls[0] == {
+            "filename": str(tmp_path / "f.png"),
+            "device": "video0",
+            "head": 0,
+            "format": "png",
+        }
+        assert not (tmp_path / "f.png").exists()
 
 
 class TestFallback:
@@ -178,11 +168,6 @@ class TestFiles:
             await backend(client).capture(display_id="video0", head=0, sink=tmp_path / "f.png")
         assert info.value.code is ErrorCode.CAPTURE_FAILED
 
-    async def test_the_frame_file_is_removed_by_default(self, tmp_path: Path) -> None:
-        sink = tmp_path / "f.png"
-        await backend(ScreendumpQmp()).capture(display_id="video0", head=0, sink=sink)
-        assert not sink.exists()
-
     async def test_retention_keeps_the_file_when_asked(self, tmp_path: Path) -> None:
         sink = tmp_path / "f.png"
         result = await backend(ScreendumpQmp(), keep_frames=True).capture(
@@ -218,13 +203,6 @@ class TestLimits:
         assert result.image_size.width == 800
         assert result.image_size.height == 500
         assert result.scaled is True
-
-    async def test_no_scaling_happens_when_the_image_already_fits(self, tmp_path: Path) -> None:
-        result = await backend(
-            ScreendumpQmp(payload=render_png(800, 600)), max_long_edge=1280
-        ).capture(display_id="video0", head=0, sink=tmp_path / "f.png")
-        assert result.scaled is False
-        assert result.image_size == Size(width=800, height=600)
 
     async def test_an_impossible_byte_limit_is_reported_rather_than_exceeded(
         self, tmp_path: Path

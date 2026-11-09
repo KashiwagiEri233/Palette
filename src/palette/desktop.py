@@ -728,18 +728,62 @@ class DesktopManager:
     async def delete(self, vm_id: str) -> dict[str, Any]:
         async with self.service.manager.operations.hold(vm_id):
             definition = self.get(vm_id)
-            self.storage.require_stopped(vm_id)
-            self.guard.resolve("definitions", vm_id + ".json").unlink()
-            self.storage.operation_path(vm_id).unlink(missing_ok=True)
-            self.definitions.pop(vm_id)
-            self.service.manager.forget(vm_id)
-            self._pin()
+            # A previous attempt can have removed some disks before an I/O error.
+            self.storage.require_stopped(vm_id, validate_storage=False)
+            from .managed_disk_delete import _require_unreferenced
+
+            root = self.guard.resolve("vms", vm_id)
+            await _require_unreferenced(self, definition, "", root, exclude_vm=True)
+            self.storage.require_stopped(vm_id, validate_storage=False)
+            if self.get(vm_id) != definition:
+                raise PaletteError(ErrorCode.STATE_CONFLICT, "虚拟机配置已更改, 请重试删除")
+            owners = {
+                owner
+                for owner in (definition.storage_owner, definition.seed_owner)
+                if owner is not None
+            } | {disk.owner for disk in definition.data_disks.values()}
+            own_roots = frozenset(self.guard.resolve("vms", vm_id, owner) for owner in owners)
+            protected = list(self._extra_pins)
+            protected.extend(
+                Path(profile.images.base) for profile in self.service.config.profiles.values()
+            )
+            for other in self.definitions.values():
+                if other.vm_id == vm_id:
+                    continue
+                protected.append(Path(other.profile.images.base))
+                protected.extend(
+                    self.guard.resolve("vms", other.vm_id, owner)
+                    for owner in (other.storage_owner, other.seed_owner)
+                    if owner is not None
+                )
+                protected.extend(
+                    self.guard.resolve("vms", other.vm_id, disk.owner)
+                    for disk in other.data_disks.values()
+                )
+                protected.extend(
+                    Path(drive.path) for drive in self.settings(other).drives if drive.path
+                )
             self.service.manager.storage.prune(
                 vm_id,
                 definition.profile,
                 [self.service.manager.get(known) for known in self.service.manager.known()],
                 delete_all=True,
+                strict=True,
+                excluded_roots=own_roots,
+                protected_paths=tuple(protected),
             )
+            if root.exists():
+                try:
+                    root.rmdir()
+                except OSError as exc:
+                    raise PaletteError(
+                        ErrorCode.STATE_CONFLICT, "虚拟机文件清理失败, 请重试删除"
+                    ) from exc
+            self.storage.operation_path(vm_id).unlink(missing_ok=True)
+            self.guard.resolve("definitions", vm_id + ".json").unlink()
+            self.definitions.pop(vm_id)
+            self.service.manager.forget(vm_id)
+            self._pin()
             return {"deleted": vm_id}
 
     async def recover_operations(self) -> None:

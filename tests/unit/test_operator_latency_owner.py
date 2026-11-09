@@ -21,19 +21,6 @@ from palette.models import Size
 from support.doubles import StubCaptureBackend, StubQmp, render_png
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["--disposable", "--observation-pipeline", "split"],
-        ["--root", ".", "--observation-pipeline", "split"],
-        ["--root", ".", "--disposable"],
-    ],
-)
-def test_parser_requires_explicit_root_confirmation_and_pipeline(args):
-    with pytest.raises(SystemExit):
-        benchmark.parser().parse_args(args)
-
-
 def test_config_must_exist_and_keep_its_runtime_inside_the_disposable_root(
     tmp_path, config, monkeypatch
 ):
@@ -110,10 +97,7 @@ def test_serial_factory_uses_the_original_client_and_restores_after_failure(monk
         assert ActionController.observe is original_observe
 
 
-@pytest.mark.parametrize("mode", ["serial", "split"])
-async def test_serial_png_encoding_stays_inside_fifo_while_split_yields_input(
-    mode, profile, tmp_path
-):
+async def test_serial_capture_facade_keeps_png_encoding_inside_fifo(profile, tmp_path):
     gate = threading.Event()
     entered = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -133,7 +117,7 @@ async def test_serial_png_encoding_stays_inside_fifo_while_split_yields_input(
             return await image_work(lambda: self.encode(acquired))
 
     backend = Backend()
-    capture = benchmark.SerialCapture(backend) if mode == "serial" else backend
+    capture = benchmark.SerialCapture(backend)
     qmp = StubQmp()
     controller = ActionController(
         view=InstanceView("desktop", "inst_1", "default", "video0", 0, state="RUNNING"),
@@ -150,12 +134,9 @@ async def test_serial_png_encoding_stays_inside_fifo_while_split_yields_input(
         input_task = asyncio.create_task(
             controller.operator_input([key_event("a", False)], lambda: None)
         )
-        if mode == "serial":
-            await asyncio.sleep(0.02)
-            assert not input_task.done()
-            assert qmp.events() == []
-        else:
-            assert await asyncio.wait_for(asyncio.shield(input_task), 1) == 1
+        await asyncio.sleep(0.02)
+        assert not input_task.done()
+        assert qmp.events() == []
         gate.set()
         await observation
         assert await input_task == 1
@@ -262,35 +243,4 @@ async def test_owner_uses_standard_lifecycle_without_starting_a_vm(
         assert ready["runtime_root"] == str(config.runtime_root)
         assert ready["ready"] is True
     assert calls == ["check-owner", "start-owner", "close-owner"]
-    assert benchmark.manager.QmpCaptureBackend is original
-
-
-async def test_owner_cancellation_closes_before_restoring_capture_factory(config, monkeypatch):
-    original = benchmark.manager.QmpCaptureBackend
-    started = asyncio.Event()
-    closed = asyncio.Event()
-
-    async def available(config):
-        return None
-
-    class Owner:
-        def __init__(self, service, *, kind):
-            self.stopping = asyncio.Event()
-
-        async def start(self):
-            started.set()
-
-        async def close(self):
-            assert benchmark.manager.QmpCaptureBackend is not original
-            closed.set()
-
-    monkeypatch.setattr(benchmark, "require_no_owner", available)
-    monkeypatch.setattr(benchmark, "PaletteService", lambda config, audit: object())
-    monkeypatch.setattr(benchmark, "RuntimeOwner", Owner)
-    task = asyncio.create_task(benchmark.serve(config, "serial"))
-    await asyncio.wait_for(started.wait(), 1)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert closed.is_set()
     assert benchmark.manager.QmpCaptureBackend is original

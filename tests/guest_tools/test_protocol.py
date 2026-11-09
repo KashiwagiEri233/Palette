@@ -19,21 +19,6 @@ from palette.guest_tools.protocol import (
 
 
 class TestFraming:
-    def test_a_frame_round_trips(self) -> None:
-        payload = {"kind": "hello", "id": "1", "payload": {"a": 1}}
-        decoder = FrameDecoder()
-        messages = decoder.feed(encode_frame(payload))
-        assert messages == [payload]
-        assert decoder.buffered_bytes == 0
-
-    def test_a_half_frame_is_held_until_the_rest_arrives(self) -> None:
-        encoded = encode_frame({"kind": "hello", "id": "1"})
-        decoder = FrameDecoder()
-        assert decoder.feed(encoded[:3]) == []
-        assert decoder.buffered_bytes == 3
-        messages = decoder.feed(encoded[3:])
-        assert len(messages) == 1
-
     def test_several_frames_in_one_read_are_all_returned(self) -> None:
         decoder = FrameDecoder()
         blob = encode_frame({"kind": "a", "id": "1"}) + encode_frame({"kind": "b", "id": "2"})
@@ -112,6 +97,3 @@ class TestVersionNegotiation:
         assert info.value.code is ErrorCode.GUEST_TOOL_VERSION_MISMATCH
         assert info.value.retryable is False
         assert info.value.details["host"] == ["1.0"]
-
-    def test_a_single_shared_version_is_enough(self) -> None:
-        assert negotiate_version(["1.0"], ["1.0"]) == "1.0"

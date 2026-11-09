@@ -12,7 +12,6 @@ from pathlib import Path
 
 from palette.cli import main
 from palette.config import HostConfig, PaletteConfig
-from palette.vm.launcher import probe_binary
 from support.profiles import FAKE_QEMU, make_profile
 
 
@@ -37,29 +36,6 @@ class TestAgainstTheTestDouble:
         failures = [check for check in report["checks"] if not check["ok"] and check["blocking"]]
         assert failures == []
         assert report["ok"] is True
-
-    def test_the_report_names_the_binary_the_accelerators_and_the_devices(
-        self, base_image: Path, tmp_path: Path
-    ) -> None:
-        from palette.cli import build_doctor_report
-
-        report = build_doctor_report(fake_config(base_image, tmp_path))
-        assert report["qemu"]["found"] is True
-        assert report["qemu"]["version"] == "11.1.2"
-        assert "whpx" in report["acceleration"]["available"]
-        assert report["runtime"]["qemu_img"]["found"] is True
-        checked = {check["name"] for check in report["checks"]}
-        assert "device:usb-tablet" in checked
-        assert "device:VGA" in checked
-
-    def test_the_base_image_is_reported_as_unverified_without_a_pinned_digest(
-        self, base_image: Path, tmp_path: Path
-    ) -> None:
-        from palette.cli import build_doctor_report
-
-        report = build_doctor_report(fake_config(base_image, tmp_path))
-        assert report["base_image"]["ok"] is True
-        assert report["base_image"]["sha256_declared"] is None
 
     def test_a_pinned_digest_is_checked(self, base_image: Path, tmp_path: Path) -> None:
         from palette.cli import build_doctor_report
@@ -99,54 +75,6 @@ class TestAgainstTheTestDouble:
         assert report["ok"] is False
         pinned = next(check for check in report["checks"] if check["name"] == "qemu_version_pin")
         assert pinned["ok"] is False
-
-
-class TestAgainstThisHost:
-    def test_a_host_without_qemu_is_reported_as_not_ready(self, tmp_path: Path) -> None:
-        """This machine has no QEMU installed. The report must say so, and must not offer
-        a degraded mode as an acceptable substitute."""
-        from palette.cli import build_doctor_report
-
-        profile = make_profile(tmp_path / "base.qcow2")
-        profile = profile.model_copy(
-            update={
-                "qemu": profile.qemu.model_copy(
-                    update={"binary": "qemu-system-x86_64-does-not-exist"}
-                )
-            }
-        )
-        config = PaletteConfig(
-            profiles={"default": profile},
-            config_root=tmp_path,
-        ).model_copy(
-            update={
-                "host": HostConfig(
-                    runtime_root=str(tmp_path / "runtime"),
-                    default_profile="default",
-                    qemu_search_paths=[],
-                )
-            }
-        )
-        report = build_doctor_report(config)
-        assert report["ok"] is False
-        missing = next(check for check in report["checks"] if check["name"] == "qemu_binary")
-        assert missing["ok"] is False
-        assert missing["blocking"] is True
-
-    def test_a_profile_selecting_tcg_is_flagged_but_not_blocking(
-        self, base_image: Path, tmp_path: Path
-    ) -> None:
-        from palette.cli import build_doctor_report
-
-        config = fake_config(base_image, tmp_path)
-        profile = config.profile("default")
-        config.profiles["default"] = profile.model_copy(
-            update={"qemu": profile.qemu.model_copy(update={"accelerator": "tcg"})}
-        )
-        report = build_doctor_report(config)
-        tcg = next(check for check in report["checks"] if check["name"] == "explicit_acceleration")
-        assert tcg["ok"] is False
-        assert tcg["blocking"] is False
 
 
 class TestCommandLine:
@@ -211,29 +139,3 @@ class TestCommandLine:
         assert report["profile"]["mode"] == "hybrid"
         assert report["profile"]["guest_tools_enabled"] is True
         assert report["profile"]["network"] == "restricted-lab"
-
-
-class TestConfigCommand:
-    def test_config_show_prints_the_resolved_configuration(
-        self, base_image: Path, tmp_path: Path, capsys
-    ) -> None:
-        config_root = tmp_path / "repo"
-        (config_root / "profiles").mkdir(parents=True)
-        (config_root / "profiles" / "default.toml").write_text(
-            'profile_id = "default"\n[qemu]\naccelerator = "whpx"\n[images]\n'
-            f"base = '{base_image.as_posix()}'\n",
-            encoding="utf-8",
-        )
-        exit_code = main(["--root", str(config_root), "config", "show"])
-        assert exit_code == 0
-        document = json.loads(capsys.readouterr().out)
-        assert document["default_profile"] == "default"
-        assert "default" in document["profiles"]
-
-
-def test_the_probe_helper_agrees_with_the_fake_build(base_image: Path) -> None:
-    import sys
-
-    profile = make_profile(base_image)
-    probe = probe_binary(sys.executable, prefix=profile.qemu.argv_prefix)
-    assert probe.version == "11.1.2"

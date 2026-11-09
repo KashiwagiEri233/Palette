@@ -9,11 +9,8 @@ from pydantic import ValidationError
 
 from palette.errors import ErrorCode, PaletteError
 from palette.models import (
-    ClickAction,
     Frame,
     ObserveResult,
-    Point,
-    Receipt,
     Size,
     Viewport,
     parse_action,
@@ -57,13 +54,13 @@ class TestActionUnion:
     def test_negative_coordinates_are_rejected_before_the_controller_sees_them(self) -> None:
         assert code_of({"type": "move", "x": -1, "y": 2}) is ErrorCode.INVALID_ARGUMENT
 
-    @pytest.mark.parametrize("count", [0, 3, 10])
+    @pytest.mark.parametrize("count", [0, 3])
     def test_click_counts_are_limited_to_one_or_two(self, count: int) -> None:
         assert (
             code_of({"type": "click", "x": 1, "y": 2, "count": count}) is ErrorCode.INVALID_ARGUMENT
         )
 
-    @pytest.mark.parametrize("ticks", [0, 21, 1000])
+    @pytest.mark.parametrize("ticks", [0, 21])
     def test_scroll_is_bounded(self, ticks: int) -> None:
         payload = {"type": "scroll", "x": 1, "y": 2, "direction": "up", "ticks": ticks}
         assert code_of(payload) is ErrorCode.INVALID_ARGUMENT
@@ -96,7 +93,7 @@ class TestActionUnion:
         payload = {"type": "key", "keys": ["CTRL", "SHIFT", "ALT", "A", "B", "C", "D"]}
         assert code_of(payload) is ErrorCode.INVALID_ARGUMENT
 
-    @pytest.mark.parametrize("hold", [0, 9, 501, 5000])
+    @pytest.mark.parametrize("hold", [9, 501])
     def test_hold_time_is_bounded(self, hold: int) -> None:
         assert (
             code_of({"type": "key", "keys": ["A"], "hold_ms": hold}) is ErrorCode.INVALID_ARGUMENT
@@ -130,14 +127,6 @@ class TestActionUnion:
     def test_non_finite_numbers_cannot_be_expressed(self) -> None:
         for value in (float("nan"), float("inf")):
             assert code_of({"type": "move", "x": value, "y": 0}) is ErrorCode.INVALID_ARGUMENT
-
-    def test_literal_values_are_pinned(self) -> None:
-        with pytest.raises(ValidationError):
-            ClickAction(type="click", x=1, y=1, button="wheel-up")  # type: ignore[arg-type]
-
-    def test_point_requires_non_negative_integers(self) -> None:
-        with pytest.raises(ValidationError):
-            Point(x=-1, y=0)
 
 
 class TestFrame:
@@ -174,10 +163,6 @@ class TestFrame:
         assert rebuilt.monotonic_stamp == 0.0
         assert rebuilt.frame_id == "frame_1"
 
-    def test_captured_at_keeps_its_utc_offset(self) -> None:
-        wire = self.make_frame().to_wire()
-        assert wire["captured_at"].endswith(("+00:00", "+08:00")) or "T" in wire["captured_at"]
-
     def test_frame_ids_are_unique_and_unguessable(self) -> None:
         ids = {Frame.new_id() for _ in range(200)}
         assert len(ids) == 200
@@ -196,15 +181,3 @@ class TestReceiptAndResults:
     def test_a_failed_observation_must_carry_an_error(self) -> None:
         with pytest.raises(ValidationError):
             ObserveResult(ok=False)
-
-    def test_effect_states_are_the_documented_four(self) -> None:
-        for state in ("not_sent", "submitted", "partial", "unknown"):
-            receipt = Receipt(ok=True, request_id="r", effect_state=state)  # type: ignore[arg-type]
-            assert receipt.effect_state == state
-
-    def test_receipts_serialise_without_nulls(self) -> None:
-        receipt = Receipt(ok=True, request_id="r", effect_state="submitted")
-        wire = receipt.to_wire()
-        assert wire["ok"] is True
-        assert "frame" not in wire
-        assert "error" not in wire

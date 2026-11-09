@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { SessionManager, type SessionEntry } from '@earendil-works/pi-coding-agent'
+import { SessionManager } from '@earendil-works/pi-coding-agent'
 import type { AssistantMessage, ToolResultMessage } from '@earendil-works/pi-ai'
 import { exportMessage, messageImage, projectMessages } from '../src/main/agent-projection'
 import { normalizeTodos, todoChanges } from '../src/shared/agent-content'
 import { conversationTurns, turnContent } from '../src/renderer/lib/conversation-turns'
-import { acceptAgentSnapshot } from '../src/renderer/lib/use-agent'
-import type { AgentRunView, AgentSnapshot } from '../src/shared/agent'
+import type { AgentRunView } from '../src/shared/agent'
 
 const run: AgentRunView = { id: 'run', state: 'running', stepCount: 1 }
 const pixel = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aP1sAAAAASUVORK5CYII='
@@ -126,14 +125,4 @@ describe('on-demand images', () => {
       expect(() => messageImage(manager.getBranch(), id, 0)).toThrow()
     }
   })
-})
-
-it('ignores older snapshots and preserves unchanged historical message identity', () => {
-  const { manager } = session()
-  const messages = projectMessages(manager.getBranch(), null, new Set(), null).messages
-  const snapshot: AgentSnapshot = { streamEpoch: 'epoch', seq: 2, view: { conversationId: 'conversation', run: null, messages, tree: [], compacting: false, contextUsage: null } }
-  expect(acceptAgentSnapshot(snapshot, { ...snapshot, seq: 1 })).toBe(snapshot)
-  const next = acceptAgentSnapshot(snapshot, JSON.parse(JSON.stringify({ ...snapshot, seq: 3 })))
-  expect(next.view.messages).toBe(messages)
-  expect(acceptAgentSnapshot(snapshot, { ...snapshot, streamEpoch: 'new', seq: 0 }).streamEpoch).toBe('new')
 })

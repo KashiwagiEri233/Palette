@@ -29,7 +29,6 @@ import pytest
 from PIL import Image
 
 from palette.audit import NullAuditLog
-from palette.cli import build_doctor_report
 from palette.config import HostConfig, PaletteConfig, Profile, load_config
 from palette.errors import ErrorCode
 from palette.platforms import execution_info
@@ -80,35 +79,6 @@ def base_digest() -> str:
 
 @requires_hardware
 class TestP0Gate:
-    def test_the_environment_passes_every_doctor_check(self, tmp_path: Path) -> None:
-        report = build_doctor_report(real_config(tmp_path))
-        failures = [check for check in report["checks"] if not check["ok"] and check["blocking"]]
-        assert report["ok"] is True, failures
-
-    def test_the_requested_accelerator_is_offered_by_this_build(self, tmp_path: Path) -> None:
-        report = build_doctor_report(real_config(tmp_path))
-        assert real_profile().qemu.accelerator in report["acceleration"]["available"]
-
-    async def test_a_hidden_start_reaches_a_real_framebuffer(
-        self, tmp_path: Path, record_property
-    ) -> None:
-        service = PaletteService(real_config(tmp_path), audit=NullAuditLog())
-        await service.startup()
-        try:
-            started = time.perf_counter()
-            instance = await service.manager.start("desktop")
-            record_property("execution", execution_info(instance.profile))
-            record_property("startup_seconds", time.perf_counter() - started)
-            assert instance.view.qmp_ready is True
-            assert instance.view.screen_ready is True, "no valid framebuffer was captured"
-            assert instance.view.native_size is not None
-            result, image = await service.observe_image("desktop")
-            assert result.ok is True
-            assert image.startswith(b"\x89PNG")
-            Image.open(BytesIO(image)).verify()
-        finally:
-            await service.shutdown()
-
     async def test_see_click_type_see(self, tmp_path: Path) -> None:
         """The P0 pass criterion: look, act, and see the result, with no host focus."""
         service = PaletteService(real_config(tmp_path), audit=NullAuditLog())

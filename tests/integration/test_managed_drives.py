@@ -90,6 +90,82 @@ async def test_blank_disk_reload_restart_reset_remove_and_delete(service):
     assert not path.exists()
 
 
+async def test_vm_delete_removes_owned_disks_and_retries_partial_cleanup(service, monkeypatch):
+    desktop, vm_id = await create_vm(service)
+    source = Path(service.config.profile("default").images.base)
+    original = source.read_bytes()
+    await save_drives(desktop, vm_id, [blank()])
+    data_disk = data_path(desktop, vm_id)
+    await desktop.start(vm_id)
+    system_disk = service.manager.get(vm_id).paths.overlay
+    await desktop.stop(vm_id, force=True)
+
+    from palette.vm.images import ImageManager
+
+    remove = ImageManager.delete_instance
+    calls = 0
+
+    def fail_second(self, vm, instance, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            self.guard.resolve("vms", vm, instance, "manifest.json").unlink()
+            raise OSError("injected cleanup failure")
+        return remove(self, vm, instance, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ImageManager, "delete_instance", fail_second)
+        with pytest.raises(PaletteError, match="清理失败"):
+            await desktop.delete(vm_id)
+    assert desktop.get(vm_id).vm_id == vm_id
+    assert (desktop.directory / f"{vm_id}.json").exists()
+    assert calls == 2
+    desktop = DesktopManager(service)
+    await desktop.delete(vm_id)
+    assert not data_disk.exists() and not system_disk.exists()
+    assert not (service.config.runtime_root / "vms" / vm_id).exists()
+    assert source.read_bytes() == original
+
+
+async def test_vm_delete_refuses_another_definition_backing_chain_and_can_retry(service, tmp_path):
+    desktop, vm_id = await create_vm(service)
+    await desktop.start(vm_id)
+    disk = service.manager.get(vm_id).paths.overlay
+    await desktop.stop(vm_id, force=True)
+    external = tmp_path / "dependent.qcow2"
+    external.write_bytes(
+        b"QFI\xfb"
+        + json.dumps(
+            {
+                "driver": "qcow2",
+                "backing": str(disk),
+                "backing_format": "qcow2",
+                "virtual_size": 24 * 1024**3,
+            }
+        ).encode()
+    )
+    other = await desktop.create(
+        {
+            "name": "Dependent",
+            "profile_id": "default",
+            "source": "image",
+            "path": str(external),
+            "vcpus": 1,
+            "memory_mib": 512,
+            "disk_gib": 24,
+            "network": "offline",
+        }
+    )
+    with pytest.raises(PaletteError, match="引用"):
+        await desktop.delete(vm_id)
+    assert desktop.get(vm_id).vm_id == vm_id and disk.exists()
+    await desktop.delete(other["vm_id"])
+    assert external.exists()
+    external.unlink()
+    await desktop.delete(vm_id)
+    assert not disk.exists()
+
+
 @pytest.mark.parametrize("damage", ["capacity", "external", "missing", "manifest"])
 async def test_allocated_disks_cannot_be_silently_replaced(service, damage):
     desktop, vm_id = await create_vm(service)

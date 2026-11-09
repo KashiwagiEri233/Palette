@@ -72,6 +72,9 @@ class VmStorage:
         instances: Sequence[VmInstance],
         *,
         delete_all: bool = False,
+        strict: bool = False,
+        excluded_roots: frozenset[Path] = frozenset(),
+        protected_paths: tuple[Path, ...] = (),
     ) -> None:
         keep = {
             instance.view.instance_id
@@ -82,7 +85,11 @@ class VmStorage:
                 or (instance.process is not None and instance.process.returncode is None)
             )
         }
-        protected: list[Path] = list(self.persistent_roots) + list(self._references)
+        protected: list[Path] = (
+            [root for root in self.persistent_roots if root not in excluded_roots]
+            + list(self._references)
+            + list(protected_paths)
+        )
         for instance in instances:
             if instance.process is not None and instance.process.returncode is None:
                 protected.append(instance.paths.root)
@@ -96,7 +103,12 @@ class VmStorage:
             images.keep_overlays = False
             images.max_overlays = 0
         try:
-            images.prune_instances(vm_id, keep_instance_ids=keep, protected_paths=tuple(protected))
+            images.prune_instances(
+                vm_id,
+                keep_instance_ids=keep,
+                protected_paths=tuple(protected),
+                strict=strict,
+            )
         except (PaletteError, OSError) as exc:
             if delete_all:
                 raise

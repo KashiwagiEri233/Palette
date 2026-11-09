@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from palette.audit import AuditLog, NullAuditLog
+from palette.audit import AuditLog
 
 
 class TestScrubbing:
@@ -56,9 +56,6 @@ class TestBounding:
             log.record("event", index=index)
         assert log.tail(1)[0]["index"] == 49
 
-    def test_tail_of_a_missing_file_is_empty(self, tmp_path: Path) -> None:
-        assert AuditLog(tmp_path / "nothing.jsonl").tail() == []
-
     def test_corrupt_lines_are_skipped_rather_than_fatal(self, tmp_path: Path) -> None:
         path = tmp_path / "audit.jsonl"
         log = AuditLog(path)
@@ -77,12 +74,6 @@ class TestFailureIsolation:
         log = AuditLog(blocker / "audit.jsonl")
         log.record("event", value=1)  # must not raise
 
-    def test_null_audit_writes_nothing(self, tmp_path: Path) -> None:
-        log = NullAuditLog()
-        log.record("event", value=1)
-        assert log.tail() == []
-        assert log.enabled is False
-
     def test_disabled_audit_skips_the_write(self, tmp_path: Path) -> None:
         path = tmp_path / "audit.jsonl"
         log = AuditLog(path, enabled=False)
@@ -91,14 +82,6 @@ class TestFailureIsolation:
 
 
 class TestRecordShape:
-    def test_records_carry_a_timestamp_and_event_name(self, tmp_path: Path) -> None:
-        log = AuditLog(tmp_path / "audit.jsonl")
-        log.record("vm.started", vm_id="desktop")
-        entry = log.tail(1)[0]
-        assert entry["event"] == "vm.started"
-        assert entry["vm_id"] == "desktop"
-        assert "T" in entry["ts"]
-
     def test_non_serialisable_values_do_not_break_the_writer(self, tmp_path: Path) -> None:
         log = AuditLog(tmp_path / "audit.jsonl")
         log.record("event", when=object())

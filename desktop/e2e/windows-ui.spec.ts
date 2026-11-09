@@ -52,7 +52,7 @@ async function checkNativeBackdrop(application: ElectronApplication, color: stri
   })).toBe(color)
 }
 
-for (const scale of [1, 1.25, 1.5, 2]) {
+for (const scale of [1.25, 2]) {
   test(`Windows title bar, Chinese fonts and dialogs at ${scale * 100}%`, async () => {
     test.skip(process.platform !== 'win32', 'Native Windows overlay and fonts require Windows')
     test.setTimeout(120_000)

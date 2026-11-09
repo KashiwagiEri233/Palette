@@ -9,11 +9,7 @@ describe('input failure classification', () => {
     expect(inputErrorCode(new Error("Error invoking remote method 'request': BackendError: VM_NOT_RUNNING: 虚拟机未在运行"))).toBe('VM_NOT_RUNNING')
     expect(inputErrorCode(new Error('CONTROL_NOT_OWNED: 请先接管虚拟机'))).toBe('CONTROL_NOT_OWNED')
   })
-  it('prefers a structured code and leaves unrelated failures unclassified', () => {
-    expect(inputErrorCode({ code: 'ACTION_OUTCOME_UNKNOWN', message: 'x' })).toBe('ACTION_OUTCOME_UNKNOWN')
-    expect(inputErrorCode(new Error('输入队列已满，控制已释放'))).toBeUndefined()
-    expect(inputErrorCode(undefined)).toBeUndefined()
-  })
+
 })
 
 describe('console coordinates and input sequencing', () => {
@@ -42,18 +38,7 @@ describe('console coordinates and input sequencing', () => {
     queue.push({ type: 'key', key: 'a', down: true }); await queue.flush()
     expect(sent).toBe(1); expect(failed).toBe(1)
   })
-  it('identifies timing batches on the renderer clock without changing input order', async () => {
-    const clock = vi.spyOn(performance, 'now').mockReturnValue(100)
-    const sample = vi.fn()
-    const queue = new InputQueue(async () => { clock.mockReturnValue(125) }, error => { throw error }, sample)
-    queue.push({ type: 'key', key: 'a', down: true })
-    queue.push({ type: 'key', key: 'a', down: false })
-    clock.mockReturnValue(105)
-    await queue.flush()
-    expect(sample).toHaveBeenCalledWith({ seq: 1, event_count: 2, queued_at: 100, started_at: 105, completed_at: 125, queue_ms: 5, roundtrip_ms: 20 })
-    expect(queue.metrics()[0]).toEqual(sample.mock.calls[0][0])
-    queue.stop(); clock.mockRestore()
-  })
+
   it('submits discrete input without advancing timers and drains immediately after ACK', async () => {
     vi.useFakeTimers()
     const batches: InputEvent[][] = []

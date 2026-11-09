@@ -481,6 +481,10 @@ async def test_iso_blank_disk_and_install_media(service: PaletteService, tmp_pat
     volumes = service.manager.get(definition["vm_id"]).overrides.volumes
     assert len(volumes) == 2
     assert next(drive for drive in volumes if drive.media == "cdrom").path is None
+    await desktop.stop(definition["vm_id"], force=True)
+    await desktop.delete(definition["vm_id"])
+    assert not (service.config.runtime_root / "vms" / definition["vm_id"]).exists()
+    assert iso.read_bytes() == b"installer"
 
 
 async def test_daemon_shares_ipc_and_binary_agent_image(service: PaletteService) -> None:
