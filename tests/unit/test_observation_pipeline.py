@@ -277,3 +277,48 @@ async def test_encoding_uses_remaining_observation_deadline(pipeline):
         await observation
     assert error.value.code == ErrorCode.TIMEOUT
     assert controller.latest_frame is None
+
+
+async def test_operator_input_jumps_ahead_of_queued_observations_without_starving_them(pipeline):
+    controller, _capture, qmp = pipeline
+    order: list[str] = []
+    started = asyncio.Event()
+    gate = asyncio.Event()
+    original_send = controller._send_events
+
+    async def tracked_send(events, **kwargs):
+        await original_send(events, **kwargs)
+        order.append("input")
+
+    controller._send_events = tracked_send  # type: ignore[method-assign]
+
+    async def blocker() -> None:
+        started.set()
+        await gate.wait()
+
+    from palette.input.scheduler import JobKind
+
+    head = asyncio.create_task(
+        controller.scheduler.submit(controller.scheduler.make_job(JobKind.ACTION, "hold", blocker))
+    )
+    await started.wait()
+
+    async def observe_marker() -> None:
+        order.append("observe")
+
+    queued_observe = asyncio.create_task(
+        controller.scheduler.submit(
+            controller.scheduler.make_job(JobKind.OBSERVE, "observe", observe_marker)
+        )
+    )
+    await asyncio.sleep(0)
+    queued_inputs = [
+        asyncio.create_task(controller.operator_input([key_event("a", True)], lambda: None))
+        for _ in range(10)
+    ]
+    await asyncio.sleep(0)
+    gate.set()
+    await asyncio.gather(head, queued_observe, *queued_inputs)
+    assert order[:9] == ["input"] * 8 + ["observe"]
+    assert order[9:] == ["input"] * 2
+    assert len(qmp.qcodes()) == 10

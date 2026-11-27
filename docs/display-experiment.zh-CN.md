@@ -31,7 +31,7 @@ experimental_display_helper = "G:/Workspace/Palette/.runtime/display-build/palet
 
 - 受监督的 C/GIO helper 订阅 `org.qemu.Display1.Listener` 的 CPU `Scanout/Update`、光标及尺寸事件，不声明 Map/GPU 能力。当前支持 32 位 RGB/BGR；不支持的格式回退 VNC。
 - 仅 runtime 传递套接字并发送 QMP。Windows 使用 `get-win32-socket`；POSIX 实验模式把唯一的 stdio QMP 改为私有 AF_UNIX，支持 `getfd`/SCM_RIGHTS。普通 POSIX 启动仍使用 stdio，没有新增第二个管理通道。
-- `FrameSource` 检查边界、合成增量并发布完整不可变 RGBA 图像。每个查看者只保留一个待发完整帧；渲染回合后的八字节大端序号 ACK 才允许发送下一帧，其他客户消息会被拒绝。慢渲染不会无限堆积完整图像。VNC 的增量字节流不丢弃。
+- `FrameSource` 检查边界、合成增量并发布不可变 RGBA 图像。每个查看者只保留一个待发帧：首帧或合批跳过序号时发送完整帧，序号连续时发送脏矩形（`rect`）或零像素光标增量包（`cursor`）；收到八字节大端序号 ACK 后再发送下一帧，其他客户消息会被拒绝。慢渲染不会无限堆积完整图像。VNC 的增量字节流不丢弃。
 - `display.ticket` 增加 `provider`（`rfb/raw`）、`generation` 和 `instance_id`。没有 `provider` 的旧结果继续按 VNC 处理。单次票据、来源检查和私有 VNC 凭据继续生效。
 - 仅 operator 可用的 `display.shadow` 要求 `instance_id`，返回编码时间、尺寸、源序号/年龄和 `authoritative: false`。它不返回 `frame_id`，不能授权动作，也不是 Agent 工具。`experimental-display-v1` 宣告这些诊断能力。
 - `control.metrics.resources` 增加后端进程树各进程的累计 CPU 秒数和 RSS，以及不完整标记。`execution` 记录实际 QEMU 版本、CPU/内存、机器/显示设备和采集限制，配置不同的报告不能通过对比。RSS 求和可能重复计算共享页，比较时必须采用同一口径。输入租约、代次、顺序与未知结果不重放规则保持原语义。
@@ -43,7 +43,7 @@ helper 依据 [QEMU 官方测试](https://github.com/qemu/qemu/blob/master/tests
 运行应用测试和显式真实 QEMU 固件检查：
 
 ```sh
-uv run python -m pytest tests/unit/test_frame_source.py tests/unit/test_display_benchmarks.py tests/integration/test_raw_display.py
+uv run python -m pytest tests/unit/test_frame_source.py tests/integration/test_raw_display.py
 npm --prefix desktop run build
 npm --prefix desktop test
 ```

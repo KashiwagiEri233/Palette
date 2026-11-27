@@ -1,6 +1,7 @@
 import { connect, type Socket } from 'node:net'
 import { randomBytes } from 'node:crypto'
 import { readFile, lstat } from 'node:fs/promises'
+import { join } from 'node:path'
 
 interface Endpoint { address: string; generation: string; token: string; transport: string; operation_timeout_seconds: number }
 
@@ -11,7 +12,6 @@ export class BackendError extends Error {
 }
 
 export async function readEndpoint(runtimeRoot: string): Promise<Endpoint> {
-  const { join } = await import('node:path')
   const path = join(runtimeRoot, '.operator', 'endpoint.json')
   for (const candidate of [join(runtimeRoot, '.operator'), path]) {
     const stat = await lstat(candidate)
@@ -25,9 +25,15 @@ export async function readEndpoint(runtimeRoot: string): Promise<Endpoint> {
   return endpoint
 }
 
-export async function call(runtimeRoot: string, method: string, vmId?: string, payload: Record<string, unknown> = {}, expectedGeneration?: string): Promise<Record<string, unknown>> {
-  const endpoint = await readEndpoint(runtimeRoot)
-  if (expectedGeneration !== undefined && endpoint.generation !== expectedGeneration) throw new Error('后台已更换，请检查状态后重试退出')
+const endpointCache = new Map<string, Endpoint>()
+
+class RetryableConnectError extends Error {
+  constructor(readonly causeError: Error) {
+    super(causeError.message)
+  }
+}
+
+function callOnce(endpoint: Endpoint, method: string, vmId: string | undefined, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   const requestId = randomBytes(16).toString('hex')
   const command = { method, vm_id: vmId ?? null, payload }
   const body = Buffer.from(JSON.stringify({ version: 1, generation: endpoint.generation, token: endpoint.token, request_id: requestId, command }))
@@ -36,10 +42,18 @@ export async function call(runtimeRoot: string, method: string, vmId?: string, p
     const socket = connect(endpoint.address)
     let received = Buffer.alloc(0)
     let expected: number | undefined
+    let connected = false
     let done = false
-    const fail = (error: Error): void => { if (!done) { done = true; reject(error) }; socket.destroy() }
+    const fail = (error: Error): void => {
+      if (done) return
+      done = true
+      const code = (error as NodeJS.ErrnoException).code
+      if (!connected && (code === 'ENOENT' || code === 'ECONNREFUSED')) reject(new RetryableConnectError(error))
+      else reject(error)
+      socket.destroy()
+    }
     socket.setTimeout(Math.min(3600_000, (endpoint.operation_timeout_seconds + 5) * 1000), () => fail(new Error('后台操作超时，请先检查虚拟机状态')))
-    socket.on('connect', () => { const header = Buffer.alloc(4); header.writeUInt32BE(body.length); socket.write(Buffer.concat([header, body])) })
+    socket.on('connect', () => { connected = true; const header = Buffer.alloc(4); header.writeUInt32BE(body.length); socket.write(Buffer.concat([header, body])) })
     socket.on('data', data => {
       received = Buffer.concat([received, data])
       if (expected === undefined && received.length >= 4) {
@@ -59,28 +73,60 @@ export async function call(runtimeRoot: string, method: string, vmId?: string, p
   })
 }
 
+export async function call(runtimeRoot: string, method: string, vmId?: string, payload: Record<string, unknown> = {}, expectedGeneration?: string): Promise<Record<string, unknown>> {
+  let endpoint = expectedGeneration === undefined ? endpointCache.get(runtimeRoot) : undefined
+  if (!endpoint) {
+    endpoint = await readEndpoint(runtimeRoot)
+    endpointCache.set(runtimeRoot, endpoint)
+  }
+  if (expectedGeneration !== undefined && endpoint.generation !== expectedGeneration) throw new Error('后台已更换，请检查状态后重试退出')
+  try {
+    return await callOnce(endpoint, method, vmId, payload)
+  } catch (error) {
+    if (error instanceof RetryableConnectError) {
+      endpointCache.delete(runtimeRoot)
+      if (expectedGeneration === undefined) {
+        const fresh = await readEndpoint(runtimeRoot)
+        endpointCache.set(runtimeRoot, fresh)
+        try {
+          return await callOnce(fresh, method, vmId, payload)
+        } catch (retryError) {
+          throw retryError instanceof RetryableConnectError ? retryError.causeError : retryError
+        }
+      }
+      throw error.causeError
+    }
+    throw error
+  }
+}
+
+interface PendingRequest {
+  id: string
+  method: string
+  resolve: (result: Record<string, unknown>) => void
+  reject: (error: Error) => void
+  timer: ReturnType<typeof setTimeout>
+}
+
+const MAX_IN_FLIGHT = 4
+
 /** Main-only, lease-bound transport. Never retries a frame that may have been written. */
 export class InputStream {
   private readonly socket: Socket
   private readonly ready: Promise<void>
-  private received = Buffer.alloc(0)
+  private readyResolved = false
+  private received: Buffer<ArrayBufferLike> = Buffer.alloc(0)
   private closed = false
   private terminalError = new Error('输入通道已关闭，请重新接管')
   private failure?: Error
   private failureHandler?: (error: Error) => void
-  private pending?: {
-    id: string
-    method: string
-    resolve: (result: Record<string, unknown>) => void
-    reject: (error: Error) => void
-    timer: ReturnType<typeof setTimeout>
-  }
+  private pending = new Map<string, PendingRequest>()
 
   private constructor(private endpoint: Endpoint, readonly vmId: string, readonly leaseId: string) {
     this.socket = connect(endpoint.address)
     this.ready = new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.fail(new Error('输入通道连接超时'), 'connect_timeout'), 2000)
-      this.socket.once('connect', () => { clearTimeout(timer); resolve() })
+      this.socket.once('connect', () => { clearTimeout(timer); this.readyResolved = true; resolve() })
       this.socket.once('error', error => { clearTimeout(timer); reject(error) })
       this.socket.once('close', () => { clearTimeout(timer); reject(this.terminalError) })
     })
@@ -113,7 +159,10 @@ export class InputStream {
 
   private fail(error: Error, phase: string): void {
     if (this.closed) return
-    const uncertain = this.pending?.method === 'control.input'
+    let uncertain = false
+    for (const item of this.pending.values()) {
+      if (item.method === 'control.input') { uncertain = true; break }
+    }
     this.failure = error instanceof BackendError ? error : new BackendError(
       uncertain ? 'ACTION_OUTCOME_UNKNOWN' : 'INPUT_CHANNEL_CLOSED',
       uncertain ? '人工输入连接中断，本批输入结果未知；请检查画面后重新接管' : '人工输入连接已断开，请重新接管',
@@ -127,22 +176,26 @@ export class InputStream {
     if (this.closed) return
     this.closed = true
     this.terminalError = error
-    const pending = this.pending
-    this.pending = undefined
-    if (pending) { clearTimeout(pending.timer); pending.reject(error) }
+    const items = [...this.pending.values()]
+    this.pending.clear()
+    for (const item of items) {
+      clearTimeout(item.timer)
+      item.reject(error)
+    }
     this.socket.destroy()
   }
 
   private async request(method: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-    await this.ready
+    if (!this.readyResolved) await this.ready
     if (this.closed) throw this.terminalError
-    if (this.pending) throw new Error('输入批次仍在处理中')
+    if (this.pending.size >= MAX_IN_FLIGHT) throw new Error('输入队列已满')
     const id = randomBytes(16).toString('hex')
     const body = Buffer.from(JSON.stringify({ version: 1, generation: this.endpoint.generation, token: this.endpoint.token, request_id: id, command: { method, vm_id: this.vmId, payload } }))
+    if (method === 'control.input' && body.length > 64 * 1024 + 512) throw new Error('请求无效')
     if (body.length > 256 * 1024) throw new Error('请求过大')
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.fail(new Error('输入响应超时'), 'response_timeout'), 15000)
-      this.pending = { id, method, resolve, reject, timer }
+      this.pending.set(id, { id, method, resolve, reject, timer })
       const header = Buffer.alloc(4); header.writeUInt32BE(body.length)
       try {
         this.socket.write(Buffer.concat([header, body]), error => { if (error) this.fail(error, 'write') })
@@ -150,9 +203,9 @@ export class InputStream {
     })
   }
 
-  private receive(data: Buffer): void {
+  private receive(data: Buffer<ArrayBufferLike>): void {
     if (this.closed) return
-    this.received = Buffer.concat([this.received, data])
+    this.received = this.received.length ? Buffer.concat([this.received, data]) : data
     try {
       while (this.received.length >= 4) {
         const size = this.received.readUInt32BE(0)
@@ -160,11 +213,12 @@ export class InputStream {
         if (this.received.length < size + 4) return
         const response = JSON.parse(this.received.subarray(4, size + 4).toString('utf8'))
         this.received = this.received.subarray(size + 4)
-        const pending = this.pending
-        if (!pending || response.version !== 1 || response.request_id !== pending.id || response.generation !== this.endpoint.generation) throw new Error('后台响应身份不匹配')
+        const pending = typeof response.request_id === 'string' ? this.pending.get(response.request_id) : undefined
+        if (!pending || response.version !== 1 || response.generation !== this.endpoint.generation) throw new Error('后台响应身份不匹配')
         if (!response.ok) throw new BackendError(response.error?.code ?? 'ERROR', response.error?.message ?? '操作失败', response.error?.details)
         if (!response.result || typeof response.result !== 'object' || Array.isArray(response.result)) throw new Error('后台响应无效')
-        clearTimeout(pending.timer); this.pending = undefined
+        this.pending.delete(pending.id)
+        clearTimeout(pending.timer)
         pending.resolve(response.result)
       }
     } catch (error) { this.fail(error as Error, 'response') }

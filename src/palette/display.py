@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
+import socket
 import struct
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlsplit
 
 from Crypto.Cipher import DES
@@ -29,11 +30,6 @@ DISPLAY_ENCODINGS = frozenset(
         1,
         2,
         5,
-        6,
-        7,
-        16,
-        21,
-        -260,
         -223,
         -224,
         -239,
@@ -41,10 +37,14 @@ DISPLAY_ENCODINGS = frozenset(
         -308,
         -312,
         -313,
-        *range(-32, -22),
-        *range(-256, -246),
     }
 )
+
+
+def _enable_nodelay(sock: Any) -> None:
+    if sock is not None:
+        with contextlib.suppress(OSError, AttributeError):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
 def vnc_response(password: str, challenge: bytes) -> bytes:
@@ -91,9 +91,19 @@ class RfbFilter:
             del self.buffer[:size]
             if kind == 2:
                 values = struct.unpack(f">{count}i", message[4:])
-                selected = [value for value in values if value in DISPLAY_ENCODINGS]
-                if 0 not in selected:
-                    selected.append(0)
+                filtered: list[int] = []
+                seen: set[int] = set()
+                for value in values:
+                    if value in DISPLAY_ENCODINGS and value not in seen:
+                        seen.add(value)
+                        filtered.append(value)
+                selected: list[int] = []
+                if 1 in seen:
+                    selected.append(1)
+                selected.append(0)
+                for value in filtered:
+                    if value not in (0, 1):
+                        selected.append(value)
                 self.encodings = set(selected)
                 message = (
                     b"\x02\0"
@@ -162,7 +172,7 @@ class DisplayGateway:
             ],
             max_size=64 * 1024,
             max_queue=4,
-            write_limit=64 * 1024,
+            write_limit=512 * 1024,
             compression=None,
             open_timeout=5,
             close_timeout=2,
@@ -213,9 +223,10 @@ class DisplayGateway:
         queue = source.subscribe()
         acknowledgements: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
         pending_seq: int | None = None
+        last_sent_seq: int | None = None
 
         async def send() -> None:
-            nonlocal pending_seq
+            nonlocal pending_seq, last_sent_seq
             while True:
                 frame = await queue.get()
                 if frame is None:
@@ -227,8 +238,9 @@ class DisplayGateway:
                 started = time.perf_counter()
                 pending_seq = frame.seq
                 async with asyncio.timeout(5):
-                    await ws.send(frame.wire())
+                    await ws.send(frame.wire_for(last_sent_seq))
                     await acknowledgements.get()
+                last_sent_seq = frame.seq
                 pending_seq = None
                 self.timings.record(forward_ms=(time.perf_counter() - started) * 1000)
 
@@ -297,8 +309,10 @@ class DisplayGateway:
             if instance.console_address is None or instance.console_password is None:
                 return
             accepted = True
+            _enable_nodelay(ws.transport.get_extra_info("socket") if ws.transport else None)
             async with asyncio.timeout(5):
                 reader, writer = await asyncio.open_connection(*instance.console_address)
+                _enable_nodelay(writer.get_extra_info("socket"))
                 if await reader.readexactly(12) != VERSION:
                     raise ValueError("RFB 3.8 is required")
                 writer.write(VERSION)
@@ -332,7 +346,7 @@ class DisplayGateway:
 
             async def upstream() -> None:
                 while True:
-                    data = await reader.read(64 * 1024)
+                    data = await reader.read(256 * 1024)
                     if not data:
                         return
                     # RFB updates are incremental; never discard bytes under backpressure.

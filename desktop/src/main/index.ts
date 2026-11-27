@@ -179,7 +179,8 @@ app.whenReady().then(async () => {
   })
   const handleRequest = async (event: Electron.IpcMainInvokeEvent, method: DesktopMethod, vmId?: string, payload: Record<string, unknown> = {}): Promise<unknown> => {
     trusted(event)
-    if ((!methods.has(method) && !workspaceMethods.has(method) && !agentMethods.has(method)) || (vmId !== undefined && !/^[A-Za-z0-9_.-]{1,128}$/.test(vmId)) || typeof payload !== 'object' || payload === null || Array.isArray(payload) || Buffer.byteLength(JSON.stringify(payload)) > (String(method) === 'agent.providers.save' || String(method) === 'window.command' && payload.action === 'copy_text' ? 1024 * 1024 : 64 * 1024)) throw new Error('请求无效')
+    const stream = vmId && method === 'control.input' ? inputStreams.get(vmId) : undefined
+    if ((!methods.has(method) && !workspaceMethods.has(method) && !agentMethods.has(method)) || (vmId !== undefined && !/^[A-Za-z0-9_.-]{1,128}$/.test(vmId)) || typeof payload !== 'object' || payload === null || Array.isArray(payload) || (!stream && Buffer.byteLength(JSON.stringify(payload)) > (String(method) === 'agent.providers.save' || String(method) === 'window.command' && payload.action === 'copy_text' ? 1024 * 1024 : 64 * 1024))) throw new Error('请求无效')
     if (handlingClose) throw new Error('正在退出，请稍候')
     const operation = String(method)
     if (agentMethods.has(operation)) {
@@ -305,7 +306,6 @@ app.whenReady().then(async () => {
     const streamGeneration = inputStreamGeneration
     if (method === 'control.acquire') expectedGeneration = streamGeneration
     if (vmId && method === 'control.release') closeInputStream(vmId, String(payload.lease_id))
-    const stream = vmId && method === 'control.input' ? inputStreams.get(vmId) : undefined
     if (method === 'control.input' && streamGeneration && !stream) throw new Error('人工输入连接已关闭，请重新接管')
     const result = stream ? await stream.input(payload) : await call(requestRoot, method, vmId, payload, expectedGeneration)
     if (method === 'control.acquire' && vmId) {

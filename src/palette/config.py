@@ -144,7 +144,7 @@ class DisplayConfig(_Strict):
 
 
 class CaptureConfig(_Strict):
-    prefer_format: Literal["png", "ppm"] = "png"
+    prefer_format: Literal["png", "ppm"] = "ppm"
     allow_ppm_fallback: bool = True
     max_long_edge: int = Field(default=1280, ge=2)
     max_bytes: int = Field(default=4 * 1024 * 1024, ge=1024)

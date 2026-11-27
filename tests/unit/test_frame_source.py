@@ -108,3 +108,43 @@ def test_cursor_metadata_is_retained_between_shape_and_position_updates() -> Non
     assert source.frame.cursor["x"] == 2
     with pytest.raises(TypeError):
         source.frame.cursor["x"] = 99
+
+
+def test_wire_for_emits_rect_cursor_and_falls_back_to_full_on_skip() -> None:
+    source = FrameSource("inst_example")
+    scanout(source, width=3, height=2, value=0x10)
+    first = source.frame
+    assert first is not None
+
+    wire_full = first.wire_for(None)
+    hsize = struct.unpack(">I", wire_full[:4])[0]
+    assert "kind" not in json.loads(wire_full[4 : 4 + hsize])
+    assert wire_full[4 + hsize :] == b"\x10" * (3 * 2 * 4)
+
+    source.apply({"kind": "update", "x": 1, "y": 1, "width": 2, "height": 1}, b"\x22" * 8)
+    second = source.frame
+    assert second is not None
+    wire_rect = second.wire_for(first.seq)
+    hsize = struct.unpack(">I", wire_rect[:4])[0]
+    rect_header = json.loads(wire_rect[4 : 4 + hsize])
+    assert rect_header["kind"] == "rect"
+    assert rect_header["rect"] == [1, 1, 2, 1]
+    assert wire_rect[4 + hsize :] == b"\x22" * 8
+
+    wire_skip_fallback = second.wire_for(first.seq - 1)
+    hsize = struct.unpack(">I", wire_skip_fallback[:4])[0]
+    assert "kind" not in json.loads(wire_skip_fallback[4 : 4 + hsize])
+    assert len(wire_skip_fallback[4 + hsize :]) == 3 * 2 * 4
+
+    source.apply({"kind": "cursor", "x": 2, "y": 1, "visible": True}, b"")
+    third = source.frame
+    assert third is not None
+    wire_cursor = third.wire_for(second.seq)
+    hsize = struct.unpack(">I", wire_cursor[:4])[0]
+    cursor_header = json.loads(wire_cursor[4 : 4 + hsize])
+    assert cursor_header["kind"] == "cursor"
+    assert wire_cursor[4 + hsize :] == b""
+    wire_cursor_fallback = third.wire_for(first.seq)
+    hsize = struct.unpack(">I", wire_cursor_fallback[:4])[0]
+    assert "kind" not in json.loads(wire_cursor_fallback[4 : 4 + hsize])
+    assert len(wire_cursor_fallback[4 + hsize :]) == 3 * 2 * 4

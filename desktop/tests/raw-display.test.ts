@@ -24,4 +24,17 @@ describe('raw framebuffer boundary', () => {
     new DataView(data).setUint32(0, 0xffffffff)
     expect(() => decodeRawFrame(data, ticket)).toThrow()
   })
+  it('decodes incremental rect and zero-pixel cursor packets and rejects malformed rects', () => {
+    const rectFrame = decodeRawFrame(packet({ kind: 'rect', rect: [1, 0, 1, 1] }, 4), ticket)
+    expect(rectFrame.kind).toBe('rect')
+    expect(rectFrame.rect).toEqual([1, 0, 1, 1])
+    expect(rectFrame.pixels.byteLength).toBe(4)
+
+    const cursorFrame = decodeRawFrame(packet({ kind: 'cursor', cursor: { x: 1, y: 0, visible: true } }, 0), ticket)
+    expect(cursorFrame.kind).toBe('cursor')
+    expect(cursorFrame.pixels.byteLength).toBe(0)
+
+    expect(() => decodeRawFrame(packet({ kind: 'rect', rect: [2, 0, 1, 1] }, 4), ticket)).toThrow()
+    expect(() => decodeRawFrame(packet({ kind: 'cursor' }, 4), ticket)).toThrow()
+  })
 })

@@ -95,3 +95,30 @@ async def test_unpainted_frames_are_coalesced_until_exact_ack(raw_display):
         header = json.loads(latest[4 : size + 4])
         assert header["seq"] == first["seq"] + 2
         assert latest[size + 4 :] == b"\x11" * 4 + b"\x77" * 8 + b"\x22" * 4
+
+
+async def test_sequential_updates_and_cursor_use_incremental_wire_packets(raw_display):
+    gateway, source, instance = raw_display
+    ticket = gateway.ticket("desktop", instance.view.instance_id)
+    async with connect(ticket["url"], origin="app://palette") as ws:
+        initial = await ws.recv()
+        size = struct.unpack(">I", initial[:4])[0]
+        first = json.loads(initial[4 : size + 4])
+        await ws.send(struct.pack(">Q", first["seq"]))
+
+        source.apply({"kind": "update", "x": 1, "y": 0, "width": 1, "height": 1}, b"\xaa" * 4)
+        rect_packet = await ws.recv()
+        size = struct.unpack(">I", rect_packet[:4])[0]
+        rect_header = json.loads(rect_packet[4 : size + 4])
+        assert rect_header["kind"] == "rect"
+        assert rect_header["rect"] == [1, 0, 1, 1]
+        assert rect_packet[size + 4 :] == b"\xaa" * 4
+        await ws.send(struct.pack(">Q", rect_header["seq"]))
+
+        source.apply({"kind": "cursor", "x": 1, "y": 1, "visible": True}, b"")
+        cursor_packet = await ws.recv()
+        size = struct.unpack(">I", cursor_packet[:4])[0]
+        cursor_header = json.loads(cursor_packet[4 : size + 4])
+        assert cursor_header["kind"] == "cursor"
+        assert cursor_header["cursor"]["x"] == 1
+        assert cursor_packet[size + 4 :] == b""

@@ -10,6 +10,7 @@ export interface DisplaySession extends EventTarget {
 class VncSession extends EventTarget implements DisplaySession {
   private client: RFB
   private observer: MutationObserver
+  private cachedCanvas: HTMLCanvasElement | null = null
   constructor(private target: HTMLElement, ticket: RawDisplayTicket, fit: boolean) {
     super()
     this.client = new RFB(target, ticket.url, { shared: true })
@@ -19,17 +20,25 @@ class VncSession extends EventTarget implements DisplaySession {
       if (this.canvas) this.canvas.dataset.paletteDisplay = 'rfb'
       this.dispatchEvent(new Event(name))
     })
-    this.observer = new MutationObserver(() => this.dispatchEvent(new Event('geometry')))
+    this.observer = new MutationObserver(() => {
+      this.cachedCanvas = null
+      this.dispatchEvent(new Event('geometry'))
+    })
     this.observer.observe(target, { childList: true, subtree: true, attributes: true, attributeFilter: ['width', 'height'] })
   }
-  get canvas() { return this.target.querySelector('canvas') }
+  get canvas() {
+    if (this.cachedCanvas?.isConnected) return this.cachedCanvas
+    this.cachedCanvas = this.target.querySelector('canvas')
+    return this.cachedCanvas
+  }
   get scaleViewport() { return this.client.scaleViewport }
   set scaleViewport(value: boolean) { this.client.scaleViewport = value }
-  disconnect() { this.observer.disconnect(); this.client.disconnect() }
+  disconnect() { this.observer.disconnect(); this.cachedCanvas = null; this.client.disconnect() }
 }
 
 class RawSession extends EventTarget implements DisplaySession {
   readonly canvas = document.createElement('canvas')
+  private ctx: CanvasRenderingContext2D | null
   private socket: WebSocket
   private observer: ResizeObserver
   private stage = document.createElement('div')
@@ -39,9 +48,11 @@ class RawSession extends EventTarget implements DisplaySession {
   private lastFrameAt = 0
   private cursor = ''
   private cursorStyle = 'default'
+  private appliedCursor = ''
   constructor(target: HTMLElement, ticket: RawDisplayTicket, fit: boolean) {
     super()
     this.fit = fit
+    this.ctx = this.canvas.getContext('2d', { alpha: false, desynchronized: true }) ?? this.canvas.getContext('2d')
     Object.assign(this.stage.style, { width: '100%', height: '100%', display: 'flex', overflow: 'auto' })
     Object.assign(this.canvas.style, { margin: 'auto', flexShrink: '0' })
     this.canvas.width = 0; this.canvas.height = 0
@@ -59,9 +70,16 @@ class RawSession extends EventTarget implements DisplaySession {
         this.seq = frame.seq
         const changed = this.canvas.width !== frame.width || this.canvas.height !== frame.height
         if (changed) { this.canvas.width = frame.width; this.canvas.height = frame.height; this.resize() }
-        const context = this.canvas.getContext('2d')
-        if (!context) throw new Error('无法创建画布')
-        context.putImageData(new ImageData(frame.pixels, frame.width, frame.height), 0, 0)
+        if (!this.ctx) throw new Error('无法创建画布')
+        if (frame.kind === 'full') {
+          this.ctx.putImageData(new ImageData(frame.pixels, frame.width, frame.height), 0, 0)
+        } else if (frame.kind === 'rect') {
+          if (changed || !this.connected || !frame.rect) throw new Error('增量画面缺少基准帧')
+          const [x, y, rw, rh] = frame.rect
+          this.ctx.putImageData(new ImageData(frame.pixels, rw, rh), x, y)
+        } else if (!this.connected || changed) {
+          throw new Error('光标更新缺少基准帧')
+        }
         if (frame.cursor?.rgba && frame.cursor.rgba !== this.cursor) {
           this.cursor = frame.cursor.rgba
           const bytes = Uint8ClampedArray.from(atob(frame.cursor.rgba), char => char.charCodeAt(0))
@@ -70,20 +88,21 @@ class RawSession extends EventTarget implements DisplaySession {
           shape.getContext('2d')?.putImageData(new ImageData(bytes, shape.width, shape.height), 0, 0)
           this.cursorStyle = `url(${shape.toDataURL()}) ${frame.cursor.hot_x} ${frame.cursor.hot_y}, default`
         }
-        this.canvas.style.cursor = frame.cursor?.visible === false ? 'none' : this.cursorStyle
+        const nextCursor = frame.cursor?.visible === false ? 'none' : this.cursorStyle
+        if (nextCursor !== this.appliedCursor) {
+          this.appliedCursor = nextCursor
+          this.canvas.style.cursor = nextCursor
+        }
         if (changed) this.dispatchEvent(new Event('geometry'))
         if (!this.connected) { this.connected = true; this.dispatchEvent(new Event('connect')) }
         const now = performance.now()
         window.dispatchEvent(new CustomEvent('palette-display-timing', { detail: { provider: 'raw', seq: frame.seq, generation: frame.generation, frame_interval_ms: this.lastFrameAt ? now - this.lastFrameAt : null } }))
         this.lastFrameAt = now
-        // One complete frame may be in flight. Acknowledge after a render turn so
-        // Chromium's message queue cannot accumulate full-size images off-screen.
-        requestAnimationFrame(() => {
-          if (this.socket.readyState !== WebSocket.OPEN) return
+        if (this.socket.readyState === WebSocket.OPEN) {
           const ack = new ArrayBuffer(8)
           new DataView(ack).setBigUint64(0, BigInt(frame.seq))
           this.socket.send(ack)
-        })
+        }
       } catch { this.socket.close(1002, 'invalid raw display frame') }
     }
     this.socket.onclose = () => this.dispatchEvent(new Event('disconnect'))

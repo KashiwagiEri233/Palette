@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ctypes
+import threading
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Literal
@@ -26,6 +27,8 @@ _ERROR_PIPE_NOT_CONNECTED = 233
 _ACCEPT_RETRY_SECONDS = 0.025
 _WAIT_TIMEOUT = 258
 _INFINITE = 0xFFFFFFFF
+_READ_CHUNK = 65536
+_MAX_POOLED_EVENTS = 2
 
 
 class _Overlapped(ctypes.Structure):
@@ -81,6 +84,7 @@ class _Api:
         )
         self.CreateEvent = self._bind(kernel, "CreateEventW", [ptr, boolean, boolean, ptr], handle)
         self.SetEvent = self._bind(kernel, "SetEvent", [handle], boolean)
+        self.ResetEvent = self._bind(kernel, "ResetEvent", [handle], boolean)
         self.CloseHandle = self._bind(kernel, "CloseHandle", [handle], boolean)
         self.ConnectNamedPipe = self._bind(kernel, "ConnectNamedPipe", [handle, ptr], boolean)
         self.DisconnectNamedPipe = self._bind(kernel, "DisconnectNamedPipe", [handle], boolean)
@@ -293,8 +297,30 @@ class WindowsChannel:
             self.api.CloseHandle(handle)
             raise _WinError(_get_last_error())
         self._workers: set[asyncio.Task[bytes]] = set()
+        self._read_buffer = bytearray()
+        self._event_lock = threading.Lock()
+        self._event_pool: list[int] = []
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
+
+    def _acquire_event(self) -> int:
+        with self._event_lock:
+            if self._event_pool:
+                return self._event_pool.pop()
+        event = self.api.CreateEvent(None, True, False, None)
+        if not event:
+            raise _WinError(_get_last_error())
+        return int(event)
+
+    def _release_event(self, event: int, *, reusable: bool) -> None:
+        if reusable and not self._closed:
+            reset = getattr(self.api, "ResetEvent", None)
+            if reset is not None and reset(event):
+                with self._event_lock:
+                    if not self._closed and len(self._event_pool) < _MAX_POOLED_EVENTS:
+                        self._event_pool.append(event)
+                        return
+        self.api.CloseHandle(event)
 
     def _transfer(
         self,
@@ -303,13 +329,12 @@ class WindowsChannel:
         timeout: float | None,
     ) -> bytes:
         api = self.api
-        event = api.CreateEvent(None, True, False, None)
-        if not event:
-            raise _WinError(_get_last_error())
+        event = self._acquire_event()
         overlapped = _Overlapped(hEvent=event)
         count = wintypes.DWORD()
         data = ctypes.create_string_buffer(payload)
         pending = False
+        reusable = False
         try:
             if kind == "accept":
                 success = api.ConnectNamedPipe(self.handle, ctypes.byref(overlapped))
@@ -322,6 +347,7 @@ class WindowsChannel:
             if not success:
                 error = _get_last_error()
                 if kind == "accept" and error == _ERROR_PIPE_CONNECTED:
+                    reusable = True
                     return b""
                 if error != _ERROR_IO_PENDING:
                     raise _WinError(error)
@@ -338,6 +364,7 @@ class WindowsChannel:
             ):
                 raise _WinError(_get_last_error())
             pending = False
+            reusable = True
             if kind == "read":
                 if count.value == 0:
                     raise EOFError("operator pipe closed")
@@ -352,7 +379,8 @@ class WindowsChannel:
                 api.GetOverlappedResult(
                     self.handle, ctypes.byref(overlapped), ctypes.byref(count), True
                 )
-            api.CloseHandle(event)
+                reusable = False
+            self._release_event(event, reusable=reusable)
 
     async def _io(
         self,
@@ -373,12 +401,17 @@ class WindowsChannel:
                 await asyncio.shield(worker)
             raise
 
+    def has_buffered(self) -> bool:
+        return bool(self._read_buffer)
+
     async def readexactly(self, size: int) -> bytes:
-        chunks = bytearray()
-        while len(chunks) < size:
+        while len(self._read_buffer) < size:
             # receive_frame owns the deadline; an operation response may follow a long boot.
-            chunks.extend(await self._io("read", size - len(chunks), None))
-        return bytes(chunks)
+            chunk = await self._io("read", max(_READ_CHUNK, size - len(self._read_buffer)), None)
+            self._read_buffer.extend(chunk)
+        result = bytes(self._read_buffer[:size])
+        del self._read_buffer[:size]
+        return result
 
     async def write(self, data: bytes) -> None:
         await self._io("write", data, FRAME_TIMEOUT)
@@ -393,6 +426,11 @@ class WindowsChannel:
         self.api.SetEvent(self.stop_event)
         if self._workers:
             await asyncio.gather(*self._workers, return_exceptions=True)
+        with self._event_lock:
+            pooled = list(self._event_pool)
+            self._event_pool.clear()
+        for event in pooled:
+            self.api.CloseHandle(event)
         self.api.CloseHandle(self.handle)
         self.api.CloseHandle(self.stop_event)
 

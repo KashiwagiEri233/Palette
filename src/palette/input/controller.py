@@ -1211,7 +1211,7 @@ class ActionController:
             self._ledger.note_releases(events)
             self._require_identity(identity)
             if self._audit is not None:
-                self._audit.record("operator.input", vm_id=self.view.vm_id, count=len(events))
+                self._audit.record_async("operator.input", vm_id=self.view.vm_id, count=len(events))
             self.operator_timings.record(
                 queue_ms=(started - queued) * 1000,
                 qmp_ms=(acknowledged - started) * 1000,

@@ -65,7 +65,7 @@ scale_percent = 100
 keymap = "us"
 
 [capture]
-prefer_format = "png"
+prefer_format = "ppm"
 allow_ppm_fallback = true
 max_long_edge = 1280
 max_bytes = 4194304

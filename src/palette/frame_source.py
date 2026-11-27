@@ -39,8 +39,11 @@ class SourceFrame:
     rgba: bytes
     received_at: float
     cursor: Mapping[str, Any] | None = None
+    update_rect: tuple[int, int, int, int] | None = None
+    update_rgba: bytes | None = None
+    cursor_only: bool = False
 
-    def wire(self) -> bytes:
+    def _encode_wire(self, payload: bytes, **extra: Any) -> bytes:
         header = json.dumps(
             {
                 "version": 1,
@@ -51,10 +54,23 @@ class SourceFrame:
                 "height": self.height,
                 "format": "rgba",
                 "cursor": dict(self.cursor) if self.cursor else None,
+                **extra,
             },
             separators=(",", ":"),
         ).encode()
-        return struct.pack(">I", len(header)) + header + self.rgba
+        return struct.pack(">I", len(header)) + header + payload
+
+    def wire(self) -> bytes:
+        return self._encode_wire(self.rgba)
+
+    def wire_for(self, last_sent_seq: int | None = None) -> bytes:
+        if last_sent_seq is None or self.seq != last_sent_seq + 1:
+            return self.wire()
+        if self.cursor_only:
+            return self._encode_wire(b"", kind="cursor")
+        if self.update_rect is not None and self.update_rgba is not None:
+            return self._encode_wire(self.update_rgba, kind="rect", rect=list(self.update_rect))
+        return self.wire()
 
 
 class FrameSource:
@@ -107,6 +123,9 @@ class FrameSource:
             raise ValueError("frame source is closed")
         kind = header.get("kind")
         previous = self.frame
+        update_rect: tuple[int, int, int, int] | None = None
+        update_rgba: bytes | None = None
+        cursor_only = False
         if kind == "disable":
             self.frame = None
             self.invalidated.set()
@@ -119,6 +138,7 @@ class FrameSource:
             if previous is None:
                 return
             width, height, rgba = previous.width, previous.height, previous.rgba
+            cursor_only = True
         else:
             raw_width, raw_height = header.get("width"), header.get("height")
             if (
@@ -149,13 +169,26 @@ class FrameSource:
                         f"raw update {(x, y, width, height)} is outside scanout "
                         f"{(previous.width, previous.height) if previous else None}"
                     )
-                buffer = bytearray(previous.rgba)
-                for row in range(height):
-                    offset = ((y + row) * previous.width + x) * 4
-                    buffer[offset : offset + width * 4] = data[
-                        row * width * 4 : (row + 1) * width * 4
-                    ]
-                width, height, rgba = previous.width, previous.height, bytes(buffer)
+                if width == previous.width and height == previous.height:
+                    rgba = bytes(data)
+                else:
+                    buffer = bytearray(previous.rgba)
+                    row_bytes = width * 4
+                    buf_view = memoryview(buffer)
+                    src_view = memoryview(data)
+                    if width == previous.width:
+                        start = y * previous.width * 4
+                        buf_view[start : start + height * row_bytes] = src_view
+                    else:
+                        for row in range(height):
+                            offset = ((y + row) * previous.width + x) * 4
+                            buf_view[offset : offset + row_bytes] = src_view[
+                                row * row_bytes : (row + 1) * row_bytes
+                            ]
+                    rgba = bytes(buffer)
+                    update_rect = (x, y, width, height)
+                    update_rgba = bytes(data)
+                width, height = previous.width, previous.height
             else:
                 raise ValueError("unknown raw display message")
         self._seq += 1
@@ -168,6 +201,9 @@ class FrameSource:
             rgba,
             time.monotonic(),
             MappingProxyType(dict(self._cursor)) if self._cursor else None,
+            update_rect=update_rect,
+            update_rgba=update_rgba,
+            cursor_only=cursor_only,
         )
         self._publish(self.frame)
 
@@ -182,7 +218,10 @@ class FrameSource:
             image = Image.frombytes("RGBA", (frame.width, frame.height), frame.rgba).convert("RGB")
             image.thumbnail((config.max_long_edge, config.max_long_edge), Image.Resampling.LANCZOS)
             output = io.BytesIO()
-            image.save(output, format="PNG", optimize=True)
+            image.save(output, format="PNG", compress_level=1)
+            if output.tell() > config.max_bytes:
+                output = io.BytesIO()
+                image.save(output, format="PNG", optimize=True)
             if output.tell() > config.max_bytes:
                 raise PaletteError(ErrorCode.CAPTURE_TOO_LARGE, "shadow PNG exceeds capture limit")
             return CapturedImage(

@@ -2,7 +2,7 @@
 
 **English** | [简体中文](operator-latency.zh-CN.md)
 
-The low-latency mode keeps noVNC display and policy-controlled QMP input. It enables QEMU's CPU D-Bus display backend alongside VNC, without starting the raw-frame helper. Agent observations retain authoritative QMP screenshots. Image encoding runs outside the serialized input/acquisition queue.
+The low-latency mode keeps noVNC display and policy-controlled QMP input. It enables QEMU's CPU D-Bus display backend alongside VNC, without starting the raw-frame helper. Agent observations retain authoritative QMP screenshots. Image encoding runs outside the serialized input/acquisition queue, `ActionScheduler` prioritizes `OPERATOR_INPUT` ahead of queued observations with a bounded fairness cap, `DisplayGateway` enables `TCP_NODELAY` and prefers `CopyRect`/`Raw` on the local loopback RFB stream, and `operator.input` audit logging runs asynchronously off the ACK path.
 
 ## Settings and compatibility
 
@@ -16,7 +16,7 @@ On this Windows host, an isolated paused, diskless QEMU 11.1.0 test completed a 
 
 ## Screenshot ordering
 
-Public observation acquires immutable screenshot bytes in the existing queue. It fixes native dimensions, display/lifecycle epochs, action sequence, acquisition time and an internal capture sequence before allowing subsequent input. PNG decoding, scaling and thumbnails then run outside that queue. Each VM reserves at most two snapshot slots before queueing, so slow encoders cannot create an unbounded byte backlog. Short file I/O does not wait on the image-encoding semaphore.
+Public observation acquires immutable screenshot bytes in the existing queue (defaulting QEMU `screendump` to PPM so compression stays out of QEMU's loop). It fixes native dimensions, display/lifecycle epochs, action sequence, acquisition time and an internal capture sequence before allowing subsequent input. PNG encoding, scaling and thumbnails then run outside that queue. Each VM reserves at most two snapshot slots before queueing, so slow encoders cannot create an unbounded byte backlog. Short file I/O does not wait on the image-encoding semaphore.
 
 A completed observation retains its acquisition action sequence even if later input occurred. Existing action validation therefore rejects it when stale. Registry selection and eviction use acquisition order, so an older slow encoding cannot replace a newer action screenshot. Lifecycle or resolution changes fence publication. Cancellation and timeout fence late-frame publication. Closing releases held input before waiting for processing cleanup. Action-internal and post-action captures retain their existing transaction semantics.
 

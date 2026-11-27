@@ -31,3 +31,23 @@ def test_rfb_rejects_unsolicited_extensions_and_oversized_encoding_list() -> Non
 
 def test_vnc_auth_vector() -> None:
     assert vnc_response("password", bytes(range(16))).hex() == "b866924125c8eebb9debc1db61c538e2"
+
+
+def test_rfb_strips_heavy_compression_and_prefers_copyrect_and_raw() -> None:
+    parser = RfbFilter()
+    offered = [7, -260, 16, 21, 6, 5, 1, 0, -223, -239, -312, -313, -26, -254]
+    packet = b"\x02\0" + struct.pack(f">H{len(offered)}i", len(offered), *offered)
+    filtered = parser.feed(packet)
+    count = struct.unpack_from(">H", filtered, 2)[0]
+    selected = list(struct.unpack(f">{count}i", filtered[4:]))
+    assert selected == [1, 0, 5, -223, -239, -312, -313]
+
+
+def test_rfb_falls_back_to_raw_when_only_compressed_encodings_offered() -> None:
+    parser = RfbFilter()
+    offered = [7, 16, 21]
+    packet = b"\x02\0" + struct.pack(f">H{len(offered)}i", len(offered), *offered)
+    filtered = parser.feed(packet)
+    count = struct.unpack_from(">H", filtered, 2)[0]
+    selected = list(struct.unpack(f">{count}i", filtered[4:]))
+    assert selected == [0]

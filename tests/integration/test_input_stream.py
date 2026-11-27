@@ -218,3 +218,34 @@ async def test_started_but_incomplete_frame_times_out_and_releases_input(stream_
         await asyncio.sleep(0.01)
     assert "desktop" not in owner.service.control.leases
     assert instance.controller.ledger_snapshot()["keys"] == []
+
+
+async def test_active_input_refreshes_lease_expiry_and_idle_still_expires(stream_fixture):
+    import time
+
+    owner, channel, lease, instance = stream_fixture
+    lease_obj = owner.service.control.leases["desktop"]
+    lease_obj.expires = time.monotonic() + 0.5
+    before = lease_obj.expires
+    assert (await exchange(channel, input_request(owner, lease, instance, 1)))["ok"]
+    assert lease_obj.expires > before + 2.0
+    lease_obj.expires = 0
+    with pytest.raises((EOFError, OSError, asyncio.IncompleteReadError)):
+        await receive_frame(channel, timeout=3)
+    for _ in range(300):
+        if "desktop" not in owner.service.control.leases:
+            break
+        await asyncio.sleep(0.01)
+    assert "desktop" not in owner.service.control.leases
+
+
+async def test_pipelined_input_batches_execute_in_order_across_buffered_frames(
+    stream_fixture,
+) -> None:
+    owner, channel, lease, instance = stream_fixture
+    requests = [input_request(owner, lease, instance, seq) for seq in range(1, 5)]
+    for message in requests:
+        await send_frame(channel, message)
+    responses = [decode_json(await receive_frame(channel)) for _ in requests]
+    assert [resp["ok"] for resp in responses] == [True, True, True, True]
+    assert [resp["result"]["seq"] for resp in responses] == [1, 2, 3, 4]

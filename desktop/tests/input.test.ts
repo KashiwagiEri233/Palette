@@ -127,4 +127,33 @@ describe('console coordinates and input sequencing', () => {
     wheel.reset()
     expect(wheel.push(0, 30, 0, 640, 400)).toEqual([])
   })
+  it('pipelines up to maxInFlight discrete batches without waiting for prior ACK', async () => {
+    const sent: number[] = []
+    const resolvers: Array<() => void> = []
+    const fail = vi.fn()
+    const queue = new InputQueue(
+      seq => new Promise<void>(resolve => { sent.push(seq); resolvers.push(resolve) }),
+      fail,
+      undefined,
+      4
+    )
+    queue.push({ type: 'key', key: 'a', down: true })
+    await Promise.resolve()
+    queue.push({ type: 'key', key: 'a', down: false })
+    await Promise.resolve()
+    queue.push({ type: 'key', key: 'b', down: true })
+    await Promise.resolve()
+    queue.push({ type: 'key', key: 'b', down: false })
+    await Promise.resolve()
+    queue.push({ type: 'key', key: 'c', down: true })
+    await Promise.resolve()
+    expect(sent).toEqual([1, 2, 3, 4])
+    resolvers.shift()!()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(sent).toEqual([1, 2, 3, 4, 5])
+    while (resolvers.length) resolvers.shift()!()
+    await Promise.resolve()
+    expect(fail).not.toHaveBeenCalled()
+  })
 })

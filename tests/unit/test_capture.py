@@ -91,9 +91,24 @@ class TestHappyPath:
         assert acquired.data == payload
         assert not sink.exists()
 
+    async def test_default_capture_uses_ppm_and_delivers_png(self, tmp_path: Path) -> None:
+        client = ScreendumpQmp(payload=render_ppm(640, 400))
+        result = await backend(client).capture(display_id="video0", head=0, sink=tmp_path / "f.ppm")
+        assert CaptureConfig().prefer_format == "ppm"
+        assert result.format_used == "ppm"
+        assert result.native_size == Size(width=640, height=400)
+        assert result.png_bytes.startswith(b"\x89PNG")
+        assert client.calls[0] == {
+            "filename": str(tmp_path / "f.ppm"),
+            "device": "video0",
+            "head": 0,
+        }
+
     async def test_png_capture_reports_the_framebuffer_size(self, tmp_path: Path) -> None:
         client = ScreendumpQmp(payload=render_png(1280, 800))
-        result = await backend(client).capture(display_id="video0", head=0, sink=tmp_path / "f.png")
+        result = await backend(client, prefer_format="png").capture(
+            display_id="video0", head=0, sink=tmp_path / "f.png"
+        )
         assert result.format_used == "png"
         assert result.native_size == Size(width=1280, height=800)
         assert result.image_size == result.native_size
@@ -111,7 +126,9 @@ class TestHappyPath:
 class TestFallback:
     async def test_a_png_format_rejection_falls_back_to_ppm(self, tmp_path: Path) -> None:
         client = ScreendumpQmp(png_supported=False, payload=render_ppm(320, 200))
-        result = await backend(client).capture(display_id="video0", head=0, sink=tmp_path / "f.png")
+        result = await backend(client, prefer_format="png").capture(
+            display_id="video0", head=0, sink=tmp_path / "f.png"
+        )
         assert result.format_used == "ppm"
         assert [call.get("format") for call in client.calls] == ["png", None]
         # The delivered image is still PNG; the guest-side format is an implementation
@@ -120,7 +137,7 @@ class TestFallback:
 
     async def test_the_failing_call_is_only_paid_once(self, tmp_path: Path) -> None:
         client = ScreendumpQmp(png_supported=False)
-        capture = backend(client)
+        capture = backend(client, prefer_format="png")
         await capture.capture(display_id="video0", head=0, sink=tmp_path / "a.png")
         client.calls.clear()
         await capture.capture(display_id="video0", head=0, sink=tmp_path / "b.png")
@@ -128,7 +145,7 @@ class TestFallback:
 
     async def test_fallback_can_be_disabled(self, tmp_path: Path) -> None:
         client = ScreendumpQmp(png_supported=False)
-        capture = backend(client, allow_ppm_fallback=False)
+        capture = backend(client, prefer_format="png", allow_ppm_fallback=False)
         with pytest.raises(PaletteError) as info:
             await capture.capture(display_id="video0", head=0, sink=tmp_path / "f.png")
         assert info.value.code is ErrorCode.UNSUPPORTED_CAPABILITY
@@ -144,7 +161,9 @@ class TestFallback:
             error=QmpCommandError("GenericError", "could not open file", "screendump")
         )
         with pytest.raises(PaletteError) as info:
-            await backend(client).capture(display_id="video0", head=0, sink=tmp_path / "f.png")
+            await backend(client, prefer_format="png").capture(
+                display_id="video0", head=0, sink=tmp_path / "f.png"
+            )
         assert info.value.code is ErrorCode.CAPTURE_FAILED
         assert len(client.calls) == 1
         assert info.value.details["qmp_class"] == "GenericError"
@@ -154,7 +173,9 @@ class TestFallback:
     ) -> None:
         client = ScreendumpQmp(error=QmpCommandError("DeviceNotFound", "Device 'video0' not found"))
         with pytest.raises(PaletteError) as info:
-            await backend(client).capture(display_id="video0", head=0, sink=tmp_path / "f.png")
+            await backend(client, prefer_format="png").capture(
+                display_id="video0", head=0, sink=tmp_path / "f.png"
+            )
         assert info.value.code is ErrorCode.CAPTURE_FAILED
         assert len(client.calls) == 1
 

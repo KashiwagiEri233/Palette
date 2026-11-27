@@ -16,7 +16,7 @@ test('human input stays ordered, accumulates wheel motion and reports mock trans
     const errors: string[] = []
     page.on('pageerror', error => errors.push(error.message))
     await page.evaluate(() => {
-      const samples: { queue_ms: number; roundtrip_ms: number }[] = []
+      const samples: { seq: number; queue_ms: number; roundtrip_ms: number }[] = []
       Object.assign(window, { humanInputSamples: samples })
       window.addEventListener('palette-input-timing', event => {
         samples.push((event as CustomEvent).detail)
@@ -53,14 +53,15 @@ test('human input stays ordered, accumulates wheel motion and reports mock trans
       const result = await window.palette.request('vms.list') as { vms: { vm_id: string; status: { input_ledger: { keys: string[]; buttons: string[] } } }[] }
       return result.vms.find(vm => vm.vm_id === vmId)!.status.input_ledger
     }, vmId)).toMatchObject({ keys: [], buttons: [] })
-    const before = await page.evaluate(async vmId => (await window.palette.request('control.metrics', vmId) as { input: { qmp_ms: { count: number } } }).input.qmp_ms.count, vmId)
+    const beforeSeq = await page.evaluate(() => (window as unknown as { humanInputSamples: { seq: number }[] }).humanInputSamples.at(-1)?.seq ?? 0)
     await page.locator('.console-surface').evaluate(element => {
       for (let i = 0; i < 99; i++) element.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 1 }))
     })
-    const afterSmall = await page.evaluate(async vmId => (await window.palette.request('control.metrics', vmId) as { input: { qmp_ms: { count: number } } }).input.qmp_ms.count, vmId)
-    expect(afterSmall).toBe(before)
+    await page.waitForTimeout(50)
+    const afterSmallSeq = await page.evaluate(() => (window as unknown as { humanInputSamples: { seq: number }[] }).humanInputSamples.at(-1)?.seq ?? 0)
+    expect(afterSmallSeq).toBe(beforeSeq)
     await page.locator('.console-surface').evaluate(element => element.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 1 })))
-    await expect.poll(async () => page.evaluate(async vmId => (await window.palette.request('control.metrics', vmId) as { input: { qmp_ms: { count: number } } }).input.qmp_ms.count, vmId)).toBe(before + 1)
+    await expect.poll(async () => page.evaluate(() => (window as unknown as { humanInputSamples: { seq: number }[] }).humanInputSamples.at(-1)?.seq ?? 0)).toBe(beforeSeq + 1)
     const report = await page.evaluate(async vmId => {
       const samples = (window as unknown as { humanInputSamples: { queue_ms: number; roundtrip_ms: number }[] }).humanInputSamples
       const percentile = (field: 'queue_ms' | 'roundtrip_ms', p: number): number => {

@@ -31,7 +31,7 @@ Missing helper/build capability falls back to VNC. A helper failure disconnects 
 
 - A supervised C/GIO helper subscribes to `org.qemu.Display1.Listener` CPU `Scanout`/`Update`, cursor and geometry events. It advertises no Map/GPU interfaces. Current pixel support is 32-bit RGB/BGR; unsupported formats fall back to VNC.
 - The runtime alone passes sockets and issues QMP. Windows uses `get-win32-socket`; experimental POSIX launches replace the sole stdio QMP with a private AF_UNIX connection supporting `getfd`/SCM_RIGHTS. Normal POSIX launches retain stdio. No second management channel is added.
-- `FrameSource` validates bounds, composes updates and publishes complete immutable RGBA images. Each viewer has one pending complete frame. An eight-byte big-endian sequence ACK after a render turn permits the next frame; arbitrary client messages are rejected. Slow rendering cannot accumulate an unbounded queue of full frames. VNC's incremental bytes are never dropped.
+- `FrameSource` validates bounds, composes updates and publishes immutable RGBA images. Each viewer has one pending frame and receives complete full frames initially or when coalescing skips sequences, and incremental dirty-rect or zero-pixel cursor packets when sequences are contiguous. An eight-byte big-endian sequence ACK permits the next frame; arbitrary client messages are rejected. Slow rendering cannot accumulate an unbounded queue of full frames. VNC's incremental bytes are never dropped.
 - `display.ticket` adds `provider` (`rfb`/`raw`), `generation` and `instance_id`. Older results without `provider` remain VNC. Existing single-use ticket, origin checks and private VNC credentials remain enforced.
 - Operator-only `display.shadow` requires `instance_id` and returns encoding time, sizes, source sequence/age and `authoritative: false`. It returns no `frame_id`, cannot authorize actions and is not an Agent tool. `experimental-display-v1` advertises these diagnostics.
 - `control.metrics.resources` adds per-process cumulative CPU seconds and RSS for the backend process tree, plus an incomplete flag. `execution` records actual QEMU version, CPU/RAM, machine/display model and capture limits so differing configurations cannot pass the comparison. RSS sums can count shared pages more than once; compare the same sampling method. Input leases, epochs, ordering and unknown-result replay rules are unchanged.
@@ -43,7 +43,7 @@ The helper follows the [upstream QEMU test](https://github.com/qemu/qemu/blob/ma
 Run the application tests and explicit real-QEMU firmware check:
 
 ```sh
-uv run python -m pytest tests/unit/test_frame_source.py tests/unit/test_display_benchmarks.py tests/integration/test_raw_display.py
+uv run python -m pytest tests/unit/test_frame_source.py tests/integration/test_raw_display.py
 npm --prefix desktop run build
 npm --prefix desktop test
 ```

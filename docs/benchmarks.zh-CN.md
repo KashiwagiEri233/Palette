@@ -35,7 +35,7 @@ PALETTE_E2E=1 PALETTE_E2E_PROFILE=default uv run pytest tests/e2e -v
 
 当某台宿主机上的实测耗时超出目标预算时，可按以下五个阶段逐一分解定位瓶颈：
 
-1. **图像编码与缩放（Pillow PNG 编码）**：将原始帧缓冲转换为压缩 PNG 字节流往往占去最大比例的 CPU 时间（尤其在未缩放的高分辨率画面下）。
+1. **图像编码与缩放（Pillow PNG 编码）**：将原始帧缓冲转换为压缩 PNG 字节流往往占去最大比例的 CPU 时间（尤其在未缩放的高分辨率画面下）。默认启用 `prefer_format = "ppm"`，由 QEMU 直接输出未压缩 PPM 以避免阻塞 QEMU 主循环压缩，随后由 Palette 后台离线转为标准 `image/png`（优先使用快速压缩，超字节上限时回退高压缩比）。
 2. **截图临时文件 I/O**：QEMU `screendump` 先将帧缓冲写入 `.runtime/vms/<vm_id>/<instance_id>/frames/` 下的临时文件，随后由服务读取并立即删除。
 3. **QMP 传输往返**：经私有传输（POSIX 为子进程标准输入输出，Windows 为 AF_UNIX）发送 JSON 指令并等待 QEMU 主循环返回响应。
 4. **输入后画面稳定等待（`settle_after_input_ms`）**：输入事件提交后到触发动作后截图之间的配置等待窗口（默认 `120 ms`）。
@@ -43,9 +43,9 @@ PALETTE_E2E=1 PALETTE_E2E_PROFILE=default uv run pytest tests/e2e -v
 
 ## 4. 人工输入与实时显示
 
-人工输入走 `control.input` → QMP `input-send-event`，没有 Agent 动作后的稳定等待或逐次截图。实时显示使用独立的只读 VNC/WebSocket 流。键盘和按钮在微任务中发送，纯移动批次采用 8ms 最小发送间隔；等待在途 ACK 或正在执行的事务产生的耗时另计，不属于这项调度预算。
+人工输入走 `control.input` → QMP `input-send-event`，没有 Agent 动作后的稳定等待或逐次截图。实时显示使用独立的只读 VNC/WebSocket 流；本地回环网关会启用 `TCP_NODELAY`，并优先协商 `CopyRect` 与 `Raw` 以避免重压缩编解码阻塞。键盘和按钮在微任务中发送，纯移动批次采用 8ms 最小发送间隔；等待在途 ACK 或正在执行的事务产生的耗时另计，不属于这项调度预算。
 
-桌面端协商 `operator-input-stream-v1`，为输入建立绑定租约的长连接。每批仍校验鉴权、序号回执和代次，旧后台沿用单次连接。心跳和释放使用独立连接，断线后不重放结果未知的输入。最多两条输入流占用八个本地连接槽位。租约失效时关闭流；有效租约可以空闲等待，但开始接收的帧必须在两秒内完整到达。
+桌面端协商 `operator-input-stream-v1`，为输入建立绑定租约的长连接。渲染端 `InputQueue` 与主进程 `InputStream` 支持最多 4 个并发在途批次的流水线传输，同时保持顺序语义及 `ACTION_OUTCOME_UNKNOWN` 断线审计边界。每批仍校验鉴权、序号回执和代次，成功提交的 `control.input` 会顺带刷新租约有效期；旧后台沿用单次连接。心跳和释放使用独立连接，断线后不重放结果未知的输入。最多两条输入流占用八个本地连接槽位。租约失效时关闭流；有效租约可以空闲等待，但开始接收的帧必须在两秒内完整到达。`ActionScheduler` 会优先调度排在待执行观察之前的 `OPERATOR_INPUT`（连续插队上限 8 次以防观察饿死），`operator.input` 审计记录在 ACK 路径外异步写盘。
 
 诊断时，`window.palette.request('control.metrics', VM_ID)` 返回最近窗口的 P50/P95/P99 毫秒数与样本量，每项最多保留 256 个样本。`input` 为当前实例的排队、QMP、审计和总耗时，`runtime` 为事件循环延迟，`display` 为整个 runtime 的网关转发及背压耗时。这些是传输和服务指标，不代表客体画面反馈延迟。渲染进程发出 `palette-input-timing` 自定义事件，仅包含 `queue_ms` 和 `roundtrip_ms`；诊断监听者需自行限制历史长度。不记录键值、文本或截图。
 

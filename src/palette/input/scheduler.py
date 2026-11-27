@@ -16,6 +16,7 @@ from ..config import Profile
 from ..errors import ErrorCode, PaletteError
 
 logger = logging.getLogger("palette.input")
+_MAX_CONSECUTIVE_PRIORITY = 8
 
 
 class JobKind(StrEnum):
@@ -58,6 +59,7 @@ class ActionScheduler:
         self.worker: asyncio.Task[None] | None = None
         self.current: Job | None = None
         self.closing = False
+        self._consecutive_priority = 0
 
     async def start(self, vm_id: str) -> None:
         if self.worker is None:
@@ -162,6 +164,33 @@ class ActionScheduler:
             self.cancel_job(job, PaletteError(ErrorCode.CANCELLED, "the request was cancelled"))
             raise
 
+    def _pop_next(self) -> Job | None:
+        while self.jobs and (self.jobs[0].cancelled or self.jobs[0].future.done()):
+            self.jobs.popleft()
+        if not self.jobs:
+            return None
+        for index, candidate in enumerate(self.jobs):
+            if candidate.kind is JobKind.RELEASE and not (
+                candidate.cancelled or candidate.future.done()
+            ):
+                if index == 0:
+                    return self.jobs.popleft()
+                del self.jobs[index]
+                return candidate
+        if self._consecutive_priority < _MAX_CONSECUTIVE_PRIORITY:
+            for index, candidate in enumerate(self.jobs):
+                if candidate.kind is JobKind.OPERATOR_INPUT and not (
+                    candidate.cancelled or candidate.future.done()
+                ):
+                    if index == 0:
+                        self._consecutive_priority = 0
+                        return self.jobs.popleft()
+                    self._consecutive_priority += 1
+                    del self.jobs[index]
+                    return candidate
+        self._consecutive_priority = 0
+        return self.jobs.popleft()
+
     async def _run_worker(self) -> None:
         while not self.closing:
             if not self.jobs:
@@ -171,8 +200,8 @@ class ActionScheduler:
                 except asyncio.CancelledError:
                     raise
                 continue
-            job = self.jobs.popleft()
-            if job.cancelled or job.future.done():
+            job = self._pop_next()
+            if job is None or job.cancelled or job.future.done():
                 continue
             self.current = job
             job.started.set()

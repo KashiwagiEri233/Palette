@@ -44,8 +44,13 @@ class TestObserve:
         assert result.frame.cursor_position_source == "not_observed"
 
     async def test_a_build_without_png_falls_back_and_still_returns_a_png(
-        self, service: PaletteService, running_vm
+        self, service: PaletteService, running_vm, monkeypatch
     ) -> None:
+        monkeypatch.setattr(
+            running_vm.capture,
+            "_config",
+            running_vm.capture._config.model_copy(update={"prefer_format": "png"}),
+        )
         write_behavior(running_vm, {"png_unsupported": True})
         result, image = await service.observe_image("desktop")
         assert result.ok is True

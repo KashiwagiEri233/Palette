@@ -86,3 +86,32 @@ class TestRecordShape:
         log = AuditLog(tmp_path / "audit.jsonl")
         log.record("event", when=object())
         assert log.tail(1)[0]["event"] == "event"
+
+
+class TestAsyncWriter:
+    def test_async_records_scrub_rotate_and_flush_on_tail_and_close(self, tmp_path: Path) -> None:
+        path = tmp_path / "audit.jsonl"
+        log = AuditLog(path, max_bytes=300, max_files=3)
+        for index in range(60):
+            log.record_async(
+                "operator.input",
+                vm_id="desktop",
+                count=index,
+                secret="never-written",
+            )
+        entries = log.tail(100)
+        assert entries[-1]["count"] == 59
+        assert all("secret" not in entry for entry in entries)
+        generations = sorted(tmp_path.glob("audit*.jsonl"))
+        assert len(generations) <= 3
+        log.close()
+        assert log._handle is None
+
+    def test_disabled_async_write_does_not_spawn_worker(self, tmp_path: Path) -> None:
+        path = tmp_path / "audit.jsonl"
+        log = AuditLog(path, enabled=False)
+        log.record_async("operator.input", count=1)
+        log.flush()
+        log.close()
+        assert log._worker is None
+        assert not path.exists()
