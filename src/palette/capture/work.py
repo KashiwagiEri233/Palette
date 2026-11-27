@@ -13,6 +13,11 @@ _limits: WeakKeyDictionary[asyncio.AbstractEventLoop, ReferenceType[asyncio.Sema
 )
 
 
+async def capture_io[T](work: Callable[[], T]) -> T:
+    """Join short acquisition I/O independently of the saturated PNG encoder slots."""
+    return await join_cleanup(asyncio.create_task(asyncio.to_thread(work)))
+
+
 async def image_work[T](work: Callable[[], T]) -> T:
     loop = asyncio.get_running_loop()
     previous = _limits.get(loop)

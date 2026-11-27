@@ -58,6 +58,10 @@ ALLOWED_COMMANDS = frozenset(
         "system_powerdown",
         "system_reset",
         "quit",
+        "getfd",
+        "get-win32-socket",
+        "add_client",
+        "closefd",
     }
 )
 
@@ -233,6 +237,7 @@ class QmpClient:
         *,
         timeout: float | None = None,
         on_sending: Callable[[], None] | None = None,
+        fd: int | None = None,
     ) -> Any:
         """Send one command and await its matching response.
 
@@ -264,7 +269,14 @@ class QmpClient:
         effective = self._command_timeout if timeout is None else timeout
         try:
             async with asyncio.timeout(effective):
-                await self._transport.send_json(payload, on_sending=on_sending)
+                if fd is None:
+                    await self._transport.send_json(payload, on_sending=on_sending)
+                else:
+                    if command != "getfd":
+                        raise PaletteError(
+                            ErrorCode.POLICY_DENIED, "only getfd accepts a descriptor"
+                        )
+                    await self._transport.send_json(payload, on_sending=on_sending, fd=fd)
                 response = await future
         except TimeoutError:
             self._pending.pop(message_id, None)

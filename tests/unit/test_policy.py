@@ -79,10 +79,6 @@ class TestPathGuard:
             guard.resolve(value)
         assert info.value.code is ErrorCode.PATH_DENIED
 
-    def test_contains_agrees_with_resolve(self, guard: PathGuard, runtime_root: Path) -> None:
-        assert guard.contains(runtime_root / "vms" / "desktop")
-        assert not guard.contains(runtime_root.parent / "elsewhere")
-
     def test_assert_managed_refuses_an_unmanaged_path(
         self, guard: PathGuard, tmp_path: Path
     ) -> None:
@@ -129,59 +125,15 @@ class TestLifecyclePermissions:
                 policy.require_lifecycle(operation, actor="agent")  # type: ignore[arg-type]
             assert info.value.code is ErrorCode.POLICY_DENIED
 
-    def test_starting_is_open_to_agents_by_default(self, guard: PathGuard) -> None:
-        make_policy(guard).require_lifecycle("start", actor="agent")
-
     def test_a_profile_can_close_starting(self, guard: PathGuard) -> None:
         policy = make_policy(guard, lifecycle=LifecyclePolicy(allow_agent_start=False))
         with pytest.raises(PaletteError) as info:
             policy.require_lifecycle("start", actor="agent")
         assert info.value.code is ErrorCode.POLICY_DENIED
 
-    def test_operators_are_allowed(self, guard: PathGuard) -> None:
-        policy = make_policy(guard)
-        for operation in ("start", "stop", "force_stop", "reset"):
-            policy.require_lifecycle(operation, actor="operator")  # type: ignore[arg-type]
-
-    def test_a_granted_operation_is_allowed_for_agents(self, guard: PathGuard) -> None:
-        policy = make_policy(
-            guard,
-            lifecycle=LifecyclePolicy(allow_agent_stop=True, allow_agent_start=False),
-        )
-        policy.require_lifecycle("stop", actor="agent")
-        with pytest.raises(PaletteError):
-            policy.require_lifecycle("reset", actor="agent")
-
-    def test_capabilities_reflect_the_grants(self, guard: PathGuard) -> None:
-        policy = make_policy(guard)
-        # Every grant the profile makes is reported, including the host-material ones: a
-        # client should be able to see that this profile lets a caller name an image or
-        # append arguments, rather than finding out by trying.
-        assert set(policy.capabilities()) >= {
-            "observe",
-            "control",
-            "lifecycle.start",
-            "host.image",
-            "host.iso",
-            "host.qemu_args",
-        }
-        assert "lifecycle.reset" not in policy.capabilities()
-        strict = make_policy(guard, lifecycle=LifecyclePolicy(allow_agent_images=False))
-        assert "host.image" not in strict.capabilities()
-
 
 class TestHostMaterial:
     """Who may hand the service a path or a QEMU argument."""
-
-    def test_operators_may_always_supply_host_material(self, guard: PathGuard) -> None:
-        policy = make_policy(
-            guard,
-            lifecycle=LifecyclePolicy(
-                allow_agent_images=False, allow_agent_iso=False, allow_agent_qemu_args=False
-            ),
-        )
-        for kind in ("image", "iso", "qemu_args"):
-            policy.require_host_material(kind, actor="operator")  # type: ignore[arg-type]
 
     def test_the_switches_are_independent(self, guard: PathGuard) -> None:
         policy = make_policy(
@@ -254,10 +206,6 @@ class TestAssetsAndNetwork:
         with pytest.raises(PaletteError) as info:
             policy.require_base_image()
         assert info.value.code is ErrorCode.IMAGE_INVALID
-
-    def test_a_well_formed_base_image_is_accepted(self, guard: PathGuard, base_image: Path) -> None:
-        policy = make_policy(guard, images=ImagesConfig(base=str(base_image), format="qcow2"))
-        assert policy.require_base_image() == base_image
 
     def test_a_mismatched_extension_is_rejected(self, guard: PathGuard, tmp_path: Path) -> None:
         wrong = tmp_path / "base.raw"

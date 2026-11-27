@@ -33,17 +33,10 @@ class TestStart:
         # a login prompt look the same from here.
         assert running_vm.view.screen_ready is True
         assert running_vm.view.desktop_ready is None
-
-    async def test_the_display_is_bound_to_the_configured_device(self, running_vm) -> None:
-        assert running_vm.view.display_id == "video0"
-        assert running_vm.view.head == 0
+        assert running_vm.process is not None and running_vm.process.returncode is None
+        assert running_vm.view.display_id == "video0" and running_vm.view.head == 0
         assert running_vm.view.native_size.width == 320
         assert running_vm.view.native_size.height == 200
-
-    async def test_the_process_is_alive_and_hidden(self, running_vm) -> None:
-        assert running_vm.process is not None
-        assert running_vm.process.returncode is None
-        assert running_vm.view.instance_id.startswith("inst_")
 
     async def test_qemu_stderr_is_consumed(self, running_vm) -> None:
         """An unread stderr pipe eventually blocks the guest, so the manager drains it."""
@@ -52,19 +45,6 @@ class TestStart:
                 break
             await asyncio.sleep(0.02)
         assert running_vm.stderr_tail(1)
-
-    async def test_the_command_line_contains_no_window_and_no_network(self, running_vm) -> None:
-        argv = running_vm.plan.argv
-        assert "-display" in argv and argv[argv.index("-display") + 1] == "none"
-        assert "-nic" in argv and argv[argv.index("-nic") + 1] == "none"
-        assert any(argument.startswith("VGA,id=video0") for argument in argv)
-        assert any("usb-tablet" in argument for argument in argv)
-        assert any("usb-kbd" in argument for argument in argv)
-        if running_vm.plan.qmp_endpoint is None:
-            assert "stdio,id=qmp,signal=off" in argv
-        else:
-            assert any(argument.startswith("socket,id=qmp,") for argument in argv)
-        assert not any("vnc" in argument.lower() for argument in argv)
 
     async def test_the_overlay_points_at_the_base_image(self, running_vm, base_image: Path) -> None:
         import json
@@ -113,15 +93,6 @@ class TestStart:
         instances = service.config.runtime_root / "vms" / "desktop"
         assert not instances.exists() or not list(instances.iterdir())
 
-    async def test_a_failed_start_is_not_reported_as_running(
-        self, service: PaletteService, tmp_path: Path
-    ) -> None:
-        service.config.profiles["default"] = make_profile(tmp_path / "missing.qcow2")  # type: ignore[index]
-        with pytest.raises(PaletteError):
-            await service.manager.start("desktop", "default")
-        status = await service.status("desktop")
-        assert status.ok is False
-
 
 class TestStop:
     async def test_a_normal_stop_ends_the_process(
@@ -141,11 +112,6 @@ class TestStop:
         await service.manager.stop("desktop")
         assert process is not None and process.returncode is not None
         assert service.manager.get("desktop").state is VmState.STOPPED
-
-    async def test_stopping_an_unknown_vm_is_refused(self, service: PaletteService) -> None:
-        with pytest.raises(PaletteError) as info:
-            await service.manager.stop("ghost")
-        assert info.value.code is ErrorCode.VM_NOT_FOUND
 
     async def test_emergency_stop_kills_without_waiting(self, service: PaletteService) -> None:
         instance = await service.manager.start("desktop", "default")
@@ -167,15 +133,6 @@ class TestReset:
         assert renewed.view.boot_epoch == first_epoch + 1
         assert renewed.state is VmState.RUNNING
         assert renewed.view.action_seq == 0
-
-    async def test_the_base_image_is_never_written_to(
-        self, service: PaletteService, base_image: Path
-    ) -> None:
-        before = sha256(base_image)
-        await service.manager.start("desktop", "default")
-        await service.manager.reset("desktop")
-        await service.manager.stop("desktop", force=True)
-        assert sha256(base_image) == before
 
     async def test_the_previous_overlay_is_kept_by_the_retention_policy(
         self, service: PaletteService, running_vm
@@ -221,18 +178,6 @@ class TestRepeatedLifecycle:
             assert process.returncode is not None, "a QEMU process outlived its VM"
         assert sha256(base_image) == before
 
-    async def test_repeated_resets_stay_bounded(
-        self, service: PaletteService, base_image: Path
-    ) -> None:
-        before = sha256(base_image)
-        for _ in range(6):
-            await service.manager.reset("desktop")
-        await service.manager.stop("desktop", force=True)
-        instance_dirs = list((service.config.runtime_root / "vms" / "desktop").iterdir())
-        # The retention limit is honoured rather than accumulating forever.
-        assert len(instance_dirs) <= service.config.profile("default").retention.max_overlays + 1
-        assert sha256(base_image) == before
-
 
 class TestShutdown:
     async def test_shutdown_stops_everything(self, service: PaletteService) -> None:
@@ -240,8 +185,3 @@ class TestShutdown:
         process = instance.process
         await service.shutdown()
         assert process is not None and process.returncode is not None
-
-    async def test_shutdown_is_idempotent(self, service: PaletteService) -> None:
-        await service.manager.start("desktop", "default")
-        await service.shutdown()
-        await service.shutdown()

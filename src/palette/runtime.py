@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import TYPE_CHECKING, Any
 
 from . import __version__
@@ -19,6 +20,7 @@ from .service import PaletteService
 
 if TYPE_CHECKING:
     from .agent_ipc import AgentServer
+    from .vm.manager import VmInstance
 
 
 class RuntimeOwner:
@@ -91,6 +93,8 @@ class RuntimeOwner:
                     "driver-claim-v1",
                     "guest-enhancements-v1",
                     "operator-input-stream-v1",
+                    "experimental-display-v1",
+                    "display-settings-v1",
                 ],
                 "owner_kind": self.kind,
                 "pid": os.getpid(),
@@ -195,7 +199,21 @@ class RuntimeOwner:
             )
         if method == "vms.delete":
             return await self.desktop.delete(vm_id)
+        if method == "display.settings.get":
+            return self._display_settings()
+        if method == "display.settings.update":
+            self.service.manager.display_settings.update(payload)
+            return self._display_settings()
         if method == "display.ticket":
+            instance = self.service.manager.get(vm_id)
+            self.service.require_instance_id(instance, str(payload["instance_id"]))
+            if instance.state.value == "RUNNING":
+                await self.service.manager.start_display_bridge(instance)
+                if (
+                    instance.display_bridge is not None
+                    and not instance.display_bridge.source.closed
+                ):
+                    await instance.display_bridge.source.wait_frame()
             return self.display.ticket(vm_id, str(payload["instance_id"]))
         if method == "display.sync":
             try:
@@ -206,14 +224,60 @@ class RuntimeOwner:
             return (await self.service.status(vm_id, actor="operator")).model_dump(mode="json")
         if method == "control.acquire":
             return await self.service.control.acquire(vm_id, str(payload["instance_id"]))
+        if method == "display.shadow":
+            instance = self.service.manager.get(vm_id)
+            self.service.require_instance_id(instance, str(payload["instance_id"]))
+            bridge = instance.display_bridge
+            if bridge is None or bridge.source.closed or bridge.source.frame is None:
+                raise PaletteError(ErrorCode.UNSUPPORTED_CAPABILITY, "raw display is unavailable")
+            frame = bridge.source.frame
+            captured = await bridge.source.shadow_capture(instance.profile.capture)
+            return {
+                "authoritative": False,
+                "generation": frame.generation,
+                "source_seq": frame.seq,
+                "source_age_ms": (time.monotonic() - frame.received_at) * 1000,
+                "duration_ms": captured.duration_ms,
+                "byte_count": captured.byte_count,
+                "native_size": captured.native_size.model_dump(),
+                "image_size": captured.image_size.model_dump(),
+            }
         if method == "control.metrics":
+            from .capture.base import SplitCaptureBackend
+            from .timing import process_tree_metrics
+
             instance = self.service.manager.get(vm_id)
             controller = instance.controller
+            lease = self.service.control.leases.get(vm_id)
             return {
                 "instance_id": instance.view.instance_id,
+                "input_transport": (
+                    "operator-input-stream-v1"
+                    if lease is not None and (vm_id, lease.token) in self.operator._input_streams
+                    else "one-shot"
+                    if lease is not None
+                    else "inactive"
+                ),
                 "input": controller.operator_timings.snapshot() if controller else {},
+                "observation": controller.observation_timings.snapshot() if controller else {},
+                "observation_pipeline": "split"
+                if isinstance(instance.capture, SplitCaptureBackend)
+                else "serial",
                 "runtime": self.service.control.timings.snapshot(),
                 "display": self.display.timings.snapshot(),
+                "display_settings": self._display_instance_settings(instance),
+                "resources": process_tree_metrics(),
+                "execution": {
+                    "qemu_version": instance.qmp.version if instance.qmp else None,
+                    "guest_arch": instance.profile.qemu.arch,
+                    "accelerator": instance.plan.accelerator if instance.plan else None,
+                    "vcpus": instance.profile.resources.vcpus,
+                    "memory_mib": instance.profile.resources.memory_mib,
+                    "machine": instance.profile.qemu.machine,
+                    "display_model": instance.profile.devices.display_model,
+                    "capture_max_long_edge": instance.profile.capture.max_long_edge,
+                    "capture_max_bytes": instance.profile.capture.max_bytes,
+                },
             }
         if method == "control.heartbeat":
             return self.service.control.heartbeat(vm_id, str(payload["lease_id"]))
@@ -239,3 +303,37 @@ class RuntimeOwner:
             asyncio.get_running_loop().call_later(0.1, self.stopping.set)
             return {"stopping": True}
         raise PaletteError(ErrorCode.INVALID_ARGUMENT, "unknown desktop operation")
+
+    def _display_settings(self) -> dict[str, Any]:
+        manager = self.service.manager
+        return {
+            "configured_mode": manager.display_settings.mode,
+            "reason": manager.display_settings.reason,
+            "instances": [
+                self._display_instance_settings(manager.get(vm_id))
+                for vm_id in manager.known()
+                if manager.get(vm_id).state.value in {"STARTING", "RUNNING", "PAUSED"}
+            ],
+        }
+
+    def _display_instance_settings(self, instance: VmInstance) -> dict[str, Any]:
+        bridge = instance.display_bridge
+        provider = (
+            "raw"
+            if bridge is not None and not bridge.source.closed and bridge.source.frame is not None
+            else "rfb"
+            if instance.console_address is not None
+            else None
+        )
+        mode = self.service.manager.display_settings.mode
+        return {
+            "vm_id": instance.view.vm_id,
+            "instance_id": instance.view.instance_id,
+            "provider": provider,
+            "refresh_mode": "steady"
+            if instance.plan and instance.plan.steady_display
+            else "adaptive",
+            "requested_mode": instance.display_requested_mode,
+            "restart_required": mode != instance.display_requested_mode,
+            "reason": instance.display_reason or self.service.manager.display_settings.reason,
+        }

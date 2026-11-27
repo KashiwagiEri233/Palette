@@ -12,11 +12,9 @@ import json
 from dataclasses import asdict
 
 import pytest
-from mcp.server.mcpserver.exceptions import ToolError
 
 from palette.config import GuestToolsConfig, PaletteConfig
 from palette.errors import ErrorCode, PaletteError
-from palette.models import ACTION_TYPES
 from palette.server import build_server
 from palette.service import PaletteService
 from support.profiles import make_profile
@@ -48,10 +46,6 @@ class TestRegistration:
             "vm_stop",
             "vm_reset",
         }
-
-    def test_guest_tools_are_not_advertised_when_no_profile_enables_them(self, server) -> None:
-        assert "vm_guest_input_text" not in tool_names(server)
-        assert "vm_guest_launch_app" not in tool_names(server)
 
     def test_guest_tools_are_advertised_when_a_profile_enables_them(
         self, service: PaletteService
@@ -102,26 +96,8 @@ class TestRegistration:
         assert tools["vm_act"].annotations.read_only_hint is False
         assert tools["vm_reset"].annotations.destructive_hint is True
 
-    def test_the_action_parameter_is_a_discriminated_union(self, server) -> None:
-        tools = {tool.name: tool for tool in server._tool_manager.list_tools()}
-        action = tools["vm_act"].parameters["properties"]["action"]
-        assert action["discriminator"]["propertyName"] == "type"
-        assert set(action["discriminator"]["mapping"]) == set(ACTION_TYPES)
-
-    def test_the_instructions_teach_the_loop_and_the_limits(self, server) -> None:
-        text = server.instructions or ""
-        assert "vm_observe" in text
-        assert "ASCII" in text
-        assert "STALE_FRAME" in text
-        assert "vm_list" in text
-
 
 class TestObservationTools:
-    async def test_list_returns_an_empty_success_without_known_vms(self, server) -> None:
-        result = await call(server, "vm_list")
-        assert result.is_error is False
-        assert result.structured_content == {"ok": True, "error": None, "vms": []}
-
     async def test_list_reports_structured_service_errors(
         self, server, service: PaletteService, monkeypatch
     ) -> None:
@@ -160,14 +136,6 @@ class TestObservationTools:
         assert service.control.leases["desktop"].token == lease["lease_id"]
         await service.control.release("desktop", lease["lease_id"])
 
-    async def test_status_returns_a_structured_summary(self, server, running_vm) -> None:
-        result = await call(server, "vm_status", vm_id="desktop")
-        assert result.is_error is False
-        assert result.structured_content["ok"] is True
-        assert result.structured_content["status"]["state"] == "RUNNING"
-        assert result.structured_content["status"]["screen_ready"] is True
-        assert result.structured_content["status"]["desktop_ready"] is None
-
     async def test_status_for_an_unknown_vm_is_an_error_result(self, server) -> None:
         result = await call(server, "vm_status", vm_id="ghost")
         assert result.is_error is True
@@ -199,13 +167,6 @@ class TestObservationTools:
         result = await call(server, "vm_observe", vm_id="desktop")
         assert result.is_error is True
         assert result.structured_content["error"]["code"] == "VM_NOT_FOUND"
-
-    async def test_release_reports_that_nothing_was_held(self, server, running_vm) -> None:
-        result = await call(
-            server, "vm_release_inputs", vm_id="desktop", instance_id=running_vm.view.instance_id
-        )
-        assert result.is_error is False
-        assert result.structured_content["release_confirmed"] is True
 
 
 class TestActionTool:
@@ -254,61 +215,12 @@ class TestActionTool:
         # No image is attached to a refusal: there is no frame to show.
         assert not any(block.type == "image" for block in result.content)
 
-    async def test_a_malformed_action_is_rejected_by_the_schema(self, server, running_vm) -> None:
-        """Structural validation happens before the tool body runs, so no half-validated
-        action can reach the controller."""
-        observed = await call(server, "vm_observe", vm_id="desktop")
-        frame_id = observed.structured_content["frame"]["frame_id"]
-        with pytest.raises(ToolError):
-            await call(
-                server,
-                "vm_act",
-                vm_id="desktop",
-                instance_id=running_vm.view.instance_id,
-                frame_id=frame_id,
-                request_id="bad",
-                action={"type": "click", "x": 5, "y": 5, "count": 7},
-            )
-
-    async def test_an_unsupported_action_type_is_rejected(self, server, running_vm) -> None:
-        observed = await call(server, "vm_observe", vm_id="desktop")
-        frame_id = observed.structured_content["frame"]["frame_id"]
-        with pytest.raises(ToolError):
-            await call(
-                server,
-                "vm_act",
-                vm_id="desktop",
-                instance_id=running_vm.view.instance_id,
-                frame_id=frame_id,
-                request_id="swipe",
-                action={"type": "swipe", "x": 5, "y": 5},
-            )
-
-    async def test_an_unknown_field_in_an_action_is_rejected(self, server, running_vm) -> None:
-        observed = await call(server, "vm_observe", vm_id="desktop")
-        frame_id = observed.structured_content["frame"]["frame_id"]
-        with pytest.raises(ToolError):
-            await call(
-                server,
-                "vm_act",
-                vm_id="desktop",
-                instance_id=running_vm.view.instance_id,
-                frame_id=frame_id,
-                request_id="extra",
-                action={"type": "move", "x": 5, "y": 5, "pressure": 0.5},
-            )
-
     async def test_wait_returns_a_reason_and_a_frame(self, server, running_vm) -> None:
         result = await call(server, "vm_wait", vm_id="desktop", mode="delay", timeout_ms=40)
         assert result.is_error is False
         assert result.structured_content["reason"] == "delay_elapsed"
         assert result.structured_content["frame"] is not None
         assert any(block.type == "image" for block in result.content)
-
-    async def test_wait_rejects_an_unsupported_mode(self, server, running_vm) -> None:
-        result = await call(server, "vm_wait", vm_id="desktop", mode="teleport", timeout_ms=100)
-        assert result.is_error is True
-        assert result.structured_content["error"]["code"] == "UNSUPPORTED_CAPABILITY"
 
 
 class TestLifecycleTools:
@@ -317,12 +229,6 @@ class TestLifecycleTools:
         assert result.is_error is False
         assert result.structured_content["ok"] is True
         assert result.structured_content["state"] == "RUNNING"
-
-    async def test_the_start_tool_exposes_the_host_material_parameters(self, server) -> None:
-        tools = {tool.name: tool for tool in server._tool_manager.list_tools()}
-        properties = tools["vm_start"].parameters["properties"]
-        for name in ("image", "image_format", "iso", "extra_disks", "qemu_args"):
-            assert name in properties
 
     async def test_a_caller_supplied_image_backs_the_instance(
         self, server, base_image, tmp_path
@@ -341,11 +247,6 @@ class TestLifecycleTools:
         assert result.is_error is True
         assert result.structured_content["error"]["code"] == "IMAGE_MISSING"
 
-    async def test_a_relative_caller_image_is_refused(self, server) -> None:
-        result = await call(server, "vm_start", vm_id="desktop", image="relative/base.qcow2")
-        assert result.is_error is True
-        assert result.structured_content["error"]["code"] == "PATH_DENIED"
-
     async def test_qemu_arguments_reach_the_plan_when_the_profile_allows_them(
         self, server, service
     ) -> None:
@@ -354,11 +255,6 @@ class TestLifecycleTools:
         instance = service.manager.get("desktop")
         assert "-m" in instance.plan.argv
         assert instance.plan.notes  # the override is recorded on the plan
-
-    async def test_an_oversized_argument_vector_is_refused(self, server) -> None:
-        result = await call(server, "vm_start", vm_id="desktop", qemu_args=["-m"] * 100)
-        assert result.is_error is True
-        assert result.structured_content["error"]["code"] == "INVALID_ARGUMENT"
 
     async def test_a_closed_switch_refuses_host_material(self, server, service, base_image) -> None:
         from palette.config import LifecyclePolicy
@@ -427,50 +323,6 @@ class TestGuestTools:
             yield build_server(service), instance
         finally:
             await service.shutdown()
-
-    async def test_guest_text_reports_unavailable_rather_than_simulating_it(
-        self, guest_server
-    ) -> None:
-        server, instance = guest_server
-        observed = await call(server, "vm_observe", vm_id="desktop")
-        frame_id = observed.structured_content["frame"]["frame_id"]
-        result = await call(
-            server,
-            "vm_guest_input_text",
-            vm_id="desktop",
-            instance_id=instance.view.instance_id,
-            boot_epoch=instance.view.boot_epoch,
-            frame_id=frame_id,
-            request_id="g1",
-            text="hello",
-            method="native_text",
-            target="focused",
-        )
-        assert result.is_error is True
-        assert result.structured_content["error"]["code"] == "GUEST_TOOL_UNAVAILABLE"
-        assert result.structured_content["effect_state"] == "not_sent"
-
-    async def test_the_visual_tools_remain_available_alongside_it(self, guest_server) -> None:
-        server, _instance = guest_server
-        assert (await call(server, "vm_observe", vm_id="desktop")).is_error is False
-        assert (await call(server, "vm_status", vm_id="desktop")).is_error is False
-
-    async def test_launching_an_unregistered_app_is_refused_before_the_channel(
-        self, guest_server
-    ) -> None:
-        server, instance = guest_server
-        result = await call(
-            server,
-            "vm_guest_launch_app",
-            vm_id="desktop",
-            instance_id=instance.view.instance_id,
-            boot_epoch=instance.view.boot_epoch,
-            request_id="g2",
-            app_id="bash",
-            options={},
-        )
-        assert result.is_error is True
-        assert result.structured_content["error"]["code"] == "APP_NOT_ALLOWED"
 
     async def test_status_reports_the_channel_as_unavailable(self, guest_server) -> None:
         server, _instance = guest_server

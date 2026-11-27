@@ -438,6 +438,8 @@ class LaunchPlan:
     guest_ipc_directory: Path | None = None
     qmp_endpoint: str | None = None
     clipboard_enabled: bool = False
+    experimental_display: bool = False
+    steady_display: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -637,6 +639,8 @@ def build_launch_plan(
     extra_volumes: Sequence[ExtraVolume] = (),
     caller_args: Sequence[str] = (),
     attach_primary: bool = True,
+    experimental_display: bool = False,
+    steady_display: bool = False,
 ) -> LaunchPlan:
     """Compose QEMU's arguments from the profile plus anything the caller supplied.
 
@@ -661,7 +665,8 @@ def build_launch_plan(
     argv += ["-smp", str(resources.vcpus)]
     if qemu.cpu:
         argv += ["-cpu", qemu.cpu]
-    argv += ["-nodefaults", "-display", "none"]
+    steady_display = steady_display or experimental_display
+    argv += ["-nodefaults", "-display", "dbus,p2p=yes,gl=off" if steady_display else "none"]
     if managed_console:
         vnc_port = _available_console_port()
         if not 5900 <= vnc_port <= 65535:
@@ -839,6 +844,9 @@ def build_launch_plan(
         qmp_endpoint = str(endpoint)
         path = str(endpoint).replace("\\", "/").replace(",", ",,")
         qmp_backend = f"socket,id=qmp,path={path},server=on,wait=off"
+    elif experimental_display:
+        qmp_endpoint = str(workdir / "qmp.sock")
+        qmp_backend = "socket,id=qmp,path=qmp.sock,server=on,wait=off"
     else:
         qmp_backend = "stdio,id=qmp,signal=off"
     argv += ["-chardev", qmp_backend, "-mon", "chardev=qmp,mode=control"]
@@ -874,6 +882,8 @@ def build_launch_plan(
         guest_ipc_directory=ipc_directory,
         qmp_endpoint=qmp_endpoint,
         clipboard_enabled=clipboard_enabled,
+        experimental_display=experimental_display,
+        steady_display=steady_display,
     )
 
 

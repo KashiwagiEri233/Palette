@@ -1,6 +1,7 @@
 import { CopyDebugInfoButton } from './components/CopyDebugInfoButton'
-import { useEffect, useRef, useState } from 'react'
-import RFB from '@novnc/novnc'
+import { memo, useEffect, useRef, useState } from 'react'
+import { createDisplaySession, type DisplaySession } from './lib/display-session'
+import type { RawDisplayTicket } from './lib/raw-display'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PcMouseIcon, ExpandIcon, CollapseIcon, RefreshIcon } from '@/components/icons'
@@ -14,11 +15,38 @@ import { IconButton, activeVm } from './components/workspace-primitives'
 import { toast } from 'sonner'
 import type { GuestStatus } from '../shared/guest'
 
-export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRecord; reportError: (message: string) => void; onAction?: (action: string) => void; busy?: boolean }) {
+interface ConsoleProps {
+  vm: VmRecord
+  reportError: (message: string) => void
+  onAction?: (action: string) => void
+  busy?: boolean
+}
+
+function areConsolePropsEqual(prev: ConsoleProps, next: ConsoleProps): boolean {
+  return prev.vm.vm_id === next.vm.vm_id
+    && prev.vm.name === next.vm.name
+    && prev.vm.persistent === next.vm.persistent
+    && prev.vm.status.state === next.vm.status.state
+    && prev.vm.status.instance_id === next.vm.status.instance_id
+    && prev.vm.status.boot_epoch === next.vm.status.boot_epoch
+    && prev.vm.status.display_epoch === next.vm.status.display_epoch
+    && prev.vm.status.display?.width === next.vm.status.display?.width
+    && prev.vm.status.display?.height === next.vm.status.display?.height
+    && prev.vm.status.last_error?.code === next.vm.status.last_error?.code
+    && prev.vm.status.last_error?.message === next.vm.status.last_error?.message
+    && prev.busy === next.busy
+    && prev.reportError === next.reportError
+    && Boolean(prev.onAction) === Boolean(next.onAction)
+}
+
+function ConsoleInner({ vm, reportError, onAction, busy = false }: ConsoleProps) {
   const mount = useRef<HTMLDivElement>(null)
   const panel = useRef<HTMLElement>(null)
   const surface = useRef<HTMLDivElement>(null)
-  const rfb = useRef<RFB | null>(null)
+  const rfb = useRef<DisplaySession | null>(null)
+  const canvasRect = useRef<DOMRect | null>(null)
+  const onActionRef = useRef(onAction)
+  onActionRef.current = onAction
   const lease = useRef<ControlLease | null>(null)
   const queue = useRef<InputQueue | null>(null)
   const wheel = useRef(new WheelAccumulator())
@@ -106,19 +134,28 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
   }, [vm.status.boot_epoch])
 
   useEffect(() => {
-    const syncFullscreen = (): void => setFullscreen(document.fullscreenElement === panel.current)
+    const invalidate = (): void => { canvasRect.current = null }
+    const syncFullscreen = (): void => { invalidate(); setFullscreen(document.fullscreenElement === panel.current) }
     const escapeFullscreen = (event: KeyboardEvent): void => {
       if (event.key === 'Escape' && document.fullscreenElement === panel.current && !scaleMenuOpen.current) {
         event.preventDefault(); event.stopPropagation()
         void toggleFullscreen()
       }
     }
+    const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(invalidate) : null
+    if (observer && surface.current) observer.observe(surface.current)
+    if (observer && mount.current) observer.observe(mount.current)
     syncFullscreen()
     document.addEventListener('fullscreenchange', syncFullscreen)
     document.addEventListener('keydown', escapeFullscreen, true)
+    window.addEventListener('resize', invalidate)
+    window.addEventListener('scroll', invalidate, true)
     return () => {
+      observer?.disconnect()
       document.removeEventListener('fullscreenchange', syncFullscreen)
       document.removeEventListener('keydown', escapeFullscreen, true)
+      window.removeEventListener('resize', invalidate)
+      window.removeEventListener('scroll', invalidate, true)
     }
   }, [])
 
@@ -134,7 +171,6 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
 
   useEffect(() => {
     let disposed = false
-    let observer: MutationObserver | undefined
     let syncingGeometry = false
     let geometryDirty = false
     setConnected(false); setDisplayError('')
@@ -155,13 +191,14 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
     void (async () => {
       try {
         if (!await sync() || disposed) return
-        const result = await window.palette.request('display.ticket', vm.vm_id, { instance_id: vm.status.instance_id }) as { url: string }
+        const result = await window.palette.request('display.ticket', vm.vm_id, { instance_id: vm.status.instance_id }) as RawDisplayTicket
         if (disposed || !mount.current) return
-        const client = new RFB(mount.current, result.url, { shared: true })
+        const client = createDisplaySession(mount.current, result, selectedScale.current === 'fit')
         rfb.current = client
-        client.viewOnly = true; client.scaleViewport = selectedScale.current === 'fit'; client.resizeSession = false; client.focusOnClick = false
-        client.addEventListener('connect', () => { if (!disposed) setConnected(true) })
+        canvasRect.current = null
+        client.addEventListener('connect', () => { canvasRect.current = null; if (!disposed) setConnected(true) })
         client.addEventListener('disconnect', () => {
+          canvasRect.current = null
           if (rfb.current === client) rfb.current = null
           if (disposed) return
           setConnected(false); setDisplayError('画面连接已断开'); void release()
@@ -188,14 +225,14 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
             if (geometryDirty && !disposed) void syncGeometry()
           }
         }
-        observer = new MutationObserver(() => {
-          const canvas = mount.current?.querySelector('canvas')
+        client.addEventListener('geometry', () => {
+          canvasRect.current = null
+          const canvas = rfb.current?.canvas ?? mount.current?.querySelector('canvas')
           if (canvas && (canvas.width !== geometry.current.width || canvas.height !== geometry.current.height)) {
             geometryDirty = true
             void syncGeometry()
           }
         })
-        observer.observe(mount.current, { childList: true, subtree: true, attributes: true, attributeFilter: ['width', 'height'] })
       } catch (error) { if (!disposed) setDisplayError(String(error)) }
     })()
     const lost = (): void => { if (lease.current) toast.info('已释放人工控制'); void release() }
@@ -212,7 +249,8 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
     document.addEventListener('visibilitychange', visibility)
     document.addEventListener('fullscreenchange', fullscreen)
     return () => {
-      disposed = true; observer?.disconnect(); void release()
+      disposed = true; void release()
+      canvasRect.current = null
       rfb.current?.disconnect(); rfb.current = null
       window.removeEventListener('blur', lost); window.removeEventListener('palette-control-lost', controlLost)
       document.removeEventListener('visibilitychange', visibility); document.removeEventListener('fullscreenchange', fullscreen)
@@ -261,9 +299,14 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
 
   function send(event: InputEvent): void { queue.current?.push(event) }
   function point(event: React.PointerEvent, captured = false): { x: number; y: number } | null {
-    const canvas = mount.current?.querySelector('canvas')
+    const canvas = rfb.current?.canvas ?? mount.current?.querySelector('canvas')
     if (!canvas) return null
-    return pointerPosition(canvas.getBoundingClientRect(), geometry.current.width, geometry.current.height, event.clientX, event.clientY, captured)
+    let rect = canvasRect.current
+    if (!rect || rect.width === 0 || rect.height === 0) {
+      rect = canvas.getBoundingClientRect()
+      if (rect.width > 0 && rect.height > 0) canvasRect.current = rect
+    }
+    return pointerPosition(rect, geometry.current.width, geometry.current.height, event.clientX, event.clientY, captured)
   }
   function key(event: React.KeyboardEvent, down: boolean): void {
     if (!lease.current || event.target !== surface.current) return
@@ -283,6 +326,7 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
     surface.current?.focus()
   }
   function changeScale(value: string): void {
+    canvasRect.current = null
     selectedScale.current = value
     setScale(value)
     if (rfb.current) rfb.current.scaleViewport = value === 'fit'
@@ -290,7 +334,7 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
 
   return <section ref={panel} className="console-panel" onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) void release() }}>
     <div className="console-toolbar">
-      <div className="flex items-center gap-2"><span className={`status-dot ${connected ? 'online' : ''}`} /><span>{connected ? controlling ? '人工控制' : '仅查看' : '未连接'}</span>{onAction && <ButtonGroup aria-label="虚拟机电源操作"><IconButton label="关机" title="强制停止虚拟机，需确认" disabled={busy || !activeVm(vm)} onClick={() => onAction('power')}><Power size={15} /></IconButton><IconButton label="重启" title="强制重启虚拟机" disabled={busy || !running || !vm.persistent} onClick={() => onAction('restart')}><RotateCw size={15} /></IconButton></ButtonGroup>}</div>
+      <div className="flex items-center gap-2"><span className={`status-dot ${connected ? 'online' : ''}`} /><span>{connected ? controlling ? '人工控制' : '仅查看' : '未连接'}</span>{onAction && <ButtonGroup aria-label="虚拟机电源操作"><IconButton label="关机" title="强制停止虚拟机，需确认" disabled={busy || !activeVm(vm)} onClick={() => onActionRef.current?.('power')}><Power size={15} /></IconButton><IconButton label="重启" title="强制重启虚拟机" disabled={busy || !running || !vm.persistent} onClick={() => onActionRef.current?.('restart')}><RotateCw size={15} /></IconButton></ButtonGroup>}</div>
       <div className="flex items-center gap-2">
         <label className="flex items-center gap-1 text-xs" title={guestStatus?.desktop.resize ? '接管时自动调整客户机分辨率' : '需要 virtio-gpu 和客户机会话工具'}><input type="checkbox" checked={autoResize} disabled={!guestStatus?.desktop.resize} onChange={event => { setAutoResize(event.target.checked); autoResizeRef.current = event.target.checked }} />自动分辨率</label>
         <Button variant={controlling ? 'default' : 'secondary'} disabled={!running || !connected || acquiring} onClick={() => controlling ? void release() : void acquire()}><PcMouseIcon className="size-4" />{acquiring ? '正在接管…' : controlling ? '结束控制' : '接管'}</Button>
@@ -304,23 +348,26 @@ export function Console({ vm, reportError, onAction, busy = false }: { vm: VmRec
         <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" className="console-overflow" aria-label="更多画面操作" />}><MoreHorizontal size={16} /></DropdownMenuTrigger><DropdownMenuContent align="end">
           <DropdownMenuItem onClick={() => changeScale('fit')}>适应窗口{scale === 'fit' ? '（当前）' : ''}</DropdownMenuItem>
           <DropdownMenuItem onClick={() => changeScale('native')}>原始尺寸{scale === 'native' ? '（当前）' : ''}</DropdownMenuItem>
-          {onAction && <><DropdownMenuSeparator /><DropdownMenuItem title="强制重启虚拟机" disabled={busy || !running || !vm.persistent} onClick={() => onAction('restart')}>重启虚拟机</DropdownMenuItem></>}
+          {onAction && <><DropdownMenuSeparator /><DropdownMenuItem title="强制重启虚拟机" disabled={busy || !running || !vm.persistent} onClick={() => onActionRef.current?.('restart')}>重启虚拟机</DropdownMenuItem></>}
         </DropdownMenuContent></DropdownMenu>
         <Button variant="ghost" size="icon" aria-label="重新连接画面" onClick={() => setRevision(value => value + 1)}><RefreshIcon className="size-4" /></Button>
         <Button variant="ghost" size="icon" aria-label={fullscreen ? '退出全屏' : '全屏'} title={fullscreen ? '退出全屏' : '全屏'} aria-pressed={fullscreen} disabled={fullscreenPending} onClick={() => void toggleFullscreen()}>{fullscreen ? <CollapseIcon className="size-4" /> : <ExpandIcon className="size-4" />}</Button>
       </div>
     </div>
     <div ref={surface} className={`console-surface ${controlling ? 'captured' : ''}`} role="region" tabIndex={0} aria-label={`${vm.name} 虚拟机画面，${controlling ? '人工控制中，按 Ctrl+Alt 释放' : '仅查看'}`} onKeyDown={event => key(event, true)} onKeyUp={event => key(event, false)}
+      onScroll={() => { canvasRect.current = null }}
       onContextMenu={event => event.preventDefault()}
-      onPointerDownCapture={event => { if (!lease.current) return; const position = point(event); if (!position) return; event.preventDefault(); surface.current?.focus(); event.currentTarget.setPointerCapture(event.pointerId); send({ type: 'move', ...position }); const button = ['left', 'middle', 'right'][event.button]; if (button) send({ type: 'button', button: button as 'left' | 'middle' | 'right', down: true }) }}
+      onPointerDownCapture={event => { if (!lease.current) return; canvasRect.current = null; const position = point(event); if (!position) return; event.preventDefault(); surface.current?.focus(); event.currentTarget.setPointerCapture(event.pointerId); send({ type: 'move', ...position }); const button = ['left', 'middle', 'right'][event.button]; if (button) send({ type: 'button', button: button as 'left' | 'middle' | 'right', down: true }) }}
       onPointerMoveCapture={event => { if (!lease.current) return; const position = point(event, event.currentTarget.hasPointerCapture(event.pointerId)); if (position) send({ type: 'move', ...position }) }}
       onPointerUpCapture={event => { if (!lease.current) return; const position = point(event, event.currentTarget.hasPointerCapture(event.pointerId)); if (position) send({ type: 'move', ...position }); const button = ['left', 'middle', 'right'][event.button]; if (button) send({ type: 'button', button: button as 'left' | 'middle' | 'right', down: false }); if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }}
       onPointerCancel={() => void release()}
       onWheelCapture={event => { if (!lease.current) return; for (const input of wheel.current.push(event.deltaX, event.deltaY, event.deltaMode, event.currentTarget.clientWidth, event.currentTarget.clientHeight)) send(input) }}>
       <div ref={mount} className="rfb-mount" />
       {controlling && <div className="human-control-label"><MousePointer2 size={14} />人工控制中<span>按 Ctrl+Alt 释放</span></div>}
-      {!connected && !shuttingDown && <EmptyState variant="plain" heading="h2" className="console-placeholder" icon={vm.status.state === 'FAILED' ? <AlertTriangle size={24} /> : <Monitor size={24} />} title={displayError || ({ STOPPED: '虚拟机已关机', STARTING: '正在启动虚拟机…', PAUSED: '虚拟机已暂停', FAILED: '虚拟机发生故障' }[vm.status.state] ?? '正在连接画面…')} description={vm.status.last_error && `${vm.status.last_error.code}: ${vm.status.last_error.message}`} action={<>{(displayError || vm.status.last_error) && <CopyDebugInfoButton source="application" error={[displayError, vm.status.last_error && `${vm.status.last_error.code}: ${vm.status.last_error.message}`].filter(Boolean).join("; ")} vmId={vm.vm_id} />}{onAction && ['STOPPED', 'FAILED'].includes(vm.status.state) && <Button size="sm" disabled={busy} onClick={() => onAction('start')}><Play size={16} />启动</Button>}{running && displayError && <Button variant="secondary" size="sm" onClick={() => setRevision(value => value + 1)}>重新连接</Button>}</>} />}
+      {!connected && !shuttingDown && <EmptyState variant="plain" heading="h2" className="console-placeholder" icon={vm.status.state === 'FAILED' ? <AlertTriangle size={24} /> : <Monitor size={24} />} title={displayError || ({ STOPPED: '虚拟机已关机', STARTING: '正在启动虚拟机…', PAUSED: '虚拟机已暂停', FAILED: '虚拟机发生故障' }[vm.status.state] ?? '正在连接画面…')} description={vm.status.last_error && `${vm.status.last_error.code}: ${vm.status.last_error.message}`} action={<>{(displayError || vm.status.last_error) && <CopyDebugInfoButton source="application" error={[displayError, vm.status.last_error && `${vm.status.last_error.code}: ${vm.status.last_error.message}`].filter(Boolean).join("; ")} vmId={vm.vm_id} />}{onAction && ['STOPPED', 'FAILED'].includes(vm.status.state) && <Button size="sm" disabled={busy} onClick={() => onActionRef.current?.('start')}><Play size={16} />启动</Button>}{running && displayError && <Button variant="secondary" size="sm" onClick={() => setRevision(value => value + 1)}>重新连接</Button>}</>} />}
     </div>
     <div className="console-footer"><span>{geometry.current.width ? `${geometry.current.width} × ${geometry.current.height}` : '—'}</span>{controlling ? <div className="flex items-center gap-2"><Button variant="ghost" size="sm" onClick={() => chord(['ctrl', 'alt', 'delete'])}>Ctrl + Alt + Del</Button><Button variant="ghost" size="sm" onClick={() => chord(['meta_l'])}>Super</Button></div> : <span>画面仅用于查看，接管后可操作</span>}</div>
   </section>
 }
+
+export const Console = memo(ConsoleInner, areConsolePropsEqual)

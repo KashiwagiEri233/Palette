@@ -8,8 +8,11 @@ export type InputEvent =
   | { type: 'key'; key: string; down: boolean }
   | { type: 'wheel'; direction: 'up' | 'down' | 'left' | 'right'; steps: number }
 
-export type DesktopMethod = 'guest.status' | 'control.display.resize' | 'profiles' | 'os_presets.list' | 'doctor' | 'image.info' | 'hardware.capabilities' | 'vms.settings.get' | 'vms.disk.resize' | 'vms.disk.delete' | 'vms.list' | 'vms.tools.mount' | 'vms.tools.eject' | 'vms.create' | 'vms.update' | 'vms.start' | 'vms.stop' | 'vms.restart' | 'vms.reboot' | 'vms.reset' | 'vms.delete' | 'display.ticket' | 'display.sync' | 'control.acquire' | 'control.input' | 'control.metrics' | 'control.heartbeat' | 'control.release'
-export interface OwnerInfo { owner_kind: 'embedded' | 'daemon'; config_root: string; runtime_root: string; version: string; features: string[] }
+export type DesktopMethod = 'guest.status' | 'control.display.resize' | 'profiles' | 'os_presets.list' | 'doctor' | 'image.info' | 'hardware.capabilities' | 'vms.settings.get' | 'vms.disk.resize' | 'vms.disk.delete' | 'vms.list' | 'vms.tools.mount' | 'vms.tools.eject' | 'vms.create' | 'vms.update' | 'vms.start' | 'vms.stop' | 'vms.restart' | 'vms.reboot' | 'vms.reset' | 'vms.delete' | 'display.ticket' | 'display.sync' | 'display.shadow' | 'display.settings.get' | 'display.settings.update' | 'control.acquire' | 'control.input' | 'control.metrics' | 'control.heartbeat' | 'control.release'
+export type DisplayMode = 'inherit' | 'low_latency' | 'compatibility'
+export interface DisplayInstanceSettings { vm_id: string; instance_id: string; provider: 'rfb' | 'raw' | null; refresh_mode: 'steady' | 'adaptive'; requested_mode: DisplayMode; restart_required: boolean; reason: string | null }
+export interface DisplaySettings { configured_mode: DisplayMode; reason?: string | null; instances: DisplayInstanceSettings[] }
+export interface OwnerInfo { owner_kind: 'embedded' | 'daemon' | 'benchmark'; config_root: string; runtime_root: string; version: string; features: string[] }
 export interface Profile { profile_id: string; qemu: { arch: string; accelerator: string }; resources: { vcpus: number; memory_mib: number }; images: { size_gib: number }; network: { mode: string; model?: string | null; mac?: string | null }; devices: { display_model: string; default_resolution: boolean }; display: { width: number; height: number }; audio: { enabled: boolean } }
 export interface PortForward { protocol: 'tcp' | 'udp'; host_port: number; guest_port: number }
 export type DriveInterface = 'virtio' | 'ide' | 'scsi' | 'nvme' | 'usb'

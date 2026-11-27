@@ -31,16 +31,26 @@ class FrameRegistry:
         #: megabyte of someone's desktop.
         self._thumbnails: OrderedDict[str, bytes] = OrderedDict()
         self._retired: OrderedDict[str, str] = OrderedDict()
+        self._sequences: dict[str, int] = {}
+        self._sequence = 0
         self._max_entries = max_entries
         self._max_retired = max_retired
 
-    def add(self, frame: Frame, thumbnail: bytes | None = None) -> Frame:
+    def add(
+        self, frame: Frame, thumbnail: bytes | None = None, *, sequence: int | None = None
+    ) -> Frame:
+        self._sequence = max(self._sequence + 1, sequence or 0)
+        self._sequences[frame.frame_id] = self._sequence if sequence is None else sequence
         self._frames[frame.frame_id] = frame
+        self._frames = OrderedDict(
+            sorted(self._frames.items(), key=lambda item: self._sequences[item[0]])
+        )
         if thumbnail is not None:
             self._thumbnails[frame.frame_id] = thumbnail
         while len(self._frames) > self._max_entries:
             evicted, _ = self._frames.popitem(last=False)
             self._thumbnails.pop(evicted, None)
+            self._sequences.pop(evicted, None)
         return frame
 
     def thumbnail(self, frame_id: str) -> bytes | None:
@@ -73,6 +83,7 @@ class FrameRegistry:
             self._retired[frame_id] = reason
         self._frames.clear()
         self._thumbnails.clear()
+        self._sequences.clear()
         while len(self._retired) > self._max_retired:
             self._retired.popitem(last=False)
 

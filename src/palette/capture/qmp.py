@@ -25,13 +25,14 @@ from ..config import CaptureConfig
 from ..errors import ErrorCode, PaletteError, QmpCommandError
 from ..models import Size
 from ..qmp.client import QmpClient
-from .base import CapturedImage
-from .work import image_work
+from .base import AcquiredImage, CapturedImage
+from .work import capture_io, image_work
 
 logger = logging.getLogger("palette.capture")
 
 #: Guard against a decompression bomb from an unexpected display surface.
 MAX_FRAMEBUFFER_PIXELS = 8192 * 4320
+MAX_CAPTURE_BYTES = MAX_FRAMEBUFFER_PIXELS * 4 + 1024 * 1024
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _PPM_MAGIC = (b"P6", b"P3", b"P5", b"P2")
 
@@ -45,14 +46,21 @@ class QmpCaptureBackend:
         #: ``None`` until proven otherwise; set to False after a format rejection so the
         #: expensive failing call is only paid once per VM instance.
         self._png_supported: bool | None = None
+        self._created_dirs: set[Path] = set()
 
     @property
     def png_supported(self) -> bool | None:
         return self._png_supported
 
     async def capture(self, *, display_id: str, head: int, sink: Path) -> CapturedImage:
+        acquired = await self.acquire(display_id=display_id, head=head, sink=sink)
+        return await image_work(lambda: self.encode(acquired))
+
+    async def acquire(self, *, display_id: str, head: int, sink: Path) -> AcquiredImage:
         started = time.perf_counter()
-        sink.parent.mkdir(parents=True, exist_ok=True)
+        if sink.parent not in self._created_dirs:
+            sink.parent.mkdir(parents=True, exist_ok=True)
+            self._created_dirs.add(sink.parent)
         sink.unlink(missing_ok=True)
 
         format_used = "ppm"
@@ -83,13 +91,57 @@ class QmpCaptureBackend:
             except QmpCommandError as exc:
                 raise _capture_error(exc) from exc
 
-        return await image_work(
-            lambda: self._encode(
-                self._read_and_cleanup(sink),
-                format_used=format_used,
-                sink=sink,
+        def read() -> AcquiredImage:
+            raw = self._read_and_cleanup(sink)
+            detected = _detect_format(raw)
+            if detected == "unknown":
+                raise PaletteError(ErrorCode.CAPTURE_FAILED, "the capture is neither PNG nor PPM")
+            try:
+                with Image.open(io.BytesIO(raw)) as image:
+                    native = Size(width=image.width, height=image.height)
+                    if native.width * native.height > MAX_FRAMEBUFFER_PIXELS:
+                        raise PaletteError(
+                            ErrorCode.CAPTURE_TOO_LARGE,
+                            "the framebuffer is larger than this service will decode",
+                        )
+            except PaletteError:
+                raise
+            except Exception as exc:
+                raise PaletteError(
+                    ErrorCode.CAPTURE_FAILED, "the capture header could not be decoded"
+                ) from exc
+            return AcquiredImage(
+                data=raw,
+                native_size=native,
+                format_used=detected,
                 started=started,
+                source_path=sink if self._config.keep_frames else None,
             )
+
+        return await capture_io(read)
+
+    def encode(self, acquired: AcquiredImage) -> CapturedImage:
+        """Decode and re-encode an already-validated acquisition to a bounded PNG."""
+        try:
+            with Image.open(io.BytesIO(acquired.data)) as image:
+                image.load()
+                png_bytes, image_size, scaled = self._render(image)
+        except PaletteError:
+            raise
+        except Exception as exc:
+            raise PaletteError(
+                ErrorCode.CAPTURE_FAILED, f"the capture could not be decoded: {type(exc).__name__}"
+            ) from exc
+
+        duration_ms = int((time.perf_counter() - acquired.started) * 1000)
+        return CapturedImage(
+            png_bytes=png_bytes,
+            native_size=acquired.native_size,
+            image_size=image_size,
+            format_used=acquired.format_used,
+            scaled=scaled,
+            duration_ms=duration_ms,
+            source_path=acquired.source_path,
         )
 
     # -- internals -------------------------------------------------------------------
@@ -112,57 +164,21 @@ class QmpCaptureBackend:
                 "screendump reported success but produced no file",
             )
         try:
-            data = sink.read_bytes()
+            with sink.open("rb") as handle:
+                data = handle.read(MAX_CAPTURE_BYTES + 1)
+            if len(data) > MAX_CAPTURE_BYTES:
+                raise PaletteError(ErrorCode.CAPTURE_TOO_LARGE, "the capture file is too large")
         except OSError as exc:
             raise PaletteError(
                 ErrorCode.CAPTURE_FAILED, "the capture file could not be read"
             ) from exc
-        if not self._config.keep_frames:
-            try:
-                sink.unlink(missing_ok=True)
-            except OSError:  # pragma: no cover - Windows file lock races
-                logger.debug("could not remove the transient capture file")
+        finally:
+            if not self._config.keep_frames:
+                try:
+                    sink.unlink(missing_ok=True)
+                except OSError:  # pragma: no cover - Windows file lock races
+                    logger.debug("could not remove the transient capture file")
         return data
-
-    def _encode(self, raw: bytes, *, format_used: str, sink: Path, started: float) -> CapturedImage:
-        if not raw:
-            raise PaletteError(ErrorCode.CAPTURE_FAILED, "the capture file was empty")
-        detected = _detect_format(raw)
-        if detected == "png":
-            format_used = "png"
-        elif detected == "ppm":
-            format_used = "ppm"
-        else:
-            raise PaletteError(ErrorCode.CAPTURE_FAILED, "the capture file is neither PNG nor PPM")
-
-        try:
-            with Image.open(io.BytesIO(raw)) as image:
-                image.load()
-                native = Size(width=image.width, height=image.height)
-                if native.width * native.height > MAX_FRAMEBUFFER_PIXELS:
-                    raise PaletteError(
-                        ErrorCode.CAPTURE_TOO_LARGE,
-                        "the framebuffer is larger than this service will decode",
-                        details={"width": native.width, "height": native.height},
-                    )
-                png_bytes, image_size, scaled = self._render(image)
-        except PaletteError:
-            raise
-        except Exception as exc:
-            raise PaletteError(
-                ErrorCode.CAPTURE_FAILED, f"the capture could not be decoded: {type(exc).__name__}"
-            ) from exc
-
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        return CapturedImage(
-            png_bytes=png_bytes,
-            native_size=native,
-            image_size=image_size,
-            format_used=format_used,
-            scaled=scaled,
-            duration_ms=duration_ms,
-            source_path=sink if self._config.keep_frames else None,
-        )
 
     def _render(self, image: Image.Image) -> tuple[bytes, Size, bool]:
         """Re-encode to PNG, shrinking only as far as the configured limits require."""
@@ -173,6 +189,8 @@ class QmpCaptureBackend:
             working, scaled = _downscale(working, max_edge)
 
         payload = _to_png_bytes(working)
+        if len(payload) > self._config.max_bytes:
+            payload = _to_png_bytes(working, optimize=True)
         # A long edge limit usually keeps us under the byte limit too; if not, shrink
         # further and keep the advertised size in step with what was actually produced.
         attempts = 0
@@ -182,7 +200,7 @@ class QmpCaptureBackend:
                 break
             working, _ = _downscale(working, next_edge)
             scaled = True
-            payload = _to_png_bytes(working)
+            payload = _to_png_bytes(working, optimize=True)
             attempts += 1
 
         if len(payload) > self._config.max_bytes:
@@ -194,9 +212,9 @@ class QmpCaptureBackend:
         return payload, Size(width=working.width, height=working.height), scaled
 
 
-def _to_png_bytes(image: Image.Image) -> bytes:
+def _to_png_bytes(image: Image.Image, *, optimize: bool = False) -> bytes:
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
+    image.save(buffer, format="PNG", compress_level=9 if optimize else 1, optimize=optimize)
     return buffer.getvalue()
 
 

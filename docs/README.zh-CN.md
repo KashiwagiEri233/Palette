@@ -25,6 +25,8 @@
 | [安全威胁模型 (threat-model.zh-CN.md)](threat-model.zh-CN.md) · [English](threat-model.md) | 信任边界划分、调用方材料开关（`allow_agent_*`）的安全后果、服务端强制保证与明确不在防护范围内的事项 |
 | [端到端验收测试 (acceptance-test.zh-CN.md)](acceptance-test.zh-CN.md) · [English](acceptance-test.md) | 从共享 `daemon` 启动、GUI 创建 VM、MCP 观察与点击、人工接管冲突到硬件设置变更的完整实机验收流程与实测记录 |
 | [性能基准测试 (benchmarks.zh-CN.md)](benchmarks.zh-CN.md) · [English](benchmarks.md) | 截图延迟、单击闭环耗时与冷启动阶段拆分目标、开销分解及物理正确性指标 |
+| [Desktop 实验显示方案](display-experiment.zh-CN.md) · [English](display-experiment.md) | 默认关闭的 CPU 帧源原型、原生 helper 构建、真实 QEMU 证据与可复现的性能判据 |
+| [人工接管低延迟显示](operator-latency.zh-CN.md) · [English](operator-latency.md) | 稳定 VNC 刷新、本机降级开关、并行观察及关联拖动/滚动验收 |
 | [已知限制 (known-limitations.zh-CN.md)](known-limitations.zh-CN.md) · [English](known-limitations.md) | 当前版本在输入法、剪贴板、网络白名单、进程内去重、多显示器等方面的真实边界清单 |
 | [客户机内增强服务契约 (../guest/agent/README.zh-CN.md)](../guest/agent/README.zh-CN.md) · [English](../guest/agent/README.md) | 客户机内 `virtio-serial` 增强服务的长度分帧协议、能力握手与安全约束 |
 | [镜像目录说明 (../images/README.zh-CN.md)](../images/README.zh-CN.md) · [English](../images/README.md) | 只读基础镜像存放规范与 `palette doctor` 校验机制 |

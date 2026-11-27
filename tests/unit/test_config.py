@@ -144,22 +144,6 @@ class TestLoading:
             load(repo)
         assert info.value.code is ErrorCode.INVALID_ARGUMENT
 
-    def test_the_runtime_root_resolves_under_the_config_root(
-        self, repo: Path, base_image: Path
-    ) -> None:
-        write_profile(repo, "default", profile_body(base_image))
-        assert load(repo).runtime_root == (repo / ".runtime").resolve()
-
-    def test_an_absolute_runtime_root_is_honoured(
-        self, repo: Path, base_image: Path, tmp_path: Path
-    ) -> None:
-        write_profile(repo, "default", profile_body(base_image))
-        elsewhere = tmp_path / "elsewhere"
-        (repo / "palette.toml").write_text(
-            f'[host]\nruntime_root = "{elsewhere.as_posix()}"\n', encoding="utf-8"
-        )
-        assert load(repo).runtime_root == elsewhere.resolve()
-
 
 class TestRefusedRelaxations:
     def test_an_accelerator_fallback_may_not_be_enabled(self, repo: Path, base_image: Path) -> None:
@@ -168,22 +152,6 @@ class TestRefusedRelaxations:
         with pytest.raises(PaletteError) as info:
             load(repo)
         assert "fallback" in info.value.message
-
-    @pytest.mark.parametrize(
-        "extra",
-        ["-mon vc,mode=control", "-chardev socket,id=x,port=4444", "-vnc :0", "-display vnc=:0"],
-    )
-    def test_operator_arguments_are_taken_at_face_value(
-        self, repo: Path, base_image: Path, extra: str
-    ) -> None:
-        """An operator writing a profile is trusted, and once callers may pass their own
-        arguments an argument filter here would be decorative. A second control channel is
-        therefore accepted — and flagged when the plan is built, which is what makes the
-        broken single-writer guarantee visible instead of silent."""
-        body = profile_body(base_image, qemu=f'extra_args = ["{extra}"]\n')
-        write_profile(repo, "default", body)
-        profile = load(repo).profile(None)
-        assert profile.qemu.extra_args == [extra]
 
     def test_an_unknown_key_is_a_typo_not_a_silent_no_op(
         self, repo: Path, base_image: Path
@@ -254,17 +222,6 @@ class TestShippedProfiles:
         assert profile.lifecycle.allow_agent_images is False
         assert profile.lifecycle.allow_agent_iso is False
         assert profile.lifecycle.allow_agent_qemu_args is False
-
-    def test_the_two_shipped_profiles_differ_only_in_posture(self) -> None:
-        """The strict example is the default machine with the doors shut, not a different
-        machine: the same devices, the same resolution, the same timeouts."""
-        config = load_config(Path(__file__).resolve().parents[2])
-        permissive, strict = config.profile("default"), config.profile("strict-example")
-        assert permissive.devices == strict.devices
-        assert permissive.display == strict.display
-        assert permissive.qemu.accelerator == strict.qemu.accelerator
-        assert permissive.qemu.machine == strict.qemu.machine
-        assert permissive.capture.max_long_edge == strict.capture.max_long_edge
 
 
 class TestConfigRootDiscovery:

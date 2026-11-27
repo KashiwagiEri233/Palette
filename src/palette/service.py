@@ -98,6 +98,7 @@ class PaletteService:
                         self.driver.close,
                         self.control.close,
                         self.manager.shutdown,
+                        lambda: asyncio.to_thread(self.audit.close),
                     )
                 ),
                 name="service-shutdown",

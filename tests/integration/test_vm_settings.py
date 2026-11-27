@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -168,7 +169,11 @@ async def test_resize_preserves_chain_bytes_vars_and_reset_capacity(
     ).virtual_size == 32 * 1024**3
 
 
-async def test_resize_before_first_boot(service: PaletteService) -> None:
+async def test_resize_before_first_boot(service: PaletteService, monkeypatch) -> None:
+    # The fake disk stores capacity as metadata and does not allocate 40 GiB.
+    monkeypatch.setattr(
+        "palette.vm.manager.shutil.disk_usage", lambda _: SimpleNamespace(free=64 * 1024**3)
+    )
     desktop, vm_id = await machine(service)
     await desktop.resize_disk(vm_id, {"revision": 0, "disk_gib": 40})
     assert desktop.get(vm_id).storage_owner is None

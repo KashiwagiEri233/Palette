@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import secrets
 import time
 from collections import OrderedDict
@@ -55,6 +54,9 @@ class Wheel(EventModel):
 EVENTS = TypeAdapter(list[Annotated[Pointer | Button | Key | Wheel, Field(discriminator="type")]])
 
 
+_ReceiptKey = tuple[int, int, int, tuple[Pointer | Button | Key | Wheel, ...]]
+
+
 @dataclass
 class Lease:
     vm_id: str
@@ -66,7 +68,9 @@ class Lease:
     state: Literal["held", "releasing", "faulted"] = "held"
     acquiring: bool = False
     seq: int = 0
-    receipts: OrderedDict[int, tuple[str, dict[str, Any]]] = field(default_factory=OrderedDict)
+    receipts: OrderedDict[int, tuple[_ReceiptKey, dict[str, Any]]] = field(
+        default_factory=OrderedDict
+    )
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -238,7 +242,7 @@ class ControlManager:
         if not 1 <= len(events) <= 64 or not 1 <= seq <= 2**53 - 1:
             raise PaletteError(ErrorCode.INVALID_ARGUMENT, "invalid input batch")
         parsed = EVENTS.validate_python(events)
-        fingerprint = json.dumps([display_epoch, width, height, events], sort_keys=True)
+        fingerprint: _ReceiptKey = (display_epoch, width, height, tuple(parsed))
         lease = self.validate(vm_id, token)
         async with lease.lock:
             self.validate(vm_id, token)
@@ -320,6 +324,7 @@ class ControlManager:
                 raise
             result = {"seq": seq, "action_seq": action_seq, "effect_state": "submitted"}
             lease.seq = seq
+            lease.expires = time.monotonic() + 3
             lease.receipts[seq] = (fingerprint, result)
             while len(lease.receipts) > 128:
                 lease.receipts.popitem(last=False)

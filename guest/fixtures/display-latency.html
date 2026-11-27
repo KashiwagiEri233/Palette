@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Palette display latency target</title>
+<style>
+  html, body { margin: 0; background: #20242c; color: white; font: 18px system-ui; overflow: hidden; touch-action: none; user-select: none; }
+  canvas { position: fixed; top: 0; left: 0; image-rendering: pixelated; pointer-events: none; }
+  #scene { top: 32px; }
+  main { margin: 60px 32px; position: relative; }
+  button { padding: 10px 20px; font: inherit; }
+</style>
+<canvas id="markers" width="640" height="8"></canvas><canvas id="scene"></canvas>
+<main><h1>Palette display latency target</h1>
+<p>Open this file inside the guest. Enter fullscreen, then focus this page.</p>
+<p>Space advances the numbered marker. Drag and wheel update coordinate / cumulative markers.</p>
+<button id="fullscreen">Fullscreen / 全屏</button>
+<p>Counter / 计数：<output id="counter">0</output></p>
+<p>This fixture measures client canvas feedback, not physical monitor presentation.</p></main>
+<script>
+  const context = document.querySelector('#markers').getContext('2d');
+  const scene = document.querySelector('#scene'), sceneContext = scene.getContext('2d');
+  let sequence = 0, motion = 0, dragging = false, pointerX = 0, pointerY = 0, scroll = 0;
+  function marker(slot, number) {
+    const n = number & 65535;
+    const value = (0xa5 | (n << 8) | (((~n) & 255) << 24)) >>> 0;
+    for (let bit = 0; bit < 32; bit++) {
+      context.fillStyle = value & (1 << bit) ? '#fff' : '#000';
+      context.fillRect(slot * 128 + bit * 4, 0, 4, 8);
+    }
+  }
+  function drawMotion() {
+    marker(1, motion);
+    // Four-pixel buckets tolerate absolute-pointer scaling by one native pixel.
+    marker(2, Math.floor(pointerX / 4)); marker(3, Math.floor(pointerY / 4));
+    marker(4, scroll);
+    if (scene.width !== innerWidth || scene.height !== innerHeight - 32) {
+      scene.width = innerWidth; scene.height = Math.max(1, innerHeight - 32);
+    }
+    const offset = scroll + pointerY;
+    for (let row = -1; row < innerHeight / 40 + 1; row++) {
+      const logicalRow = row - Math.floor(offset / 40);
+      sceneContext.fillStyle = logicalRow % 2 ? '#243447' : '#183022';
+      sceneContext.fillRect(0, row * 40 + offset % 40, innerWidth, 40);
+      sceneContext.fillStyle = '#5487aa';
+      const range = Math.max(1, innerWidth - 100);
+      const blockX = ((pointerX + logicalRow * 37) % range + range) % range;
+      sceneContext.fillRect(blockX, row * 40 + offset % 40, 100, 16);
+    }
+  }
+  document.querySelector('#fullscreen').onclick = () => document.documentElement.requestFullscreen();
+  addEventListener('keydown', event => {
+    if (event.code === 'Space') {
+      event.preventDefault();
+      if (!event.repeat) {
+        sequence = (sequence + 1) & 65535; marker(0, sequence);
+        document.querySelector('#counter').value = String(sequence);
+      }
+    }
+  });
+  addEventListener('pointerdown', event => { event.preventDefault(); dragging = true; });
+  addEventListener('pointerup', () => { dragging = false; });
+  addEventListener('pointercancel', () => { dragging = false; });
+  addEventListener('pointermove', event => {
+    if (dragging) {
+      pointerX = Math.floor(event.clientX); pointerY = Math.floor(event.clientY);
+      motion = (motion + 1) & 65535; drawMotion();
+    }
+  });
+  addEventListener('wheel', event => {
+    event.preventDefault();
+    const pixels = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? innerHeight : 1);
+    scroll += Math.round(pixels);
+    motion = (motion + 1) & 65535; drawMotion();
+  }, { passive: false });
+  addEventListener('resize', drawMotion);
+  marker(0, sequence); drawMotion();
+</script>

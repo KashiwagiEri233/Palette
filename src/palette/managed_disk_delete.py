@@ -58,7 +58,12 @@ def _snapshot(desktop: DesktopManager) -> tuple[Any, ...]:
 
 
 async def _require_unreferenced(
-    desktop: DesktopManager, definition: VmDefinition, drive_id: str, root: Path
+    desktop: DesktopManager,
+    definition: VmDefinition,
+    drive_id: str,
+    root: Path,
+    *,
+    exclude_vm: bool = False,
 ) -> None:
     """Inspect persisted and live references, then commit without another await.
 
@@ -76,6 +81,11 @@ async def _require_unreferenced(
     for profile in desktop.service.config.profiles.values():
         add(profile.images.base, profile)
     for original in desktop.definitions.values():
+        if exclude_vm and original.vm_id == definition.vm_id:
+            add(original.draft.path, original.profile)
+            for drive in desktop.settings(original).drives:
+                add(drive.path, original.profile)
+            continue
         item = definition if original.vm_id == definition.vm_id else original
         add(item.profile.images.base, item.profile)
         if (

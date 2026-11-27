@@ -121,3 +121,37 @@ it.each(['disconnect', 'generation'] as const)('never retries an input after %s'
     } finally { stream.close() }
   }, mode)
 })
+
+it('rejects oversized control.input payloads in the stream transport without sending', async () => {
+  await fixture(async ({ root, received }) => {
+    const stream = await InputStream.open(root, 'desktop', 'lease', 'a'.repeat(32))
+    try {
+      await expect(stream.input({ lease_id: 'lease', seq: 1, pad: 'x'.repeat(70 * 1024) })).rejects.toThrow('请求无效')
+      expect(received.filter(request => request.command.method === 'control.input')).toHaveLength(0)
+    } finally { stream.close() }
+  })
+})
+
+it('pipelines up to four concurrent control.input frames and bounds overflow', async () => {
+  await fixture(async ({ root, received }) => {
+    const stream = await InputStream.open(root, 'desktop', 'lease', 'a'.repeat(32))
+    try {
+      const firstBatch = await Promise.all([
+        stream.input({ lease_id: 'lease', seq: 1 }),
+        stream.input({ lease_id: 'lease', seq: 2 }),
+        stream.input({ lease_id: 'lease', seq: 3 }),
+        stream.input({ lease_id: 'lease', seq: 4 }),
+      ])
+      expect(firstBatch).toEqual([{ seq: 1 }, { seq: 2 }, { seq: 3 }, { seq: 4 }])
+      const nextBatch = [
+        stream.input({ lease_id: 'lease', seq: 5 }),
+        stream.input({ lease_id: 'lease', seq: 6 }),
+        stream.input({ lease_id: 'lease', seq: 7 }),
+        stream.input({ lease_id: 'lease', seq: 8 }),
+      ]
+      await expect(stream.input({ lease_id: 'lease', seq: 9 })).rejects.toThrow('输入队列已满')
+      expect(await Promise.all(nextBatch)).toEqual([{ seq: 5 }, { seq: 6 }, { seq: 7 }, { seq: 8 }])
+      expect(received.filter(request => request.command.method === 'control.input')).toHaveLength(8)
+    } finally { stream.close() }
+  })
+})

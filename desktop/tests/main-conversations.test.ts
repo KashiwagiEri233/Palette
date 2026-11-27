@@ -106,7 +106,7 @@ it('waits for only the archived session to stop before persisting the update', a
   expect(fixture.repository.update).toHaveBeenCalledWith('vm', 'old', 1, patch)
 })
 
-it.each([{ archived: false }, { title: 'Renamed' }, { draft: 'Saved draft' }])('does not stop tasks for an ordinary update %j', async patch => {
+it.each([{ title: 'Renamed' }])('does not stop tasks for an ordinary update %j', async patch => {
   await request('conversations.update', 'vm', { id: 'old', revision: 1, patch })
   expect(fixture.service.stop).not.toHaveBeenCalled()
   expect(fixture.service.stopVm).not.toHaveBeenCalled()

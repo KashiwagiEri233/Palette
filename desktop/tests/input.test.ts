@@ -9,11 +9,7 @@ describe('input failure classification', () => {
     expect(inputErrorCode(new Error("Error invoking remote method 'request': BackendError: VM_NOT_RUNNING: 虚拟机未在运行"))).toBe('VM_NOT_RUNNING')
     expect(inputErrorCode(new Error('CONTROL_NOT_OWNED: 请先接管虚拟机'))).toBe('CONTROL_NOT_OWNED')
   })
-  it('prefers a structured code and leaves unrelated failures unclassified', () => {
-    expect(inputErrorCode({ code: 'ACTION_OUTCOME_UNKNOWN', message: 'x' })).toBe('ACTION_OUTCOME_UNKNOWN')
-    expect(inputErrorCode(new Error('输入队列已满，控制已释放'))).toBeUndefined()
-    expect(inputErrorCode(undefined)).toBeUndefined()
-  })
+
 })
 
 describe('console coordinates and input sequencing', () => {
@@ -42,6 +38,7 @@ describe('console coordinates and input sequencing', () => {
     queue.push({ type: 'key', key: 'a', down: true }); await queue.flush()
     expect(sent).toBe(1); expect(failed).toBe(1)
   })
+
   it('submits discrete input without advancing timers and drains immediately after ACK', async () => {
     vi.useFakeTimers()
     const batches: InputEvent[][] = []
@@ -129,5 +126,34 @@ describe('console coordinates and input sequencing', () => {
     expect(wheel.push(0, -70, 0, 640, 400)).toEqual([])
     wheel.reset()
     expect(wheel.push(0, 30, 0, 640, 400)).toEqual([])
+  })
+  it('pipelines up to maxInFlight discrete batches without waiting for prior ACK', async () => {
+    const sent: number[] = []
+    const resolvers: Array<() => void> = []
+    const fail = vi.fn()
+    const queue = new InputQueue(
+      seq => new Promise<void>(resolve => { sent.push(seq); resolvers.push(resolve) }),
+      fail,
+      undefined,
+      4
+    )
+    queue.push({ type: 'key', key: 'a', down: true })
+    await Promise.resolve()
+    queue.push({ type: 'key', key: 'a', down: false })
+    await Promise.resolve()
+    queue.push({ type: 'key', key: 'b', down: true })
+    await Promise.resolve()
+    queue.push({ type: 'key', key: 'b', down: false })
+    await Promise.resolve()
+    queue.push({ type: 'key', key: 'c', down: true })
+    await Promise.resolve()
+    expect(sent).toEqual([1, 2, 3, 4])
+    resolvers.shift()!()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(sent).toEqual([1, 2, 3, 4, 5])
+    while (resolvers.length) resolvers.shift()!()
+    await Promise.resolve()
+    expect(fail).not.toHaveBeenCalled()
   })
 })

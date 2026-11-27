@@ -3,11 +3,55 @@
 from pathlib import Path
 
 import pytest
-from test_utm_drives import blank, save, setup_vm
 
 from palette.desktop import DesktopManager
 from palette.errors import PaletteError
 from palette.primary_drive import PRIMARY_DRIVE_ID
+
+
+async def setup_vm(service):
+    desktop = DesktopManager(service)
+    vm = await desktop.create(
+        {
+            "name": "UTM drives",
+            "profile_id": "default",
+            "source": "image",
+            "path": service.config.profile("default").images.base,
+            "vcpus": 1,
+            "memory_mib": 512,
+            "disk_gib": 24,
+            "network": "offline",
+        }
+    )
+    return desktop, vm["vm_id"]
+
+
+async def save(desktop, vm_id, drives, **overrides):
+    data = await desktop.get_settings(vm_id)
+    return await desktop.update(
+        vm_id,
+        {
+            "revision": data["revision"],
+            "name": data["draft"]["name"],
+            "vcpus": 1,
+            "memory_mib": 512,
+            "network": "offline",
+            "iso_attached": False,
+            "settings": {**data["settings"], "drives": drives},
+            **overrides,
+        },
+    )
+
+
+def blank(drive_id="drive-data", interface="virtio", image_format="qcow2"):
+    return {
+        "id": drive_id,
+        "media": "disk",
+        "size_gib": 1,
+        "format": image_format,
+        "interface": interface,
+        "read_only": False,
+    }
 
 
 async def test_original_disk_edits_use_the_common_drive_launch_path(service):

@@ -63,15 +63,20 @@ export function physicalKey(code: string): string | undefined {
 
 export class InputQueue {
   private pending: InputEvent[] = []
-  private busy = false
+  private inFlight = 0
   private stopped = false
   private seq = 0
   private timer: ReturnType<typeof setTimeout> | undefined
   private lastSent = -Infinity
   private queuedAt = 0
   private scheduled = false
-  private samples: { queue_ms: number; roundtrip_ms: number }[] = []
-  constructor(private send: (seq: number, events: InputEvent[]) => Promise<unknown>, private fail: (error: unknown) => void, private sample?: (timing: { queue_ms: number; roundtrip_ms: number }) => void) {}
+  private samples: InputTiming[] = []
+  constructor(
+    private send: (seq: number, events: InputEvent[]) => Promise<unknown>,
+    private fail: (error: unknown) => void,
+    private sample?: (timing: InputTiming) => void,
+    private maxInFlight = 4
+  ) {}
   push(event: InputEvent): void {
     if (this.stopped) return
     if (!this.pending.length) this.queuedAt = performance.now()
@@ -81,10 +86,11 @@ export class InputQueue {
     this.schedule()
   }
   stop(): void { this.stopped = true; this.pending = []; clearTimeout(this.timer); this.timer = undefined }
-  metrics(): ReadonlyArray<{ queue_ms: number; roundtrip_ms: number }> { return this.samples.slice() }
+  metrics(): ReadonlyArray<InputTiming> { return this.samples.slice() }
   private schedule(): void {
-    if (this.stopped || this.busy || this.scheduled || !this.pending.length) return
+    if (this.stopped || this.inFlight >= this.maxInFlight || this.scheduled || !this.pending.length) return
     clearTimeout(this.timer)
+    this.timer = undefined
     const urgent = this.pending.some(event => event.type !== 'move')
     const delay = urgent ? 0 : Math.max(0, 8 - (performance.now() - this.lastSent))
     // A microtask batches one DOM dispatch (position + button) without a timer wait.
@@ -95,22 +101,36 @@ export class InputQueue {
     else this.timer = setTimeout(() => { this.timer = undefined; void this.flush() }, delay)
   }
   async flush(): Promise<void> {
-    if (this.stopped || this.busy || !this.pending.length) return
+    if (this.stopped || this.inFlight >= this.maxInFlight || !this.pending.length) return
     clearTimeout(this.timer); this.timer = undefined
-    this.busy = true
+    this.inFlight += 1
     const events = this.pending.splice(0, 64)
     const started = performance.now()
-    const queueMs = started - this.queuedAt
+    const queuedAt = this.queuedAt
+    const seq = ++this.seq
+    const queueMs = started - queuedAt
     this.lastSent = started
-    try { await this.send(++this.seq, events) }
+    try { await this.send(seq, events) }
     catch (error) { if (!this.stopped) { this.stop(); this.fail(error) } }
     finally {
-      const timing = { queue_ms: queueMs, roundtrip_ms: performance.now() - started }
+      this.inFlight -= 1
+      const completedAt = performance.now()
+      const timing = { seq, event_count: events.length, queued_at: queuedAt, started_at: started, completed_at: completedAt, queue_ms: queueMs, roundtrip_ms: completedAt - started }
       this.samples.push(timing)
       if (this.samples.length > 256) this.samples.shift()
-      this.busy = false
       this.schedule()
       this.sample?.(timing)
     }
   }
+}
+
+/** Renderer clock values identify the batch; queued_at starts the queue window. */
+export interface InputTiming {
+  seq: number
+  event_count: number
+  queued_at: number
+  started_at: number
+  completed_at: number
+  queue_ms: number
+  roundtrip_ms: number
 }

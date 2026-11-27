@@ -144,7 +144,7 @@ class DisplayConfig(_Strict):
 
 
 class CaptureConfig(_Strict):
-    prefer_format: Literal["png", "ppm"] = "png"
+    prefer_format: Literal["png", "ppm"] = "ppm"
     allow_ppm_fallback: bool = True
     max_long_edge: int = Field(default=1280, ge=2)
     max_bytes: int = Field(default=4 * 1024 * 1024, ge=1024)
@@ -411,6 +411,9 @@ class HostConfig(_Strict):
     )
     audit_enabled: bool = True
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    # Trusted host opt-in only. Agent requests cannot select a display transport.
+    experimental_display: Literal["off", "dbus"] = "off"
+    experimental_display_helper: str | None = None
     #: Reserved for the operator identity that authorises destructive lifecycle actions
     #: when no interactive confirmation channel exists.
     operator_authorized: bool = True

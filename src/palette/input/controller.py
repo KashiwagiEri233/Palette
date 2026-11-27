@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from ..audit import AuditLog
-from ..capture.base import CaptureBackend, CapturedImage
+from ..capture.base import AcquiredImage, CaptureBackend, CapturedImage, SplitCaptureBackend
 from ..capture.work import image_work
 from ..cleanup import join_cleanup
 from ..config import Profile
@@ -49,6 +49,7 @@ from ..models import (
     ObservationState,
     Receipt,
     ReleaseResult,
+    Size,
     TypeTextAction,
     Viewport,
     WaitReason,
@@ -120,6 +121,13 @@ class _InputProgress:
         return EffectState.PARTIAL if self.accepted else EffectState.NOT_SENT
 
 
+@dataclass(frozen=True, slots=True)
+class _CaptureStamp:
+    frame: Frame
+    identity: tuple[str, int, int, int]
+    sequence: int
+
+
 # --------------------------------------------------------------------------------------
 # the controller
 # --------------------------------------------------------------------------------------
@@ -145,10 +153,14 @@ class ActionController:
         self._frames_dir = frames_dir
         self._audit = audit
         self.operator_timings = TimingWindow()
+        self.observation_timings = TimingWindow()
         self._ledger = InputLedger()
         self._frames = FrameRegistry()
         self._dedupe = RequestDeduplicator()
         self._generation = 0
+        self._capture_sequence = 0
+        self._observation_slots = asyncio.Semaphore(2)
+        self._observations: set[asyncio.Task[tuple[Frame, CapturedImage]]] = set()
         self._guest_snapshots: dict[str, tuple[str, dict[str, int]]] = {}
         self._last_capture_at: float = 0.0
         self.mutation_guard: Callable[[], None] | None = None
@@ -189,6 +201,10 @@ class ActionController:
                 await asyncio.shield(current.future)
         result = await self._bounded_release() if release else None
         await self.scheduler.close()
+        observations = tuple(self._observations)
+        for observation in observations:
+            observation.cancel()
+        await asyncio.gather(*observations, return_exceptions=True)
         self._frames.clear(reason="the VM is shutting down")
         return result
 
@@ -207,13 +223,107 @@ class ActionController:
         request_id: str | None = None,
         max_long_edge: int | None = None,
     ) -> tuple[Frame, CapturedImage]:
-        """Take a fresh capture, queued so it cannot observe a half-finished action."""
-        job = self.scheduler.make_job(
-            JobKind.OBSERVE,
-            "observe",
-            lambda: self._capture_frame(max_long_edge=max_long_edge),
+        """Acquire in transaction order; encode outside the input queue with bounded memory."""
+        requested = time.perf_counter()
+        if self.scheduler.closing:
+            raise PaletteError(ErrorCode.VM_NOT_RUNNING, "this VM instance is shutting down")
+        if len(self.scheduler.jobs) >= self.profile.resources.max_queue_depth:
+            raise PaletteError(ErrorCode.BUSY, "the action queue for this VM is full")
+        try:
+            await asyncio.wait_for(
+                self._observation_slots.acquire(),
+                timeout=self.profile.resources.max_queued_wait_seconds,
+            )
+        except TimeoutError:
+            raise PaletteError(
+                ErrorCode.BUSY, "the observation processing capacity is full"
+            ) from None
+        try:
+            if self.scheduler.closing:
+                raise PaletteError(ErrorCode.VM_NOT_RUNNING, "this VM instance is shutting down")
+            observation = asyncio.create_task(
+                self._observe(max_long_edge=max_long_edge, requested=requested),
+                name="observe-image",
+            )
+            self._observations.add(observation)
+            try:
+                return await asyncio.shield(observation)
+            except asyncio.CancelledError:
+                observation.cancel()
+                with contextlib.suppress(asyncio.CancelledError, PaletteError):
+                    await join_cleanup(observation)
+                raise
+            finally:
+                self._observations.discard(observation)
+        finally:
+            self._observation_slots.release()
+
+    async def _observe(
+        self, *, max_long_edge: int | None, requested: float
+    ) -> tuple[Frame, CapturedImage]:
+        queued = time.perf_counter()
+
+        async def acquire() -> tuple[AcquiredImage | CapturedImage, _CaptureStamp, float]:
+            started = time.perf_counter()
+            deadline = asyncio.get_running_loop().time() + self.profile.resources.max_action_seconds
+            identity = self._identity()
+            if isinstance(self._capture, SplitCaptureBackend):
+                image: AcquiredImage | CapturedImage = await self._capture.acquire(
+                    display_id=self.view.display_id, head=self.view.head, sink=self._frame_path()
+                )
+            else:
+                image = await self._capture.capture(
+                    display_id=self.view.display_id, head=self.view.head, sink=self._frame_path()
+                )
+            self._require_identity(identity)
+            stamp = self._stamp_frame(image.native_size, cursor_position_source="not_observed")
+            self.observation_timings.record(
+                queue_ms=(started - queued) * 1000,
+                acquire_ms=(time.perf_counter() - started) * 1000,
+            )
+            return image, stamp, deadline
+
+        job = self.scheduler.make_job(JobKind.OBSERVE, "observe", acquire)
+        try:
+            image, stamp, deadline = cast(
+                "tuple[AcquiredImage | CapturedImage, _CaptureStamp, float]",
+                await self.scheduler.submit(job),
+            )
+        except asyncio.CancelledError:
+            # submit cancels the job, but its I/O thread still owns the snapshot slot.
+            async def joined() -> None:
+                with contextlib.suppress(PaletteError):
+                    await asyncio.shield(job.future)
+
+            await join_cleanup(asyncio.create_task(joined()))
+            raise
+
+        def process() -> tuple[CapturedImage, bytes]:
+            if isinstance(image, AcquiredImage):
+                captured = cast(SplitCaptureBackend, self._capture).encode(image)
+            else:
+                captured = image
+            if max_long_edge is not None and max_long_edge != self.profile.capture.max_long_edge:
+                captured = rescale(captured, max_long_edge, self.profile.capture.max_bytes)
+            return captured, image_thumbnail(captured.png_bytes)
+
+        encoding_started = time.perf_counter()
+        try:
+            async with asyncio.timeout_at(deadline):
+                captured, thumbnail = await image_work(process)
+        except TimeoutError:
+            raise PaletteError(
+                ErrorCode.TIMEOUT, "observation processing exceeded its deadline"
+            ) from None
+        self._require_identity(stamp.identity)
+        if stamp.frame.display_epoch != self.view.display_epoch:
+            raise PaletteError(ErrorCode.STALE_FRAME, "the display changed during observation")
+        frame = self._build_frame(captured, stamp=stamp)
+        self.observation_timings.record(
+            encode_ms=(time.perf_counter() - encoding_started) * 1000,
+            total_ms=(time.perf_counter() - requested) * 1000,
         )
-        return cast("tuple[Frame, CapturedImage]", await self.scheduler.submit(job))
+        return self._frames.add(frame, thumbnail, sequence=stamp.sequence), captured
 
     async def act(
         self,
@@ -805,6 +915,9 @@ class ActionController:
             display_id=self.view.display_id, head=self.view.head, sink=sink
         )
         self._require_identity(identity)
+        stamp = self._stamp_frame(
+            captured.native_size, cursor_position_source=cursor_position_source
+        )
 
         def process() -> tuple[CapturedImage, bytes]:
             result = captured
@@ -814,9 +927,8 @@ class ActionController:
 
         captured, thumbnail = await image_work(process)
         self._require_identity(identity)
-        frame = self._build_frame(captured, cursor_position_source=cursor_position_source)
-        self._last_capture_at = time.monotonic()
-        return self._frames.add(frame, thumbnail), captured
+        frame = self._build_frame(captured, stamp=stamp)
+        return self._frames.add(frame, thumbnail, sequence=stamp.sequence), captured
 
     def _frame_path(self) -> Path:
         # Frames live under the instance directory. When capture.keep_frames is off the
@@ -824,9 +936,17 @@ class ActionController:
         # area rather than an accumulating archive of the agent's screens.
         return self._frames_dir / f"frame-{time.monotonic_ns()}.png"
 
-    def _build_frame(
-        self, captured: CapturedImage, *, cursor_position_source: CursorPositionSource
-    ) -> Frame:
+    def _build_frame(self, captured: CapturedImage, *, stamp: _CaptureStamp) -> Frame:
+        return stamp.frame.model_copy(
+            update={
+                "image_size": captured.image_size,
+                "transform_id": transform_id_for(captured.image_size, captured.native_size),
+            }
+        )
+
+    def _stamp_frame(
+        self, native_size: Size, *, cursor_position_source: CursorPositionSource
+    ) -> _CaptureStamp:
         view = self.view
         previous_size = view.native_size
         # The view follows what was actually captured, *always*. Leaving the old size in
@@ -834,8 +954,8 @@ class ActionController:
         # frame against this value, so a single resize would refuse every subsequent action
         # for the rest of the instance's life. A guest that starts at the firmware's
         # 640x480 and switches to its real mode makes that the normal path, not an edge case.
-        view.native_size = captured.native_size
-        if previous_size is not None and previous_size != captured.native_size:
+        view.native_size = native_size
+        if previous_size is not None and previous_size != native_size:
             # Every frame captured *before* this moment maps to a surface that no longer
             # exists, so they are retired here rather than relying on each caller to notice.
             # The frame being built right now carries the new size and stays usable.
@@ -846,8 +966,8 @@ class ActionController:
                 view.vm_id,
                 previous_size.width,
                 previous_size.height,
-                captured.native_size.width,
-                captured.native_size.height,
+                native_size.width,
+                native_size.height,
                 view.display_epoch,
             )
             if self._audit:
@@ -859,20 +979,22 @@ class ActionController:
                 )
         elif previous_size is None:
             expected = self.profile.display
-            if (captured.native_size.width, captured.native_size.height) != (
+            if (native_size.width, native_size.height) != (
                 expected.width,
                 expected.height,
             ):
                 logger.warning(
                     "framebuffer is %sx%s but the profile expects %sx%s; the guest template "
                     "does not match its profile",
-                    captured.native_size.width,
-                    captured.native_size.height,
+                    native_size.width,
+                    native_size.height,
                     expected.width,
                     expected.height,
                 )
 
-        return Frame(
+        self._capture_sequence += 1
+        self._last_capture_at = time.monotonic()
+        frame = Frame(
             frame_id=Frame.new_id(),
             vm_id=view.vm_id,
             instance_id=view.instance_id,
@@ -882,14 +1004,15 @@ class ActionController:
             display_epoch=view.display_epoch,
             controller_epoch=view.controller_epoch,
             action_seq=view.action_seq,
-            native_size=captured.native_size,
-            image_size=captured.image_size,
-            viewport=Viewport.full(captured.native_size),
-            transform_id=transform_id_for(captured.image_size, captured.native_size),
+            native_size=native_size,
+            image_size=native_size,
+            viewport=Viewport.full(native_size),
+            transform_id=transform_id_for(native_size, native_size),
             captured_at=datetime.now().astimezone(),
-            monotonic_stamp=time.monotonic(),
+            monotonic_stamp=self._last_capture_at,
             cursor_position_source=cursor_position_source,
         )
+        return _CaptureStamp(frame, self._identity(), self._capture_sequence)
 
     async def _sample_bytes(self) -> bytes:
         _frame, captured = await self._capture_frame()
@@ -1088,7 +1211,7 @@ class ActionController:
             self._ledger.note_releases(events)
             self._require_identity(identity)
             if self._audit is not None:
-                self._audit.record("operator.input", vm_id=self.view.vm_id, count=len(events))
+                self._audit.record_async("operator.input", vm_id=self.view.vm_id, count=len(events))
             self.operator_timings.record(
                 queue_ms=(started - queued) * 1000,
                 qmp_ms=(acknowledged - started) * 1000,

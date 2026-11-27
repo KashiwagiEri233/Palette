@@ -224,3 +224,70 @@ async def test_asyncio_cancellation_waits_for_the_native_worker(monkeypatch) -> 
     await channel.close()
     assert api.calls.index(("completion", True)) < api.calls.index(("close", 55))
     assert not channel._workers
+
+
+async def test_buffered_readexactly_avoids_extra_read_syscalls(monkeypatch) -> None:
+    class BufferedKernel(FakeKernel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads = 0
+
+        def ReadFile(self, handle, buffer, size, count_ptr, overlapped):
+            self.reads += 1
+            payload = b"\0\0\0\x04test"
+            ctypes.memmove(buffer, payload, len(payload))
+            ctypes.cast(count_ptr, ctypes.POINTER(ctypes.c_uint32))[0] = len(payload)
+            return True
+
+        def GetOverlappedResult(self, handle, overlapped, count_ptr, wait):
+            return True
+
+    api = BufferedKernel()
+    monkeypatch.setattr(windows, "_api", lambda: api)
+    channel = windows.WindowsChannel(55)
+    try:
+        assert await channel.readexactly(1) == b"\0"
+        assert await channel.readexactly(3) == b"\0\0\x04"
+        assert await channel.readexactly(4) == b"test"
+        assert api.reads == 1
+    finally:
+        await channel.close()
+
+
+async def test_event_pool_reuses_completed_events_and_closes_on_channel_close(monkeypatch) -> None:
+    class PooledKernel(FakeKernel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.created: list[int] = []
+            self.resets: list[int] = []
+
+        def CreateEvent(self, *args):
+            handle = super().CreateEvent(*args)
+            self.created.append(handle)
+            return handle
+
+        def ResetEvent(self, handle):
+            self.resets.append(handle)
+            return True
+
+        def ReadFile(self, handle, buffer, size, count_ptr, overlapped):
+            ctypes.memmove(buffer, b"x", 1)
+            ctypes.cast(count_ptr, ctypes.POINTER(ctypes.c_uint32))[0] = 1
+            return True
+
+        def GetOverlappedResult(self, handle, overlapped, count_ptr, wait):
+            return True
+
+    api = PooledKernel()
+    monkeypatch.setattr(windows, "_api", lambda: api)
+    channel = windows.WindowsChannel(55)
+    try:
+        for _ in range(4):
+            assert await channel.readexactly(1) == b"x"
+        # One CreateEvent for stop_event plus one pooled overlapped I/O event.
+        assert len(api.created) == 2
+        assert len(api.resets) == 4
+        assert ("close", api.created[1]) not in api.calls
+    finally:
+        await channel.close()
+    assert ("close", api.created[1]) in api.calls

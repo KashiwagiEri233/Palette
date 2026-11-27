@@ -270,7 +270,7 @@ class PersistentStorage:
                 "drive_id": request.drive_id,
             }
 
-    def require_stopped(self, vm_id: str) -> None:
+    def require_stopped(self, vm_id: str, *, validate_storage: bool = True) -> None:
         instance = self.service.manager.find(vm_id)
         if instance is not None and (
             instance.state not in {VmState.STOPPED, VmState.FAILED}
@@ -280,7 +280,7 @@ class PersistentStorage:
                 ErrorCode.STATE_CONFLICT, "shut down the VM before editing or deleting it"
             )
         definition = self.definitions.get(vm_id)
-        if definition and definition.storage_owner:
+        if validate_storage and definition and definition.storage_owner:
             self.paths(definition)
 
     def paths(self, definition: VmDefinition) -> InstancePaths | None:

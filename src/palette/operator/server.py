@@ -148,7 +148,7 @@ class OperatorServer:
                     ):
                         return
                     self.service.control.validate(*binding)
-                    response = await self._execute_once(request)
+                    response = await self._dispatch(request)
                     await send_frame(channel, response)
                     if not response.ok:
                         return
@@ -177,6 +177,10 @@ class OperatorServer:
     async def _receive_input_frame(self, channel: Channel, vm_id: str, token: str) -> bytes:
         # An idle authenticated stream may live for the lease's lifetime. Once a peer
         # starts a frame, the existing header+body deadline still protects against trickling.
+        has_buffered = getattr(channel, "has_buffered", None)
+        if callable(has_buffered) and has_buffered():
+            self.service.control.validate(vm_id, token)
+            return await receive_frame(channel, timeout=2.0)
         first = asyncio.create_task(channel.readexactly(1))
         try:
             while not first.done():
